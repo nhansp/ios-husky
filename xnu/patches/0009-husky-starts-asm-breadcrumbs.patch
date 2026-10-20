@@ -1,0 +1,54 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 7a57fe0..35ab56f 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -463,6 +463,27 @@ start_cpu:
+  * Cold boot init routine.  Called from __start
+  *   x0 - Boot args
+  */
++#if defined(HUSKY)
++/*
++ * husky bring-up breadcrumb: append one byte to the ramoops pmsg ring at
++ * physical 0xfd5ff000 (the channel the shim/pmsg console use). Valid only
++ * while the MMU is off; clobbers x0-x3. The shim left the ring's sig/size
++ * valid, so this continues its log.
++ */
++.macro HUSKY_BC ch
++	movz	x0, #0xf000
++	movk	x0, #0xfd5f, lsl #16		// x0 = 0xfd5ff000
++	ldr	w1, [x0, #8]			// w1 = ring size
++	movz	w3, #\ch
++	add	x2, x0, #12			// data base
++	strb	w3, [x2, x1]			// data[size] = ch
++	add	w1, w1, #1
++	str	w1, [x0, #4]			// start = size+1
++	str	w1, [x0, #8]			// size  = size+1
++	dsb	sy
++.endm
++#endif /* HUSKY */
++
+ 	.align 2
+ 	.globl EXT(start_first_cpu)
+ LEXT(start_first_cpu)
+@@ -473,6 +494,10 @@ LEXT(start_first_cpu)
+ 
+ 	mov		x20, x0
+ 	mov		x21, #0
++#if defined(HUSKY)
++	HUSKY_BC 0x0a					// newline after the shim's log
++	HUSKY_BC 0x41					// 'A': reached start_first_cpu
++#endif /* HUSKY */
+ 
+ 	// Set low reset vector before attempting any loads
+ 	adrp	x0, EXT(LowExceptionVectorBase)@page
+@@ -747,6 +772,10 @@ common_start:
+ 	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
+ #endif /* HAS_APPLE_PAC */
+ 
++#if defined(HUSKY)
++	HUSKY_BC 0x4d					// 'M': PAC keys set, about to enable MMU+PAC
++#endif /* HUSKY */
++
+ 	// Enable caches, MMU, ROP and JOP
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
