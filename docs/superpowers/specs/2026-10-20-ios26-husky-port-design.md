@@ -404,6 +404,79 @@ being on means a mis-signed pointer traps rather than silently corrupting,
 matching iOS behaviour, so the kernel's PAC exception handling must be
 wired before arm64e userland runs.
 
+## XNU-12377 source audit + build strategy (2026-10-20)
+
+Three source audits of `artifacts/xnu-12377` (tag 12377.121.6). Headline: the
+kernel is built in one of two mutually-exclusive configs (`osfmk/conf/files.arm64`),
+and we build the classic one, synthesizing a board modeled on **VMAPPLE** — the
+architected/virtual config — not any real Apple SoC.
+
+### Monitor: build `config_pmap_ppl`, with the monitor OFF
+- `config_sptm` is **unbuildable from open source**: it links SDK-only
+  `-lsptm_xnu` / `-lTrustedExecutionMonitor_Kernel` and `<sptm/sptm_xnu.h>`
+  (absent from the tree), and its `_start` expects the SPTM already running with
+  MMU on — an undocumented, un-spoofable ABI.
+- `config_pmap_ppl` is fully present (`osfmk/arm/pmap/*`, `arm/arm_init.c`,
+  `arm64/arm_vm_init.c`, `arm64/start.s`). Its `_start` takes **x0 = boot_args
+  physical, EL1, MMU/caches off, and sets up its own MMU** — exactly the state
+  our `el2_to_el1` drop produces. The shim jumps straight in.
+- **No-monitor pmap is first-class**: with `XNU_MONITOR`/`PMAP_CS` undefined,
+  every public pmap routine calls `*_internal()` in-kernel (186 `#if XNU_MONITOR`
+  guards in pmap.c, all with `#else` fallbacks; `pmap_internal.h:112`). VMAPPLE
+  does exactly this.
+- **CTRR/AMCC lockdown compiles out** when `HAS_CTRR/HAS_KTRR` are undefined
+  (`amcc_rorgn.h:39`, `machine_routines.c:609`); no Apple-memory-controller MMIO
+  is touched. VMAPPLE does this too.
+
+### Board: synthesize a VMAPPLE-class board (not A13/H12)
+- A13 (`H12`/`t8030`) was **removed** from this tree (oldest is `H13`=A14). A13
+  *cores* survive in `cpuid.h` (`CPU_PART_LIGHTNING/THUNDER`), but there is no
+  board config. We don't need one: husky is not an Apple SoC.
+- `VMAPPLE.h` already declares husky's reality: `NO_MONITOR`, `HAS_GIC_V3`,
+  `__ARM_16K_PG__`, no `HAS_CTRR/KTRR`, `CPU_HAS_APPLE_PAC`. Base the husky board
+  on it: add `ARM64_BOARD_CONFIG_*` in `board_config.h` + `MakeInc.def`, drop the
+  `hvc`-to-host paravirt bits (`HAS_PARAVIRTUALIZED_PAC/CTRR`), and plug in the
+  architected-register PAC backend (below). XNU's **native GICv3 driver** (VMAPPLE)
+  serves husky's GIC directly — sweet's GIC patch is unnecessary.
+- The **userland identity stays independent**: ADT `/product` + `compatible` =
+  `d431ap`/`iPhone12,5` (already extracted to `artifacts/adt/d431ap.adt`). The
+  A13/iPhone-11 userland runs unchanged on a VMAPPLE-class kernel; the SoC posed
+  is a userland/MobileGestalt choice, not a kernel one.
+
+### PAC retarget (fills the gap P0c proved)
+Apple's private PAC SPRs are **gone** from open XNU (moved into SPTM); nothing to
+rewrite. The key-programming asm macros are deliberately **empty** off the
+paravirt path. The port fills them with the architected `msr AP*Key*_EL1` writes
+validated in P0c:
+- boot key init: `pac_asm.h:148` `PAC_INIT_KEY_STATE`
+- per-process keys: `pac_asm.h:99/129` `SET_{JOP,ROP}_KEY_REGISTERS`; enable the
+  cswitch gates `cswitch.s:227-228`
+- kernel-signs-user: `machine_routines_asm.s:107-137` `ml_{enable,disable}_user_jop_key`
+- diversifiers: `machine_routines_apple.c:233-269` return real values (now 0)
+- use the non-SPTM pmap's in-tree signing (`arm/pmap/pmap.c:9584`
+  `pmap_sign_user_ptr_internal`), never the SPTM `sptm_sign_user_pointer`.
+`pacia`/`pacga` sites and `SCTLR_EL1.En{IA,IB,DA,DB}` are already architected.
+
+### Handoff contract (updates loader.c / mkpayload.py)
+- `_start` (`arm64/start.s`): x0 = boot_args **physical**, EL1, MMU off. No CRC or
+  version gate on arm64 boot_args — a hand-built struct is accepted (set Rev=2/Ver=2).
+- **boot_args grew**: `BOOT_LINE_LENGTH=1024`, struct **1152 bytes** (`boot.h`,
+  `genassym.c:366`). sweet's `loader.c`/`mkpayload.py` assumed 608/736 → update.
+  Field offsets through `CommandLine` (0x6c) unchanged; `bootFlags`/`memSizeActual`
+  at 0x470/0x478.
+- ADT **panic-if-missing** set: `/chosen` with `dram-base`+`dram-size` (u64) and
+  `random-seed`; a `chosen/memory-map` node; `/cpus/cpuN` each with `state`
+  (one `"running"`) + `reg`; under `arm-io` an `interrupt-controller=="master"`
+  + `device_type=="timer"` with `reg`. (`mkadt.py` covers most; reconcile sweet's
+  `gic` node with stock `master`/`timer` matching, or use VMAPPLE's GICv3 ADT shape.)
+
+### Forward-looking (iOS 27/28, other SoCs)
+PAC is present on every A12+ device, so it is never the gate. The gates are whether
+a given XNU source drop still ships `config_pmap_ppl` and `VMAPPLE`. VMAPPLE is load-
+bearing for macOS VMs on Apple Silicon, so it is likely to persist; `config_pmap_ppl`
+is the one Apple may eventually drop once all shipping devices are SPTM. The SoC a
+future port poses as (A14, A15, …) remains a userland-fit choice, decoupled from this.
+
 ## Left to the builder
 
 - Exact ABL framebuffer address/format (one live `fastboot boot` probe).
