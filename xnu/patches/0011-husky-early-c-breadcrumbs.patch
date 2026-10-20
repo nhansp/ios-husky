@@ -1,0 +1,123 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 6690846..8213f33 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -571,6 +571,13 @@ arm_init(
+ 
+ 	arm_vm_init(xmaxmem, args);
+ 
++#if defined(HUSKY)
++	/* ml_io_map works from here (arm_vm_init set up the VM); breadcrumb the
++	 * steps up to serial_init to locate the early-boot hang. */
++	extern void husky_early_bc(const char *s);
++	husky_early_bc("arm_init: arm_vm_init done\n");
++#endif
++
+ 	if (debug_boot_arg) {
+ 		patch_low_glo();
+ 	}
+@@ -581,10 +588,19 @@ arm_init(
+ 
+ 	PE_consistent_debug_inherit();
+ 
++#if defined(HUSKY)
++	husky_early_bc("arm_init: calling serial_init\n");
++#endif
+ 	/* Setup debugging output. */
+ 	const unsigned int serial_exists = serial_init();
++#if defined(HUSKY)
++	husky_early_bc("arm_init: serial_init returned\n");
++#endif
+ 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+ 	kprintf("kprintf initialized\n");
++#if defined(HUSKY)
++	husky_early_bc("arm_init: kprintf initialized\n");
++#endif
+ 
+ 	serialmode = 0;
+ 	if (PE_parse_boot_argn("serial", &serialmode, sizeof(serialmode))) {
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 31040a9..db66c2e 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -818,6 +818,33 @@ static volatile struct husky_prz *husky_prz;
+ static uint32_t husky_pmsg_pos;
+ #define HUSKY_PMSG_CAP		(HUSKY_PMSG_SIZE - sizeof(struct husky_prz))
+ 
++/*
++ * husky bring-up breadcrumb usable from early C (arm_init/arm_vm_init), once
++ * the VM is far enough along for ml_io_map (i.e. from just after arm_vm_init).
++ * Appends a string to the pmsg ring, continuing the shim's log. Own mapping so
++ * it is independent of the serial framework.
++ */
++static volatile struct husky_prz *husky_bc_prz;
++void husky_early_bc(const char *s);
++void
++husky_early_bc(const char *s)
++{
++	if (husky_bc_prz == NULL) {
++		husky_bc_prz = (volatile struct husky_prz *)ml_io_map(HUSKY_PMSG_PHYS, HUSKY_PMSG_SIZE);
++		if (husky_bc_prz->sig != HUSKY_PMSG_SIG || husky_bc_prz->size > HUSKY_PMSG_CAP) {
++			husky_bc_prz->sig = HUSKY_PMSG_SIG;
++			husky_bc_prz->start = 0;
++			husky_bc_prz->size = 0;
++		}
++	}
++	uint32_t pos = husky_bc_prz->size;
++	while (*s && pos < HUSKY_PMSG_CAP) {
++		husky_bc_prz->data[pos++] = (uint8_t)*s++;
++	}
++	husky_bc_prz->start = pos;
++	husky_bc_prz->size = pos;
++}
++
+ static void
+ husky_pmsg_init(void)
+ {
+@@ -995,12 +1022,21 @@ serial_init(void)
+ 		return gPESF != NULL;
+ 	}
+ 
++#if defined(HUSKY)
++	husky_early_bc("serial_init: entry\n");
++#endif
+ 	soc_base = pe_arm_get_soc_base_phys();
+ 
+ 	if (soc_base == 0) {
+ 		uart_initted = true;
++#if defined(HUSKY)
++		husky_early_bc("serial_init: soc_base==0, no serial\n");
++#endif
+ 		return 0;
+ 	}
++#if defined(HUSKY)
++	husky_early_bc("serial_init: soc_base ok\n");
++#endif
+ 
+ 	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
+ 
+@@ -1008,8 +1044,14 @@ serial_init(void)
+ 	uint32_t phandle;
+ 	if (!get_serial_device_phandle(&phandle)) {
+ 		// XNU has not been configured to use a serial device; return early.
++#if defined(HUSKY)
++		husky_early_bc("serial_init: no serial-device phandle\n");
++#endif
+ 		return 0;
+ 	}
++#if defined(HUSKY)
++	husky_early_bc("serial_init: phandle ok, matching driver\n");
++#endif
+ 
+ 	// Look at the "compatible" string in the devicetree node referenced by the
+ 	// "serial-device" phandle property to see which driver we should use.
+@@ -1035,6 +1077,9 @@ serial_init(void)
+ 	if (!found_matching_driver) {
+ 		panic("Unable to find serial device driver for '%s'", compatible);
+ 	}
++#if defined(HUSKY)
++	husky_early_bc("serial_init: driver set up\n");
++#endif
+ 
+ 	fns = gPESF;
+ 	while (fns != NULL) {
