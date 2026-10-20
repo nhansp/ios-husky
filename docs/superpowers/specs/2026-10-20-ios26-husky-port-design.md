@@ -132,8 +132,24 @@ deferred earlier, kept as a de-risking fallback, not the primary path.)
 
 ## Bring-up sequence (phases)
 
-- **P0 — Spikes (throwaway):** (a) shim prints over `ttySAC0` + reads FDT; (b) PAC
-  spike; (c) PPL-defang spike. Retire the scary unknowns cheaply.
+- **P0 — Spikes (throwaway):** retire the scary unknowns cheaply —
+  - (a) **Delivery probe:** confirm retail unlocked husky honors `fastboot boot` of a
+    standalone image *with nothing flashed* (gates the whole no-flash model — see
+    Decision 1).
+  - (b) **Shim + UART:** shim prints over `ttySAC0` from the first instruction +
+    reads the live FDT. Confirms the serial dongle path works.
+  - (c) **PAC spike — run on the A510 boot core, not just a big core** (Q7): confirm
+    stock ARMv8.3 PAuth round-trips; confirm retail `bl31` leaves `SCR_EL3.API/APK`
+    enabled for EL1/EL0 with keys delegated to EL1 (if EL3 gates PAC off, the only
+    fix touches `bl31` — see Decision 1). Extend to the **userland-facing PAC
+    contract**: signed thread state across exception return / `sigreturn`,
+    per-process key diversity (Q2) — the part that actually gates P3.
+  - (d) **PPL-defang + source audit:** confirm the d431/A13 build in public
+    `xnu-12377` compiles the PPL (`XNU_MONITOR`) path and that PPL isn't half-gated
+    behind SPTM assumptions (Q1); defang its enter/exit to plain kernel code.
+  - (e) **Framebuffer-persistence probe (Q5):** does ABL leave a continuously-scanned
+    framebuffer after `fastboot boot` hands off with no Android kernel servicing
+    DECON? If not, P4 grows a from-scratch DECON/DSIM/`hk3` bring-up.
 - **P1 — Early kernel:** shim loads stripped `xnu-12377` (d431 ADT) → kernel console
   over UART, GICv3 + timers + boot CPU up.
 - **P2 — Storage + root:** Exynos UFS driver; mount HFS+ iOS root; pivot root.
@@ -153,6 +169,38 @@ deferred earlier, kept as a de-risking fallback, not the primary path.)
   DeviceTree, produced externally with standard IPSW tooling (see constraint above).
 - The `gs-6.1` google-modules tree as the Tensor driver reference (UFS, DECON,
   ST FTS touch, S2MPG PMIC, SMP).
+
+## Builder-check resolutions (2026-10-20)
+
+Settled during review and folded above:
+- **PAC/PPL exist in public `xnu-12377`** (`pac_asm.h`, `HAS_APPLE_PAC`,
+  `ml_set_kernelkey_enabled`) → de-fang, not reconstruct. Caveat: the 26 kernel is
+  SPTM-centric; confirming the d431 PPL build path is now an explicit P0(d) audit.
+- **Matching HID kext source is published** (`IOHIDFamily-2238.120.5` / `2222.x`,
+  the iOS 26 line). ABI drift from sweet's `1915.140.3` is P4/P5 porting effort.
+- **Spike scope corrected:** PAC spike runs on the **A510 boot core** and covers the
+  **userland PAC contract** + the **EL3/`bl31` PAuth-enablement** check, not just
+  kernel-internal round-trip on a big core.
+- **Reference-tree gap:** the supplied `gs-6.1 google-modules` snapshot looks
+  Pixel-9-era — it has zuma SoC bits (`cal-if/zuma`, UFS/MFD under `soc/gs`) but the
+  **Pixel 8 Pro `hk3` panel driver is absent** (`display/panels/` has only
+  caimito/stallion/tegu). SoC drivers are usable; the display fallback needs the
+  husky-matched branch — see Decision 2.
+
+## Decisions needed from the owner (before planning is final)
+
+1. **Anti-goal hardness (could reshape or end the project).** Three P0 probes may
+   reveal that proceeding *requires* touching partitions the anti-goals currently
+   forbid: `fastboot boot` may be AVB-gated on retail ABL (→ flash `boot` or patch
+   `vbmeta`), or retail `bl31` may disable PAC for EL1 (→ modify `bl31`). Is "never
+   touch bootloader / boot / vbmeta / bl31" a **hard** line (abandon rather than
+   cross it) or **soft** (allowed on an unlocked dev unit if a probe proves it
+   necessary)? The answer decides whether a failed probe is a dead end or a detour.
+2. **Correct kernel source branch.** Can the owner supply the husky-matched
+   `gs-6.1` branch that contains the `hk3` panel driver + zuma display stack? Needed
+   only if P0(e) shows we must drive the panel ourselves.
+3. **Serial dongle.** All of P0's method rests on a USB-C SBU serial dongle +
+   `fastboot oem uart enable`. Confirm the hardware is in hand.
 
 ## Left to the builder
 
