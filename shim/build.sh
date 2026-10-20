@@ -12,8 +12,9 @@ OBJCOPY=aarch64-linux-gnu-objcopy
 CPPFLAGS=""
 [ "${HANG:-}" = entry ] && CPPFLAGS="-DHANG_AT_ENTRY"
 [ "${HANG:-}" = probe ] && CPPFLAGS="-DPROBE_RAMOOPS"
-CFLAGS="$CPPFLAGS -O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
-SRCS="start.S shim.c console.c fdt.c pac.S"
+# -march=armv8.3-a: loader.c signs arm64e auth pointers with pacia/pacib/pacda/pacdb.
+CFLAGS="$CPPFLAGS -O2 -ffreestanding -nostdlib -fno-pic -march=armv8.3-a -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+SRCS="start.S shim.c console.c fdt.c pac.S loader.c"
 mkdir -p out
 objs=()
 for f in $SRCS; do

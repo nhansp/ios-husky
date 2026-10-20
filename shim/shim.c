@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include "console.h"
 #include "fdt.h"
+#include "loader.h"
 
 #define PSCI_VERSION		0x84000000UL
 #define PSCI_SYSTEM_RESET	0x84000009UL
@@ -168,34 +169,17 @@ void shim_main(uint64_t dtb, uint64_t entry_el)
 	stage = "psci";
 	con_hex("PSCI", smc(PSCI_VERSION, 0, 0, 0));
 	con_hex("SMCCC", smc(SMCCC_VERSION, 0, 0, 0));
+	/* The two per-unit values mkadt.py wants pinned: the boot core's MPIDR
+	 * affinity (masked) and the real timer frequency. Logged above as MPIDR
+	 * and CNTFRQ; feed them to mkadt --boot-mpidr/--timebase. */
 
 	/*
-	 * P0c: PAC at EL1. Set the architected APIAKey/APGAKey, enable the
-	 * instructions, and round-trip a canonical TTBR0 pointer. A nonzero
-	 * PAC in the signed value proves EL3 is not trapping pac/aut (if it
-	 * were, we'd have reset here or seen the input unchanged). recovered
-	 * == ptr proves the QARMA5 round-trip. The final corrupt autia should
-	 * FPAC-fault (ISAR1.APA=5), logged as a SYNC panic at stage "pacbad".
+	 * P1.2: act as iBoot. Load the HUSKYXNU payload from the ABL ramdisk,
+	 * sign its arm64e auth pointers, and jump to xnu. loader_boot only
+	 * returns on error; log it and reset so Android comes back up.
 	 */
-	stage = "pac";
-	uint64_t ptr = 0x0000000012345670ULL, mod = 0x1122334455667788ULL;
-	con_hex("SCTLRpac", pac_enable());
-	pac_set_iakey(0x0123456789abcdefULL, 0xfedcba9876543210ULL);
-	pac_set_gakey(0x0f1e2d3c4b5a6978ULL, 0x8796a5b4c3d2e1f0ULL);
-	uint64_t s1 = pac_sign_ia(ptr, mod);
-	uint64_t s2 = pac_sign_ia(ptr, mod);
-	uint64_t rec = pac_auth_ia(s1, mod);
-	con_hex("PTR", ptr);
-	con_hex("PACIA", s1);
-	con_hex2("DET", "same=", s1 == s2, "pac=", (uint32_t)((s1 ^ ptr) >> 32));
-	con_hex2("RT", "rec=", (uint32_t)rec, "ok=", rec == ptr);
-	con_hex("XPACI", pac_strip_ia(s1));
-	con_hex("PACGA", pac_gen(ptr, mod));
-	con_str("HUSKY", "p0a done");
-
-	stage = "pacbad";
-	con_hex("AUTBAD", pac_auth_ia(s1 ^ (1ULL << 50), mod));	/* expect FPAC fault */
-	con_str("PAC", "no FPAC fault");
-
-	reset(2);
+	stage = "load";
+	con_str("HUSKY", "loading xnu");
+	con_str("LOADER", loader_boot(dtb));
+	reset(5);
 }
