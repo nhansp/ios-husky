@@ -1,0 +1,84 @@
+diff --git a/osfmk/prng/prng_random.c b/osfmk/prng/prng_random.c
+index 504b3fa..7bf7303 100644
+--- a/osfmk/prng/prng_random.c
++++ b/osfmk/prng/prng_random.c
+@@ -263,9 +263,47 @@ __static_testable void read_erandom(void * buf, size_t nbytes);
+  *    generation to it via read_random_generate. (Note that this
+  *    function acquires a per-processor mutex.)
+  */
++#if defined(HUSKY)
++/*
++ * Bring-up: husky has no corecrypto kext, and the corecrypto early-DRBG path
++ * (bootseed_init -> cchmac/ccdrbg, and bootseed_init_native's hardware RNG)
++ * hangs on these cores. Use a self-contained splitmix64 for all early/kernel
++ * randomness. NOT cryptographically secure - a bring-up stand-in until a real
++ * HMAC PRNG (sweet 0014-style) is ported.
++ */
++static uint64_t
++husky_prng64(void)
++{
++	static uint64_t s;
++	if (__improbable(s == 0)) {
++		s = ml_get_timebase() | 1;
++	}
++	uint64_t z = (s += 0x9e3779b97f4a7c15ULL);
++	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
++	z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
++	return z ^ (z >> 31);
++}
++
++static void
++husky_fill_random(void *buf, size_t nbytes)
++{
++	uint8_t *p = buf;
++	while (nbytes) {
++		uint64_t r = husky_prng64();
++		size_t n = nbytes < sizeof(r) ? nbytes : sizeof(r);
++		__builtin_memcpy(p, &r, n);
++		p += n;
++		nbytes -= n;
++	}
++}
++#endif /* HUSKY */
++
+ uint64_t
+ early_random(void)
+ {
++#if defined(HUSKY)
++	return husky_prng64();
++#else
+ 	uint64_t result;
+ 	static int init = 0;
+ 
+@@ -277,6 +315,7 @@ early_random(void)
+ 	read_erandom(&result, sizeof(result));
+ 
+ 	return result;
++#endif /* HUSKY */
+ }
+ 
+ static void
+@@ -312,6 +351,10 @@ read_erandom_generate(void * buf, size_t nbytes)
+ __static_testable __mockable void
+ read_erandom(void * buf, size_t nbytes)
+ {
++#if defined(HUSKY)
++	husky_fill_random(buf, nbytes);
++	return;
++#endif
+ 	// We defer to the kernel PRNG after it has been installed and
+ 	// initialized. This happens during corecrypto kext
+ 	// initialization.
+@@ -370,6 +413,12 @@ random_cpu_init(int cpu)
+ __mockable void
+ read_random(void * buffer, u_int numbytes)
+ {
++#if defined(HUSKY)
++	/* No corecrypto kext loads on husky (prng_ready stays false); use the
++	 * bring-up PRNG rather than the uninitialized kernel DRBG. */
++	husky_fill_random(buffer, numbytes);
++	return;
++#endif
+ 	prng_funcs.refresh(prng_ctx);
+ 	read_random_generate(buffer, numbytes);
+ }
