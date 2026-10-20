@@ -1,0 +1,55 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 76cd529..561f507 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -389,9 +389,18 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: TRUE entry\n");
++#endif
+ 	arm_slide_rebase_and_sign_image();
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: slide_rebase_sign ok\n");
++#endif
+ 
+ 	arm_static_if_init(args);
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: static_if_init ok\n");
++#endif
+ 
+ 	/* If kernel integrity is supported, use a constant copy of the boot args. */
+ 	const_boot_args = *args;
+@@ -407,16 +416,31 @@ arm_init(
+ 	BootCpuData.rop_key = ml_default_rop_pid();
+ 	BootCpuData.jop_key = ml_default_jop_pid();
+ #endif /* defined(HAS_APPLE_PAC) */
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: cpu_data_init ok\n");
++#endif
+ 
+ 	PE_init_platform(FALSE, args); /* Get platform expert set up */
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: PE_init_platform ok\n");
++#endif
+ 
+ #if __arm64__
+ 	configure_timer_apple_regs();
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: configure_timer_apple_regs ok\n");
++#endif
+ 	wfe_timeout_configure();
+ 	wfe_timeout_init();
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: wfe_timeout ok\n");
++#endif
+ 
+ 	configure_misc_apple_boot_args();
+ 	configure_misc_apple_regs(true);
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: configure_misc_apple_regs ok\n");
++#endif
+ 
+ #if HAS_UPSI_FAILURE_INJECTION
+ 	/* UPSI (Universal Panic and Stall Injection) Logic
