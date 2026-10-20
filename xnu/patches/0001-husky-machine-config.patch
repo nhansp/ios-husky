@@ -74,83 +74,35 @@ index 6aa6fe4..7a57fe0 100644
  	/* Watchtower
 diff --git a/pexpert/pexpert/arm64/HUSKY.h b/pexpert/pexpert/arm64/HUSKY.h
 new file mode 100644
-index 0000000..ed10540
+index 0000000..d0dec6a
 --- /dev/null
 +++ b/pexpert/pexpert/arm64/HUSKY.h
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,25 @@
 +/*
 + * husky (Google Tensor G3 / Pixel 8 Pro) board config.
 + *
-+ * Modeled on VMAPPLE: Tensor G3 is "VMAPPLE-class" hardware — architected
-+ * GICv3, 16K pages, architected QARMA5 pointer authentication, no Apple
-+ * page-protection monitor and no Apple CTRR memory controller. We therefore
-+ * reuse Apple's virtual-platform support (GICv3, PL011-style console, the
-+ * no-monitor pmap) instead of writing an Apple-SoC board from scratch.
++ * Tensor G3 is "VMAPPLE-class": architected GICv3, 16K pages, QARMA5 PAC,
++ * no Apple page-protection monitor, no Apple CTRR. HUSKY is therefore built
++ * at parity with VMAPPLE (it even links the KDK's closed VMAPPLE
++ * KernelSupport archive, aliased to libHUSKY since Apple ships no libHUSKY),
++ * and doconf marks soc "husky" SOC_IS_VIRTUALIZED just like "vm*".
 + *
-+ * Differences from VMAPPLE:
-+ *  - no paravirtualization: husky runs bare metal from a fastboot shim, not
-+ *    under a host hypervisor, so the paravirt PAC/CTRR hvc paths are dropped.
-+ *    PAC keys are programmed directly in the architected AP*Key_EL1 registers
-+ *    (filled into pac_asm.h's key macros by a later patch; validated in P0c).
-+ *  - no SME: the Cortex-A510/A715/X3 cores have no SME/SME2.
++ * The real husky divergences are applied as later, targeted patches against
++ * this building baseline, not here:
++ *   - PAC keys programmed in the architected AP*Key_EL1 regs (validated in
++ *     the P0c on-device spike) instead of VMAPPLE's paravirt hvc to a host;
++ *   - the real MMIO / CPU topology, carried in the synthesized Apple DT.
++ * SME/AMX and the other VMAPPLE features the Tensor cores lack stay enabled
++ * in config (XNU gates them on the ID registers at runtime) so the VMAPPLE
++ * KernelSupport objects resolve.
 + */
 +#ifndef _PEXPERT_ARM64_HUSKY_H
 +#define _PEXPERT_ARM64_HUSKY_H
 +
-+#define NO_MONITOR                1   /* in-kernel pmap; XNU_MONITOR stays off */
-+#define NO_ECORE                  1   /* bring-up: homogeneous SMP view */
++#define HUSKY 1
++#include <pexpert/arm64/VMAPPLE.h>
 +
-+#define HUSKY                     1
-+#define APPLEVIRTUALPLATFORM      1
-+
-+#define CPU_HAS_APPLE_PAC         1   /* arm64e; architected keys, no paravirt */
-+#define HAS_GIC_V3                1
-+#define HAS_ARM_FEAT_SSBS2        1
-+#define HAS_ARM_FEAT_PAN3         1
-+
-+#define __ARM_PAN_AVAILABLE__     1
-+#define __ARM_16K_PG__            1
-+#define __ARM_RANGE_TLBI__        1
-+
-+#define ARM_PARAMETERIZED_PMAP    1
-+#define __ARM_MIXED_PAGE_SIZE__   1
-+
-+
-+#include <pexpert/arm64/apple_arm64_common.h>
-+#undef  __ARM64_PMAP_SUBPAGE_L1__
-+#undef  __ARM64_PMAP_KERN_SUBPAGE_L1__
-+
-+#ifndef ASSEMBLER
-+#define PL011_UART
-+#define PLATFORM_PANIC_LOG_DISABLED
-+#endif /* ! ASSEMBLER */
-+
-+
-+#define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
-+
-+#define GICR_PE_SIZE              0x20000 // Size of each redistributor region
-+
-+/* GICv3 register definitions; see GICv3 spec (Arm IHI 0069G). */
-+#define GICD_CTLR                 0x0
-+
-+#define GICD_CTLR_ENABLEGRP0      0x1
-+
-+#define GICR_TYPER                              0x08
-+#define GICR_WAKER                              0x14
-+#define GICR_IGROUPR0                           0x10080
-+#define GICR_ISENABLER0                         0x10100
-+
-+#define GICR_TYPER_AFFINITY_VALUE_SHIFT         32
-+#define GICR_TYPER_LAST                         0x10
-+
-+#define GICR_WAKER_PROCESSORSLEEP               0x2
-+#define GICR_WAKER_CHILDRENASLEEP               0x4
-+
-+#define ICC_CTLR_EOIMODE                        0x1
-+
-+#define ICC_SRE_SRE                             0x1
-+
-+#endif /* ! _PEXPERT_ARM64_HUSKY_H */
++#endif /* _PEXPERT_ARM64_HUSKY_H */
 diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
 index 75938b5..06ae8d4 100644
 --- a/pexpert/pexpert/arm64/Makefile
