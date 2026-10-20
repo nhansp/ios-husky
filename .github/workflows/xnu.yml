@@ -42,6 +42,14 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '26.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'VMAPPLE' }}
+  # ccache gives fast incremental rebuilds across runs (content-addressed, so
+  # it survives DXB re-cloning xnu each run, unlike mtime-based object caches).
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  # Capped well under GitHub's 10 GB/repo Actions-cache budget so the rolling
+  # snapshots don't thrash; an xnu dev build's ccache is only ~1-2 GB.
+  CCACHE_MAXSIZE: "4G"
+  CCACHE_COMPILERCHECK: content
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines,modules
 
 jobs:
   build:
@@ -58,14 +66,33 @@ jobs:
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
+          # DXB applies 26.x patches from patches/$MACOS_VERSION, else patches/26.0
+          # (alongside blacktop's own build-fix patches). Land ours in that dir.
+          PD="dxb/patches/${MACOS_VERSION}"
+          [ -d "$PD" ] || PD="dxb/patches/26.0"
+          mkdir -p "$PD"
           shopt -s nullglob
           files=(xnu/patches/*.patch xnu/patches/*.sh)
-          if [ ${#files[@]} -gt 0 ]; then cp "${files[@]}" dxb/patches/; fi
-          echo "patches staged:"; ls dxb/patches || true
+          if [ ${#files[@]} -gt 0 ]; then cp "${files[@]}" "$PD"/; fi
+          echo "patch dir $PD:"; ls "$PD" || true
+          # Route the kernel compiler through ccache (DXB exports CC/CXX itself).
+          sed -i '' 's#export CC="$(xcrun -find clang)"#export CC="ccache $(xcrun -find clang)"#' dxb/build.sh
+          sed -i '' 's#export CXX="$(xcrun -find clang++)"#export CXX="ccache $(xcrun -find clang++)"#' dxb/build.sh
+          grep -n 'export C\(C\|XX\)=' dxb/build.sh | head
+
+      - name: ccache cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.MACHINE_CONFIG }}-
+            ccache-
 
       - name: Deps
         run: |
-          brew install jq gum bash cmake ninja || true
+          brew install jq gum bash cmake ninja ccache || true
+          ccache -z || true
           # build.sh only checks that `xcodes` exists (Xcode is preinstalled).
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
@@ -82,6 +109,10 @@ jobs:
         env:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s || true
 
       - name: Package build tree for local compiles
         if: always()
