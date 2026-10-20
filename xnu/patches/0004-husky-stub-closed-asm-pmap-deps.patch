@@ -1,0 +1,112 @@
+diff --git a/osfmk/arm64/amcc_rorgn_common.c b/osfmk/arm64/amcc_rorgn_common.c
+new file mode 100644
+index 0000000..fb3f565
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_common.c
+@@ -0,0 +1,7 @@
++/*
++ * husky: amcc_rorgn_common.c ships only in Apple's closed per-SoC KernelSupport library. It
++ * implements AMCC/CTRR read-only-region lockdown, which husky does not use
++ * (SOC_IS_VIRTUALIZED leaves KERNEL_INTEGRITY_{KTRR,CTRR,PV_CTRR} undefined, so
++ * nothing references these symbols). Empty translation unit.
++ */
++static const unsigned char husky_no_amcc_rorgn_common __attribute__((unused)) = 0;
+diff --git a/osfmk/arm64/amcc_rorgn_ppl.c b/osfmk/arm64/amcc_rorgn_ppl.c
+new file mode 100644
+index 0000000..04c4ce8
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_ppl.c
+@@ -0,0 +1,7 @@
++/*
++ * husky: amcc_rorgn_ppl.c ships only in Apple's closed per-SoC KernelSupport library. It
++ * implements AMCC/CTRR read-only-region lockdown, which husky does not use
++ * (SOC_IS_VIRTUALIZED leaves KERNEL_INTEGRITY_{KTRR,CTRR,PV_CTRR} undefined, so
++ * nothing references these symbols). Empty translation unit.
++ */
++static const unsigned char husky_no_amcc_rorgn_ppl __attribute__((unused)) = 0;
+diff --git a/osfmk/arm64/amcc_rorgn_ppl_amcc.c b/osfmk/arm64/amcc_rorgn_ppl_amcc.c
+new file mode 100644
+index 0000000..8bbbb62
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_ppl_amcc.c
+@@ -0,0 +1,7 @@
++/*
++ * husky: amcc_rorgn_ppl_amcc.c ships only in Apple's closed per-SoC KernelSupport library. It
++ * implements AMCC/CTRR read-only-region lockdown, which husky does not use
++ * (SOC_IS_VIRTUALIZED leaves KERNEL_INTEGRITY_{KTRR,CTRR,PV_CTRR} undefined, so
++ * nothing references these symbols). Empty translation unit.
++ */
++static const unsigned char husky_no_amcc_rorgn_ppl_amcc __attribute__((unused)) = 0;
+diff --git a/osfmk/arm64/amcc_rorgn_pv_ctrr.c b/osfmk/arm64/amcc_rorgn_pv_ctrr.c
+new file mode 100644
+index 0000000..47a9b16
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_pv_ctrr.c
+@@ -0,0 +1,7 @@
++/*
++ * husky: amcc_rorgn_pv_ctrr.c ships only in Apple's closed per-SoC KernelSupport library. It
++ * implements AMCC/CTRR read-only-region lockdown, which husky does not use
++ * (SOC_IS_VIRTUALIZED leaves KERNEL_INTEGRITY_{KTRR,CTRR,PV_CTRR} undefined, so
++ * nothing references these symbols). Empty translation unit.
++ */
++static const unsigned char husky_no_amcc_rorgn_pv_ctrr __attribute__((unused)) = 0;
+diff --git a/osfmk/arm64/ppl/sart.h b/osfmk/arm64/ppl/sart.h
+new file mode 100644
+index 0000000..a166c17
+--- /dev/null
++++ b/osfmk/arm64/ppl/sart.h
+@@ -0,0 +1,11 @@
++/*
++ * husky: Apple's SART (the IOMMU fronting ANS/NVMe) header is not in the
++ * open-source drop. There is no SART on Tensor hardware; bootstrap is a no-op.
++ */
++#ifndef _ARM64_PPL_SART_H_
++#define _ARM64_PPL_SART_H_
++static inline void
++sart_bootstrap(void)
++{
++}
++#endif /* _ARM64_PPL_SART_H_ */
+diff --git a/osfmk/arm64/ppl/uat.h b/osfmk/arm64/ppl/uat.h
+new file mode 100644
+index 0000000..a9d37d7
+--- /dev/null
++++ b/osfmk/arm64/ppl/uat.h
+@@ -0,0 +1,11 @@
++/*
++ * husky: Apple's UAT (the AGX GPU's unified address translator) header is not
++ * in the open-source drop. No AGX/UAT on Tensor hardware; bootstrap is a no-op.
++ */
++#ifndef _ARM64_PPL_UAT_H_
++#define _ARM64_PPL_UAT_H_
++static inline void
++uat_bootstrap(void)
++{
++}
++#endif /* _ARM64_PPL_UAT_H_ */
+diff --git a/osfmk/arm64/tunables/tunables.s b/osfmk/arm64/tunables/tunables.s
+new file mode 100644
+index 0000000..f76beb2
+--- /dev/null
++++ b/osfmk/arm64/tunables/tunables.s
+@@ -0,0 +1,7 @@
++/*
++ * husky: Apple's per-SoC CPU tunables (implementation-defined HID/ACC register
++ * settings applied in start.s) are not in the open-source drop and none exist
++ * on the Cortex-A510/A715/X3. APPLY_TUNABLES does nothing.
++ */
++.macro APPLY_TUNABLES midr, tmp1, tmp2
++.endmacro
+diff --git a/pexpert/pexpert/arm64/HUSKY.h b/pexpert/pexpert/arm64/HUSKY.h
+index d0dec6a..69df859 100644
+--- a/pexpert/pexpert/arm64/HUSKY.h
++++ b/pexpert/pexpert/arm64/HUSKY.h
+@@ -20,6 +20,8 @@
+ #define _PEXPERT_ARM64_HUSKY_H
+ 
+ #define HUSKY 1
++/* Tensor cores have no Apple CPU_OVRD power-management SPR. */
++#define NO_CPU_OVRD 1
+ #include <pexpert/arm64/VMAPPLE.h>
+ 
+ #endif /* _PEXPERT_ARM64_HUSKY_H */
