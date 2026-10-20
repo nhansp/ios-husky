@@ -125,7 +125,30 @@ jobs:
         working-directory: dxb
         env:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          # Tee to a file so a failure step can extract a tiny error report
+          # on the runner (the full log is too big for a slow link to pull).
+          bash build.sh 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Error summary
+        if: failure()
+        run: |
+          LOG="$RUNNER_TEMP/build.log"; mkdir -p err
+          # Deduped compile errors with ~3 lines of context each, Apple-path-stripped.
+          grep -nE 'error:|fatal error:|No rule to make target|Undefined symbols|^[^ ]*ld: |#error' "$LOG" \
+            | sed -E 's#/Users/[^ ]*/(xnu|dxb)/##g' | awk '!seen[$0]++' > err/errors.txt || true
+          grep -nE -A3 'error:|fatal error:' "$LOG" \
+            | sed -E 's#/Users/[^ ]*/(xnu|dxb)/##g' | head -400 > err/errors_ctx.txt || true
+          tail -300 "$LOG" > err/tail.txt || true
+          echo "=== errors.txt ($(wc -l < err/errors.txt) lines) ==="; head -60 err/errors.txt
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: xnu-errors
+          path: err/
+          retention-days: 7
 
       - name: ccache stats
         if: ${{ always() && (inputs.use_ccache || 'false') == 'true' }}
