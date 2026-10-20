@@ -1,0 +1,119 @@
+name: xnu
+
+# Builds XNU (xnu-12377 / iOS 26 era) on a GitHub macOS runner via
+# blacktop/darwin-xnu-build, applying xnu/patches/ in order.
+#
+# P1.0 baseline: MACHINE_CONFIG=VMAPPLE, no patches -> proves the DXB +
+#   xnu-12377 + Xcode toolchain pipeline end to end.
+# P1.1+: MACHINE_CONFIG=HUSKY once xnu/patches/0001-husky-machine-config
+#   (a VMAPPLE-derived, arm64e, config_pmap_ppl board) lands.
+#
+# Unlike ios-sweet we build arm64e (husky has PAC; iOS 26 is arm64e-only),
+# so there is no "add arm64 to VALID_ARCHS" step.
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos_version:
+        description: macOS release whose xnu to build (26.x = xnu-12377, iOS 26 era)
+        default: "26.5"
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      machine_config:
+        description: xnu MACHINE_CONFIG (VMAPPLE baseline, HUSKY once patched in)
+        default: VMAPPLE
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        default: "true"
+  push:
+    branches: [main, master]
+    paths:
+      - "xnu/patches/**"
+      - ".github/workflows/xnu.yml"
+
+concurrency:
+  group: xnu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: ${{ inputs.macos_version || '26.5' }}
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'VMAPPLE' }}
+
+jobs:
+  build:
+    # xnu-12377 (macOS 26) needs the Xcode 26 toolchain: its iig must match
+    # this xnu's IORPC ABI, the same reason ios-sweet pinned macos-14 for
+    # xnu-8796 / Xcode 15. Adjust if the macos-26 image label differs.
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          shopt -s nullglob
+          files=(xnu/patches/*.patch xnu/patches/*.sh)
+          if [ ${#files[@]} -gt 0 ]; then cp "${files[@]}" dxb/patches/; fi
+          echo "patches staged:"; ls dxb/patches || true
+
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja || true
+          # build.sh only checks that `xcodes` exists (Xcode is preinstalled).
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          sw_vers
+          ls -d /Applications/Xcode*.app || true
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig
+
+      - name: Build
+        working-directory: dxb
+        env:
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
+        run: bash build.sh
+
+      - name: Package build tree for local compiles
+        if: always()
+        run: |
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          mkdir -p sdk-kernel-platform
+          cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
+          tar czf buildtree.tgz \
+            --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
+            --exclude='kernel.*.*' --exclude='.git' \
+            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
+            -C .. sdk-kernel-platform || true
+          ls -la buildtree.tgz || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-buildtree
+          path: buildtree.tgz
+          retention-days: 7
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out || true
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel
+          path: out/
+          if-no-files-found: warn
