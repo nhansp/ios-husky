@@ -3,7 +3,7 @@
 
 Only what the early boot path actually reads; every MMIO address comes from
 the husky hardware map (Tensor G3 "zuma"). Usage:
-  mkadt.py OUT.adt [--dump] [--lowmem] [--boot-mpidr HEX] [--timebase HZ]
+  mkadt.py OUT.adt [--dump] [--highmem] [--boot-mpidr HEX] [--timebase HZ]
 
 The kernel board is VMAPPLE-class (GICv3 + 16K pages + architected PAC); the
 userland identity it poses as is the iPhone 11 Pro Max (iPhone12,5 / d431ap),
@@ -21,16 +21,17 @@ import hashlib, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
 
-# Kernel-managed RAM. husky has 12GB (DRAM base 0x80000000); the low 4GB holds
-# every firmware/XPU carve-out (ramoops, bootloader log, TZ, GSA, modem...),
-# so by default the kernel owns a 2GB window at the 4GB mark, well clear of
-# them and never overlapping the ABL ramdisk (which lands in low RAM).
-PHYS_BASE = 0x100000000
-MEM_SIZE = 0x80000000
-# --lowmem: a conservative low-bank window above the bootloader region, for
-# experiments where the high bank is unavailable.
-LOW_PHYS_BASE = 0xa0000000
-LOW_MEM_SIZE = 0x40000000
+# Kernel-managed RAM. The 4GB-mark high bank (0x100000000) is not EL1-NS
+# executable on husky — jumping xnu there faults with a synchronous external
+# abort on instruction fetch (the shim itself runs fine from the low bank at
+# 0x80000000). So the kernel lives in the low DDR bank, in a 640MB window
+# (32MB-block aligned) above the shim+payload image (which ends ~0x81600000)
+# and below the ABL ramdisk (which lands at 0xb0000000).
+PHYS_BASE = 0x82000000
+MEM_SIZE = 0x28000000
+# --highmem: the 4GB-mark bank, kept for experiments (currently faults).
+LOW_PHYS_BASE = 0x100000000
+LOW_MEM_SIZE = 0x80000000
 
 # /arm-io children are relative to this; it must not be 0 (serial_init bails).
 SOC_BASE = 0x01000000
@@ -88,8 +89,8 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, lowmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
-    phys_base, mem_size = (LOW_PHYS_BASE, LOW_MEM_SIZE) if lowmem else (PHYS_BASE, MEM_SIZE)
+def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
+    phys_base, mem_size = (LOW_PHYS_BASE, LOW_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -221,7 +222,7 @@ if __name__ == '__main__':
         bm = int(args[args.index('--boot-mpidr') + 1], 0)
     if '--timebase' in args:
         tb = int(args[args.index('--timebase') + 1], 0)
-    root = build(lowmem='--lowmem' in args, boot_mpidr=bm, timebase=tb)
+    root = build(highmem='--highmem' in args, boot_mpidr=bm, timebase=tb)
     blob = adt.serialize(root)
     out = args[0]
     open(out, 'wb').write(blob)

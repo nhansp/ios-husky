@@ -26,6 +26,9 @@
  * register (lo and hi), i.e. movz 0x4331 / movk 0x5041,0x534b,0x4855. */
 #define HUSKY_PAC_KEY		0x4855534b50414331ULL
 
+/* End of the shim image; the payload is appended here (see loader_boot). */
+extern char _end[];
+
 struct payload_seg {
 	uint64_t vmaddr, vmsize, file_off, file_size;
 };
@@ -164,15 +167,30 @@ const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
 
-	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
-	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
-		return "no initrd in /chosen";
-	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
-
-	const struct payload *p = (const struct payload *)rd_start;
-	if (!magic_ok(p->magic))
-		return "no HUSKYXNU payload";
-	if (p->version != 2 || (p->adt_off & 7) || (p->auth_off & 7) || (rd_start & 7))
+	/*
+	 * Delivery: `fastboot boot` drops our boot.img ramdisk (ABL uses only the
+	 * on-device vendor_boot ramdisk), so the payload is appended to the shim
+	 * image itself (after _end, with the Image header's image_size patched so
+	 * ABL loads it all). It therefore sits at _end at runtime. Fall back to
+	 * scanning the ABL initrd in case it was delivered as a ramdisk instead.
+	 */
+	const struct payload *p = 0;
+	if (magic_ok(_end)) {
+		p = (const struct payload *)_end;
+	} else if (fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) &&
+		   fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end)) {
+		con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
+		for (uintptr_t a = rd_start; a + sizeof(struct payload) <= rd_end; a += 0x1000) {
+			if (magic_ok((const char *)a)) {
+				p = (const struct payload *)a;
+				break;
+			}
+		}
+	}
+	if (!p)
+		return "no HUSKYXNU payload (not at _end or in initrd)";
+	con_hex("PAYLOAD", (uintptr_t)p);
+	if (p->version != 2 || (p->adt_off & 7) || (p->auth_off & 7) || ((uintptr_t)p & 7))
 		return "bad payload header";
 
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
@@ -187,7 +205,7 @@ const char *loader_boot(uintptr_t dtb)
 	for (uint32_t i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
 		uintptr_t dst = s->vmaddr + pa_of_va_base;
-		copy64(dst, rd_start + s->file_off, s->file_size);
+		copy64(dst, (uintptr_t)p + s->file_off, s->file_size);
 		if (s->vmsize > s->file_size)
 			zero64(dst + ((s->file_size + 7) & ~7UL), s->vmsize - ((s->file_size + 7) & ~7UL));
 	}
@@ -200,7 +218,7 @@ const char *loader_boot(uintptr_t dtb)
 
 	/* ADT, then boot_args, behind the kernel; all below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
-	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+	copy64(adt_pa, (uintptr_t)p + p->adt_off, p->adt_size);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 

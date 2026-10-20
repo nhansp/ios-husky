@@ -31,8 +31,21 @@ python3 -I tools/mkadt.py out/boot/husky.adt "${EXTRA[@]}"
 echo ">> building payload"
 python3 -I tools/mkpayload.py "$KERNEL" out/boot/husky.adt out/boot/payload.bin \
 	--cmdline "$CMDLINE" ${RAMDISK:+--ramdisk "$RAMDISK"}
+echo ">> embedding payload in kernel image (appended at _end; image_size patched)"
+# ABL drops the boot.img ramdisk on `fastboot boot`, so the payload rides in
+# the kernel section itself: shim/out/Image is already padded to _end, so the
+# payload lands exactly at the shim's runtime _end. Patch the arm64 Image
+# header image_size (offset 16, 8-byte LE) to the total so ABL loads it all.
+cat shim/out/Image out/boot/payload.bin > out/boot/kernel-xnu
+python3 - out/boot/kernel-xnu <<'PY'
+import struct, sys
+f = sys.argv[1]
+b = bytearray(open(f, 'rb').read())
+struct.pack_into('<Q', b, 16, len(b))   # image_size
+open(f, 'wb').write(b)
+print(f'   kernel-xnu: {len(b)} bytes (image_size patched)')
+PY
 echo ">> packing boot image"
-python3 "$MKBOOTIMG" --header_version 4 \
-	--kernel shim/out/Image --ramdisk out/boot/payload.bin -o "$OUT"
+python3 "$MKBOOTIMG" --header_version 4 --kernel out/boot/kernel-xnu -o "$OUT"
 ls -l "$OUT" out/boot/payload.bin
 echo ">> deliver with:  fastboot boot $OUT"

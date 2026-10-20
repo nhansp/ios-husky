@@ -29,7 +29,7 @@ Payload layout (little endian, offsets from payload start):
   0x050  u64   auth_count     number of auth-fixup records
   0x058  char  cmdline[1024]
   0x458  seg[nsegs] { u64 vmaddr, vmsize, file_off(in payload), file_size }
-  auth_off: auth_count * { u64 slot_va, u32 info }
+  auth_off: auth_count * { u64 slot_va, u32 info, u32 pad }   (16 bytes each)
             info = diversity[0:15] | addrDiv<<16 | key<<17   (key 0=IA 1=IB 2=DA 3=DB)
 
 --ramdisk appends IMAGE as one more segment after the kernel and moves
@@ -181,10 +181,12 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
         out += data
         out += b'\0' * (-len(out) & 0xf)
         seg_table.append((vmaddr, vmsize, off, len(data)))
-    # auth-fixup table, 16-aligned
+    # auth-fixup table, 16-aligned; each record padded to 16 bytes so the u64
+    # slot_va stays 8-aligned (the shim is built -mstrict-align) and the stride
+    # matches the loader's natural struct auth_fixup layout.
     auth_off = len(out)
     for slot_va, key, addr_div, diversity in auth:
-        out += struct.pack('<QI', slot_va, diversity | (addr_div << 16) | (key << 17))
+        out += struct.pack('<QII', slot_va, diversity | (addr_div << 16) | (key << 17), 0)
     out += b'\0' * (-len(out) & 0xf)
     adt_off = len(out)
     out += adt_blob
