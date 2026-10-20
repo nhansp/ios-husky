@@ -21,9 +21,58 @@ _head:
 	.text
 	.globl _start
 _start:
+#ifdef PROBE_RAMOOPS
+	/*
+	 * Decisive handoff probe. Before touching anything (no EL drop, no
+	 * SMC, no stack, no cache ops), stamp the ramoops console zone with a
+	 * valid persistent_ram_buffer header and the literal bytes "RUN!",
+	 * then spin. MMU is off so these stores land straight in DRAM. If the
+	 * watchdog resets us and Android later shows "RUN!" in
+	 * console-ramoops-0, ABL genuinely transferred control to our entry.
+	 * x9 also records CurrentEL as an ASCII digit after "RUN!".
+	 */
+	movz	x8, #0xf000
+	movk	x8, #0xfd3f, lsl #16		/* x8 = 0xfd3ff000 */
+	movz	w9, #0x4244
+	movk	w9, #0x4347, lsl #16		/* sig "DBGC" */
+	str	w9, [x8]
+	mov	w9, #6
+	str	w9, [x8, #4]			/* start = 6 */
+	str	w9, [x8, #8]			/* size  = 6 */
+	movz	w9, #0x5552
+	movk	w9, #0x214e, lsl #16		/* "RUN!" */
+	str	w9, [x8, #12]
+	mrs	x9, CurrentEL
+	lsr	x9, x9, #2
+	add	w9, w9, #0x30			/* '0' + EL */
+	strb	w9, [x8, #16]
+	mov	w9, #0x0a
+	strb	w9, [x8, #17]			/* newline */
+	dsb	sy
+1:	b	1b
+#endif
+#ifdef HANG_AT_ENTRY
+	/* Bring-up probe: a hung phone means ABL really jumped here. */
+1:	b	1b
+#endif
 	msr	daifset, #0xf
 	mov	x19, x0			/* DTB pointer from ABL */
 	mrs	x20, CurrentEL		/* entry EL, reported by shim_main */
+	/*
+	 * Breadcrumb first, before the EL drop can fault: ask EL3 to set the
+	 * Pixel reboot mode to NORMAL (SMC_CMD_PRIV_REG write to PMU_ALIVE +
+	 * SYSIP_DAT0, as pixel-zuma-reboot.c does). Entered from `fastboot
+	 * boot` the mode still reads BOOTLOADER, so if we ever reach here the
+	 * next reset lands in Android instead of fastboot and the ramoops log
+	 * is readable. x19/x20 are callee-saved across the SMC.
+	 */
+	movz	w0, #0x0504
+	movk	w0, #0x8200, lsl #16	/* SMC_CMD_PRIV_REG */
+	movz	x1, #0x0810
+	movk	x1, #0x1546, lsl #16	/* PMU_ALIVE_BASE + SYSIP_DAT0 */
+	mov	x2, #1			/* PRIV_REG_OPTION_WRITE */
+	mov	x3, #0			/* REBOOT_MODE_NORMAL */
+	smc	#0
 	cmp	x20, #(2 << 2)
 	b.ne	1f
 	adr	x1, vectors		/* catch faults in the drop itself */

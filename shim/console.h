@@ -2,13 +2,17 @@
 #include <stdint.h>
 
 /*
- * The log goes to the ramoops console zone, which Android shows on the
- * next boot as /sys/fs/pstore/console-ramoops-0. Stock ramoops is
- * 0x400000@0xfd3ff000 with record_size=0, console_size=2M, ecc=0, so the
- * console zone is the first 2M of the region (fs/pstore/ram.c lays out
- * dmesg, console, ftrace, pmsg in that order).
+ * The log goes to the ramoops *pmsg* zone, which Android shows on the next
+ * boot as /sys/fs/pstore/pmsg-ramoops-0. Stock ramoops is 0x400000@0xfd3ff000
+ * with record_size=0, console_size=2M, ftrace=0, pmsg_size=2M, ecc=0, so
+ * fs/pstore/ram.c lays the zones out as dmesg(empty), console@0xfd3ff000+2M,
+ * ftrace(empty), pmsg@0xfd5ff000+2M. We deliberately avoid the console zone:
+ * ABL rewrites it with its own boot log every boot (including the one that
+ * boots Android after our reset), which would clobber our log before it can
+ * be read. ABL leaves the pmsg zone untouched, so our log survives the
+ * handoff. Both zones share the persistent_ram_buffer sig 0x43474244.
  */
-#define RAMOOPS_CON_BASE	0xfd3ff000UL
+#define RAMOOPS_CON_BASE	0xfd5ff000UL
 #define RAMOOPS_CON_SIZE	0x200000UL
 
 /* Colours are kept so sweet-derived callers build; the text log ignores them. */

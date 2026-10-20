@@ -7,7 +7,12 @@ cd "$(dirname "$0")"
 MKBOOTIMG=${MKBOOTIMG:-../artifacts/mkbootimg/mkbootimg.py}
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+# HANG=entry spins at the first instruction; HANG=probe stamps "RUN!" into
+# the ramoops console zone first, so a handoff shows up after a reset.
+CPPFLAGS=""
+[ "${HANG:-}" = entry ] && CPPFLAGS="-DHANG_AT_ENTRY"
+[ "${HANG:-}" = probe ] && CPPFLAGS="-DPROBE_RAMOOPS"
+CFLAGS="$CPPFLAGS -O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
 SRCS="start.S shim.c console.c fdt.c"
 mkdir -p out
 objs=()
@@ -25,5 +30,8 @@ $OBJCOPY -O binary out/shim.elf out/Image
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
 size=$((0x$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print $1}')))
 truncate -s "$size" out/Image
-python3 "$MKBOOTIMG" --header_version 4 --kernel out/Image -o out/shim-boot.img
-ls -l out/Image out/shim-boot.img
+img=out/shim-boot${HANG:+-hang-$HANG}.img
+python3 "$MKBOOTIMG" --header_version 4 --kernel out/Image -o $img
+# No AVB footer or partition-size padding: vbmeta is flashed with
+# --disable-verification, so ABL accepts an unsigned kernel-only boot.img.
+ls -l out/Image out/shim-boot*.img
