@@ -41,8 +41,13 @@ XNU generation newer, on Tensor.
 
 - Any dependency on Apple online services (activation uses the offline
   "Hactivation" path, as sweet does).
-- Touching husky's bootloader/modem/persist partitions. We only ever
-  `fastboot boot` a temporary image and write the iOS root to the data partition.
+- **Touching the bootloader/EL3 firmware stages — `abl`, `bl1/bl2/bl31`, `pbl`,
+  `tzsw`, `ldfw`, `gsa`, `pvmfw`, modem, persist. HARD line: modifying any of these
+  can hard-brick the phone, so we never write them — a probe that would require it
+  (e.g. EL3 gating PAC off) is a dead end, not a detour.** The bootloader is
+  unlocked; `boot`, `vbmeta`, `dtbo` and the data partition are fair game
+  (recoverable by re-flashing the factory image), so flashing `boot` / patching
+  `vbmeta` is an allowed fallback if `fastboot boot` turns out AVB-gated.
 
 ## Hard constraint: the userland is an input, not a build artifact of this project
 
@@ -187,20 +192,23 @@ Settled during review and folded above:
   caimito/stallion/tegu). SoC drivers are usable; the display fallback needs the
   husky-matched branch — see Decision 2.
 
-## Decisions needed from the owner (before planning is final)
+## Decisions (resolved 2026-10-20)
 
-1. **Anti-goal hardness (could reshape or end the project).** Three P0 probes may
-   reveal that proceeding *requires* touching partitions the anti-goals currently
-   forbid: `fastboot boot` may be AVB-gated on retail ABL (→ flash `boot` or patch
-   `vbmeta`), or retail `bl31` may disable PAC for EL1 (→ modify `bl31`). Is "never
-   touch bootloader / boot / vbmeta / bl31" a **hard** line (abandon rather than
-   cross it) or **soft** (allowed on an unlocked dev unit if a probe proves it
-   necessary)? The answer decides whether a failed probe is a dead end or a detour.
-2. **Correct kernel source branch.** Can the owner supply the husky-matched
-   `gs-6.1` branch that contains the `hk3` panel driver + zuma display stack? Needed
-   only if P0(e) shows we must drive the panel ourselves.
-3. **Serial dongle.** All of P0's method rests on a USB-C SBU serial dongle +
-   `fastboot oem uart enable`. Confirm the hardware is in hand.
+1. **Brick line is HARD on the bootloader/EL3 stages, soft on recoverable
+   partitions** (see anti-goals). Consequence baked into P0: the `bl31`/EL3-PAC
+   check in P0(c) is pass/fail-to-abort — if EL3 traps PAC for EL1 we stop, we do
+   not patch `bl31`. (Mitigating fact: Pixel `bl31` is ARM TF-A-derived, which
+   normally leaves `SCR_EL3.API/APK` set so PAC isn't trapped at lower ELs — so this
+   is a tail risk, not an expected one.) If `fastboot boot` is AVB-gated, flashing
+   `boot` / patching `vbmeta` is the allowed detour.
+2. **Panel source:** the supplied `lineage-24.0` tree has the zuma SoC display
+   driver (`cal_9865`) but not the `hk3` panel driver; `hk3` to be sourced from
+   `android-gs-shusky-6.1` only if P0(e) forces a from-scratch panel bring-up.
+   Manifest for reference:
+   `LineageOS/android_kernel_google_gs-6.1_manifest@lineage-24.0`.
+3. **Hardware:** husky is connected (adb/fastboot over USB, `adb reboot bootloader`
+   available). USB-C SBU **serial dongle not yet explicitly confirmed** — required
+   for P0(b); P0(a) needs only fastboot. Confirm dongle before P0(b).
 
 ## Left to the builder
 
