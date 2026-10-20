@@ -75,9 +75,15 @@ jobs:
           files=(xnu/patches/*.patch xnu/patches/*.sh)
           if [ ${#files[@]} -gt 0 ]; then cp "${files[@]}" "$PD"/; fi
           echo "patch dir $PD:"; ls "$PD" || true
-          # Route the kernel compiler through ccache (DXB exports CC/CXX itself).
-          sed -i '' 's#export CC="$(xcrun -find clang)"#export CC="ccache $(xcrun -find clang)"#' dxb/build.sh
-          sed -i '' 's#export CXX="$(xcrun -find clang++)"#export CXX="ccache $(xcrun -find clang++)"#' dxb/build.sh
+          # Route the compiler through ccache via SINGLE-executable wrappers:
+          # make splits $(CC) into words, but xcodebuild (DXB's host tools)
+          # execs CC as one path, so "ccache clang" must be one script.
+          WRAP="$GITHUB_WORKSPACE/ccwrap"; mkdir -p "$WRAP"
+          printf '#!/bin/sh\nexec ccache "$(xcrun -find clang)" "$@"\n'   > "$WRAP/clang"
+          printf '#!/bin/sh\nexec ccache "$(xcrun -find clang++)" "$@"\n' > "$WRAP/clang++"
+          chmod +x "$WRAP/clang" "$WRAP/clang++"
+          sed -i '' "s#export CC=\"\$(xcrun -find clang)\"#export CC=\"$WRAP/clang\"#" dxb/build.sh
+          sed -i '' "s#export CXX=\"\$(xcrun -find clang++)\"#export CXX=\"$WRAP/clang++\"#" dxb/build.sh
           grep -n 'export C\(C\|XX\)=' dxb/build.sh | head
 
       - name: ccache cache
