@@ -95,6 +95,24 @@ jobs:
           else
             echo "ccache disabled for this run"
           fi
+          # Apple ships no libHUSKY KernelSupport archive; HUSKY is VMAPPLE-class,
+          # so alias the board's closed KDK support lib to VMAPPLE's before the
+          # kernel link. Injected at build_xnu/_library start (KDK is set by then).
+          if [ "$MACHINE_CONFIG" = "HUSKY" ]; then
+            python3 - <<'PY'
+p='dxb/build.sh'; s=open(p).read()
+inj=('%s() {\n'
+     '    for v in RELEASE DEVELOPMENT DEBUG; do\n'
+     '        KS="${KDKROOT}/System/Library/KernelSupport"; SRC="$KS/libVMAPPLE.os.$v.a"\n'
+     '        [ -f "$SRC" ] && [ ! -e "$KS/libHUSKY.os.$v.a" ] && sudo ln -sf "libVMAPPLE.os.$v.a" "$KS/libHUSKY.os.$v.a"\n'
+     '    done\n')
+for fn in ('build_xnu_library','build_xnu'):
+    a=fn+'() {\n'
+    assert s.count(a)==1, a
+    s=s.replace(a, inj%fn, 1)
+open(p,'w').write(s); print('injected libHUSKY->libVMAPPLE alias into build_xnu[_library]')
+PY
+          fi
 
       - name: ccache cache
         if: ${{ (inputs.use_ccache || 'false') == 'true' }}
