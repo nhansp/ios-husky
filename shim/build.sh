@@ -13,7 +13,7 @@ CPPFLAGS=""
 [ "${HANG:-}" = entry ] && CPPFLAGS="-DHANG_AT_ENTRY"
 [ "${HANG:-}" = probe ] && CPPFLAGS="-DPROBE_RAMOOPS"
 CFLAGS="$CPPFLAGS -O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
-SRCS="start.S shim.c console.c fdt.c"
+SRCS="start.S shim.c console.c fdt.c pac.S"
 mkdir -p out
 objs=()
 for f in $SRCS; do
