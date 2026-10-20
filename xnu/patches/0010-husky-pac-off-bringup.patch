@@ -1,0 +1,22 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 35ab56f..6bcda0b 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -778,6 +778,17 @@ common_start:
+ 
+ 	// Enable caches, MMU, ROP and JOP
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
++#if defined(HUSKY)
++	/*
++	 * Bring-up: clear SCTLR_EL1 EnIA/EnIB/EnDA/EnDB so pac*/aut* execute as
++	 * NOPs. Lets the kernel boot on unsigned fixup pointers (loader built with
++	 * HUSKY_NO_PAC_SIGN) while we debug the rest of early boot; re-enable once
++	 * the arm64e fixup signing is validated. x1 = (1<<31|30|27|13).
++	 */
++	movz	x1, #0x2000
++	movk	x1, #0xc800, lsl #16
++	bic	x0, x0, x1
++#endif /* HUSKY */
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+ 
