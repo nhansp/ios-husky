@@ -380,6 +380,30 @@ P0c PAC spike proper (sign/authenticate round-trip at EL1, EL3
 PAuth-contract check) and the PPL source audit of xnu-12377, then P1
 early-kernel bring-up (loader.c load of the XNU Mach-O + synthesized ADT).
 
+## P0c PAC spike (2026-10-20) — PASS on hardware
+
+On the A510 boot core, at EL1 after the EL2->EL1 drop (pac.S + shim.c,
+`artifacts/p0a/shim-pac-log.txt`):
+
+| Check | Result |
+| --- | --- |
+| Enable pac/aut | `SCTLR_EL1 = 0xf8d02980` (En{IA,IB,DA,DB} set) |
+| EL3 PAuth contract | `pacia 0x12345670 -> 0xa229738b12345670` — a real QARMA5 signature, so `pac`/`aut` are **not trapped to EL3** (`SCR_EL3.API=1`) |
+| Architected keys | `APIAKeyLo/Hi_EL1`, `APGAKeyLo/Hi_EL1` settable at EL1 and used |
+| Determinism | two signings identical |
+| Round-trip | `autia` recovers `0x12345670` exactly |
+| Generic MAC | `pacga -> 0x57739fb4_00000000` |
+| FPAC | corrupt `autia` faults: SYNC, `ESR 0x72000000` (EC=0x1C, FEAT_FPAC), caught by our EL1 vectors |
+
+Consequence for XNU: the arm64e PAC path is architecturally available and
+correct here. Apple's kernel programs the keys through Apple-private SPRs
+and GXF/exception-gating that don't exist on zuma; the port retargets
+those to the architected `AP*Key_EL1` regs proven above (sweet had no PAC
+analog, so this is new code, but bounded — key plumbing, not crypto). FPAC
+being on means a mis-signed pointer traps rather than silently corrupting,
+matching iOS behaviour, so the kernel's PAC exception handling must be
+wired before arm64e userland runs.
+
 ## Left to the builder
 
 - Exact ABL framebuffer address/format (one live `fastboot boot` probe).
