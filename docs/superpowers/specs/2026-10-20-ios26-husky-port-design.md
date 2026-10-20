@@ -210,6 +210,30 @@ Settled during review and folded above:
    available). USB-C SBU **serial dongle not yet explicitly confirmed** — required
    for P0(b); P0(a) needs only fastboot. Confirm dongle before P0(b).
 
+## iOS 26 root recon (2026-10-20, from the extracted `iOSRoot` HFS+ image)
+
+Confirmed against the assembled root (`artifacts/ios26-root-23G90.img`, HFSX,
+478,602 entries, `ProductVersion 26.6.2 / 23G90 / "iPhone OS"`):
+
+- **dyld shared cache is `arm64e`-only** (`dyld_shared_cache_arm64e` + `.01`–`.04`
+  subcaches, plus a DriverKit cache). No arm64 slice → **PAC is mandatory**, hardening
+  risk #1 from a maybe to a fact.
+- **Cache lives in the cryptex path** `private/preboot/Cryptexes/OS/System/Library/
+  Caches/com.apple.dyld/`, not the classic `/System/Library/Caches/com.apple.dyld`.
+  On-device these are signature-verified cryptex disk images mounted by the
+  preboot/cryptex machinery. We merged them in as plain dirs, so a **new P3 task**:
+  make dyld resolve its cache without a real cryptex mount (firmlinks/binds/symlinks)
+  — a meaner version of sweet's "add dyld cache links."
+- **628 LaunchDaemons.** Bring-up disable-list (P3 root-tweaks, the sweet
+  `sweet-root-tweaks.py` analog, scaled up): `CommCenter*` / `WirelessRadioManager` /
+  `DumpBasebandCrash` (no modem), `wifid` / `bluetooth*` (no radio), `locationd`
+  (no GPS), `watchdogd` (kills slow procs during soft-render boot),
+  `analyticsd`/`aggregated`/`cloudd`/`apsd`/`identityservicesd`/`itunescloudd`
+  (network/crash loops), `appleidsetupd`/`mediasetupd` (skip Setup),
+  `mobileactivationd` → offline Hactivation.
+- **Goal binaries present:** `SpringBoard.app` + `SpringBoard.framework` + backboardd;
+  MobileGestalt daemon present (consumes the `d431ap` `/product` device tree).
+
 ## Left to the builder
 
 - Exact ABL framebuffer address/format (one live `fastboot boot` probe).
