@@ -234,6 +234,32 @@ Confirmed against the assembled root (`artifacts/ios26-root-23G90.img`, HFSX,
 - **Goal binaries present:** `SpringBoard.app` + `SpringBoard.framework` + backboardd;
   MobileGestalt daemon present (consumes the `d431ap` `/product` device tree).
 
+## Bootloader (LK/ripcurrent) dmesg recon (2026-10-20, via `fastboot oem dmesg`)
+
+`fastboot oem dmesg` dumps the full bootloader log over fastboot — a second debug
+channel independent of the UART. Key facts:
+
+- **Display is DSI command-mode + DSC — changes P4.** Panel `google-hk3`, `cmd mode`,
+  DECON `command mode, hw trigger`, path `DSCC DSC_ENC1 DSC_ENC0`. ABL configures a
+  full-res window: `xres(1344) yres(2992)`, `win_end_pos 0xbaf053f` = (2991<<16)|1343.
+  Unlike sweet's video-mode continuously-scanned FB, husky's panel self-refreshes its
+  last frame from GRAM and **each update needs a DECON frame trigger (TE) + DSC
+  encode**. So the display path is not "write pixels into a scanned buffer" — it's
+  "write raw frame to DECON source + trigger a (DSC-encoded) frame." Bigger P4 task;
+  the FB *source* address is still TBD (P0e), but geometry + pipeline are known.
+- **UFS:** Samsung UFS 3.1, controller **v3.0**, caps `0x1383ff1f`, `KLUDG4UHGC-B0E1`,
+  128 GB, 4 LUNs, boot LUN `0x2`, WriteBooster present — host-driver reference.
+- **PMIC:** `S2MPG_M` (S2MPG14 main) + `S2MPG_S` (S2MPG15 sub), chipid 0x3; PWRONSRC/
+  OFFSRC/INT registers logged — buttons/rail reference.
+- **Boot chain order confirmed:** BL1 → PBL → **BL2** → EL3(`bl31`) → ABL(LK). (`bl2`
+  is a real stage — correctly in the never-touch set.)
+- Misc: SoC `0x09865` Zuma rev B1; USB `dwc3`; TCPC/PD `max77759`; haptics `cs40l26`;
+  NFC `st21nfc`; modem `g5300i` (Exynos — non-goal). Slot `b` active.
+- **Debug channels:** `fastboot oem dmesg` covers the bootloader stage. The *live* UART
+  (`ttySAC0 @ 0x10870000`, P0b) needs a host-visible serial endpoint — currently
+  `lsusb` shows only the fastboot device, no USB-serial bridge / `/dev/ttyUSB*`, so the
+  dongle path must be sorted before the shim-UART spike.
+
 ## Left to the builder
 
 - Exact ABL framebuffer address/format (one live `fastboot boot` probe).
