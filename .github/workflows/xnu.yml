@@ -29,11 +29,8 @@ on:
       use_ccache:
         description: route the compiler through ccache (off until the deployment-target interaction is resolved)
         default: "false"
-  push:
-    branches: [main, master]
-    paths:
-      - "xnu/patches/**"
-      - ".github/workflows/xnu.yml"
+  # Dispatch-only: a push trigger raced every manual dispatch and left a
+  # confusing concurrency-cancelled run each time. Build via `gh workflow run`.
 
 concurrency:
   group: xnu-${{ github.ref }}

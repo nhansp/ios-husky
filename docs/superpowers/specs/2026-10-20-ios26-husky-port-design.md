@@ -477,6 +477,31 @@ bearing for macOS VMs on Apple Silicon, so it is likely to persist; `config_pmap
 is the one Apple may eventually drop once all shipping devices are SPTM. The SoC a
 future port poses as (A14, A15, …) remains a userland-fit choice, decoupled from this.
 
+## P1.1 result (2026-10-20) — HUSKY kernel builds
+
+`kernel.development.husky` builds end to end on CI (nhansp/ios-husky,
+`.github/workflows/xnu.yml`): Mach-O 64-bit **arm64e** (caps PAK00), PIE,
+21.7 MB. `xnu/patches/0001-husky-machine-config.patch` adds the HUSKY board
+(MakeInc.def, board_config.h, HUSKY.h, pexpert Makefile manifest, proc_reg.h,
+start.s SCTLR skip, and doconf marking soc "husky" SOC_IS_VIRTUALIZED).
+
+Shake-out that got here (each one mechanical, surfaced by CI): ccache
+wrapper must be a single-executable script (xcodebuild execs CC as one path)
+— now opt-in/off pending a deployment-target interaction; HUSKY.h must be in
+pexpert's EXPORT_MD_LIST manifest; SOC_IS_VIRTUALIZED (via doconf) disables
+the Apple-CPMU/CTRR class husky lacks; the KDK's closed KernelSupport archive
+(aliased libHUSKY -> libVMAPPLE in the workflow) is coupled to VMAPPLE's exact
+config, so **HUSKY is built at VMAPPLE parity** (HUSKY.h = `#define HUSKY 1` +
+`#include VMAPPLE.h`; SME/paravirt kept, runtime-gated on the ID regs). A tiny
+`xnu-errors` artifact carries a deduped error report so the full ~400k-line
+log never has to be pulled.
+
+Next (P1.2): diverge from parity as targeted patches on this green build —
+the architected-PAC key programming (fill the empty `pac_asm.h` macros with
+the `msr AP*Key_EL1` writes validated in P0c; drop VMAPPLE's paravirt hvc
+PAC path) and the real MMIO/topology via the synthesized ADT — then the
+loader/mkpayload/mkadt port to the 12377 boot_args/ADT contract.
+
 ## Left to the builder
 
 - Exact ABL framebuffer address/format (one live `fastboot boot` probe).
