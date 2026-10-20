@@ -1,0 +1,29 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index a44aaa9..f7be1f4 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1554,6 +1554,9 @@ arm_vm_physmap_init(boot_args *args)
+ {
+ 	ptov_table_entry temp_ptov_table[PTOV_TABLE_SIZE];
+ 	bzero(temp_ptov_table, sizeof(temp_ptov_table));
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi: enter\n"); }
++#endif
+ 
+ 	// This is memory that will either be handed back to the VM layer via ml_static_mfree(),
+ 	// or will be available for general-purpose use.   Physical aperture mappings for this memory
+@@ -1604,8 +1607,14 @@ arm_vm_physmap_init(boot_args *args)
+ 	}
+ 
+ 	// Remainder of physical memory
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi: pre main-ram slide\n"); }
++#endif
+ 	arm_vm_physmap_slide(temp_ptov_table, (args->topOfKernelData - gPhysBase + gVirtBase),
+ 	    real_avail_end - args->topOfKernelData, AP_RWNA, 0);
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi: slides done\n"); }
++#endif
+ 
+ 
+ #if HAS_MTE
