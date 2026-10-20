@@ -1,0 +1,36 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 91e672c..76cd529 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -368,6 +368,12 @@ husky_vp_bc(const char *s)
+ 	}
+ 	p->start = pos;
+ 	p->size = pos;
++	/* The ring is mapped cacheable here, so clean to PoC or a watchdog reset
++	 * loses the writes before pstore reads physical RAM. */
++	for (uintptr_t a = 0xfd5ff000UL; a < 0xfd5ff000UL + 12 + pos; a += 64) {
++		__asm__ volatile ("dc cvac, %0" :: "r" (a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ #endif /* HUSKY */
+ 
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index b2ce635..00f7cde 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -480,6 +480,14 @@ start_cpu:
+ 	add	w1, w1, #1
+ 	str	w1, [x0, #4]			// start = size+1
+ 	str	w1, [x0, #8]			// size  = size+1
++	/*
++	 * Clean to PoC: once the MMU is on this ring is mapped cacheable, so flush
++	 * the header line and the just-written data byte to RAM, or a watchdog
++	 * reset loses the write before pstore reads it. Harmless with the MMU off.
++	 */
++	dc	cvac, x0			// header (sig/start/size)
++	add	x2, x2, x1
++	dc	cvac, x2			// data byte just written
+ 	dsb	sy
+ .endm
+ #endif /* HUSKY */
