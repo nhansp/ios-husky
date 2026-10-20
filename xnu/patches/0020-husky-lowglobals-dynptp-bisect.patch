@@ -1,0 +1,24 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index f7be1f4..e98d5e7 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2158,6 +2158,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	ptpage_vaddr = alloc_ptpage(TRUE);
+ 	*cpu_l2_tte = (kvtophys(ptpage_vaddr) & ARM_TTE_TABLE_MASK) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID | ARM_TTE_TABLE_PXN | ARM_TTE_TABLE_XN;
+ 	bzero((void *)ptpage_vaddr, ARM_PGBYTES);
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: lowglobals ok\n"); }
++#endif
+ 
+ 	/*
+ 	 * Initialize l2 page table pages :
+@@ -2177,6 +2180,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	 */
+ 	init_ptpages(cpu_tte, dynamic_memory_begin, VM_MAX_KERNEL_ADDRESS, TRUE, ARM_DYNAMIC_TABLE_XN | ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA));
+ #endif
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: dyn ptpages ok\n"); }
++#endif
+ 
+ #if KASAN
+ 	/* record the extent of the physmap */
