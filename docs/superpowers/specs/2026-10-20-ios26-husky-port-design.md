@@ -329,6 +329,57 @@ untrapped, FGT/HCRX cleared when present), text log in the ramoops console zone,
 reports EL, load address, FDT header, ID registers, PSCI/SMCCC, then warm-resets
 (SYSTEM_RESET2 if offered). Pass = the log shows up in `console-ramoops-0`.
 
+## P0a/P0b results (2026-10-20) — PASS on hardware
+
+Delivery gate (the real one): husky ABL chains `boot` verification to the
+boot image's own vbmeta footer, so an unsigned kernel-only `boot.img` is
+**rejected before the first instruction runs** (ABL resets to fastboot in
+~3 s). This looked identical to "shim crashed," and cost most of the
+session to isolate. The fix is to reflash the root `vbmeta` with
+verification off:
+
+```
+fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img
+fastboot -w            # verity state change invalidates FBE userdata
+```
+
+The disable flags are only honoured in the **root** `vbmeta`; it chains to
+`boot`, `init_boot`, `vbmeta_system` (different key), `vbmeta_vendor`, and
+disabling at the root cuts all chains, so `vbmeta_system` needs no change.
+`vbmeta.img` is the build-matched one for CP41.260831.019 (rollback index
+1791158400), pulled from the OTA with `scratchpad/ota_pull_partition.py`.
+After this, the shim is a plain unsigned v4 `boot.img` — no footer, no
+padding — delivered by `fastboot boot` (nothing flashed).
+
+Debug channel that works: write the shim log to the ramoops **pmsg** zone
+`0xfd5ff000` (not the console zone `0xfd3ff000`, which ABL overwrites with
+its own log on the very next boot). As the first act at `_start`, before
+the EL drop can fault, the shim asks EL3 to set the Pixel reboot mode to
+NORMAL; `fastboot boot` leaves the mode at BOOTLOADER, so if the shim runs
+at all the next PSCI `SYSTEM_RESET` boots Android instead of fastboot, and
+`adb shell cat /sys/fs/pstore/pmsg-ramoops-0` reads the log back. Serial-
+free, survives the handoff, no root needed (shell is in the `log` group).
+
+Measured (`artifacts/p0a/shim-pmsg-log.txt`):
+
+| What | Value | Note |
+| --- | --- | --- |
+| Entry / current EL | `entry=2 now=1` | ABL enters at EL2; **EL2→EL1 drop works** |
+| EL3 priv-reg SMC | `BOOTMODE 0` | reboot-mode write succeeds |
+| Load address | `0x8000_0000..0x8001_4000` | DRAM base, 81 KB image |
+| DTB in x0 | `0xb400_0000`, FDT magic `d00dfeed`, size `0x73dc8` | **ABL passes a valid ~475 KB FDT** |
+| `/chosen` initrd | `0xb000_0000..0xb311_72a7` | ramdisk range parsed by `fdt.c` |
+| Boot CPU MIDR | `0x411fd461` | **A510 (little) boots first** |
+| PAC (`ISAR1`) | APA=5, GPA=1 | **QARMA5 address + generic auth** |
+| Granule/PA (`MMFR0`) | TGran16=1, PARange=2 | **16 KB granule**, 40-bit PA |
+| PSCI / SMCCC | `0x0001_0001` / `0x0001_0002` | **v1.1 / v1.2** |
+
+Net: delivery, EL handoff, FDT read, PSCI/SMCCC, and the de-risking CPU
+features (16K granule, PAC/QARMA5) are all confirmed on-device. Next:
+P0c PAC spike proper (sign/authenticate round-trip at EL1, EL3
+PAuth-contract check) and the PPL source audit of xnu-12377, then P1
+early-kernel bring-up (loader.c load of the XNU Mach-O + synthesized ADT).
+
 ## Left to the builder
 
 - Exact ABL framebuffer address/format (one live `fastboot boot` probe).
