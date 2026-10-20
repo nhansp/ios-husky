@@ -1,0 +1,121 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 8213f33..91e672c 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -344,6 +344,33 @@ arm_auxkc_init(void *mh, void *base)
+  *		Function:		Runs on the boot CPU, once, on entry from iBoot.
+  */
+ 
++#if defined(HUSKY)
++/*
++ * husky bring-up breadcrumb for the window BEFORE arm_vm_init (where ml_io_map
++ * is not yet usable). start.s maps a V=P block at 0xfc000000 and TTBR0 stays
++ * active into arm_init, so the pmsg ring at 0xfd5ff000 is reachable directly.
++ * Continues the shim's log. Stays within the first 16KB of the ring (the only
++ * part guaranteed mapped) - breadcrumbs are tiny.
++ */
++static void
++husky_vp_bc(const char *s)
++{
++	volatile struct { uint32_t sig, start, size; uint8_t data[]; } *p =
++	    (void *)0xfd5ff000UL;
++	if (p->sig != 0x43474244U || p->size > 0x3000U) {
++		p->sig = 0x43474244U;
++		p->start = 0;
++		p->size = 0;
++	}
++	uint32_t pos = p->size;
++	while (*s && pos < 0x3000U) {
++		p->data[pos++] = (uint8_t)*s++;
++	}
++	p->start = pos;
++	p->size = pos;
++}
++#endif /* HUSKY */
++
+ __startup_func
+ void
+ arm_init(
+@@ -496,14 +523,26 @@ arm_init(
+ 	kernel_debug_string_early("kernel_startup_bootstrap");
+ 	kernel_startup_bootstrap();
+ 
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: entry\n");
++#endif
+ 	/*
+ 	 * Initialize the timer callout world
+ 	 */
+ 	timer_call_init();
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: timer_call_init ok\n");
++#endif
+ 
+ 	cpu_init();
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: cpu_init ok\n");
++#endif
+ 
+ 	processor_bootstrap();
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: processor_bootstrap ok\n");
++#endif
+ 
+ 	if (PE_parse_boot_argn("maxmem", &maxmem, sizeof(maxmem))) {
+ 		xmaxmem = (uint64_t) maxmem * (1024 * 1024);
+@@ -569,11 +608,15 @@ arm_init(
+ 	gDramSize = *dram_size;
+ 	pmap_first_pnum = (ppnum_t)atop(gDramBase);
+ 
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: pre arm_vm_init\n");
++#endif
+ 	arm_vm_init(xmaxmem, args);
+ 
+ #if defined(HUSKY)
+-	/* ml_io_map works from here (arm_vm_init set up the VM); breadcrumb the
+-	 * steps up to serial_init to locate the early-boot hang. */
++	/* arm_vm_init done. Use the TTBR0 V=P breadcrumb too (still valid here if
++	 * TTBR0 is live), then switch to ml_io_map-based once confirmed. */
++	husky_vp_bc("arm_init: arm_vm_init done (vp)\n");
+ 	extern void husky_early_bc(const char *s);
+ 	husky_early_bc("arm_init: arm_vm_init done\n");
+ #endif
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index d08e7ed..99d6169 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -645,6 +645,22 @@ Lkernelcache_base_found:
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
++#if defined(HUSKY)
++	/*
++	 * husky: map one V=P L2 block (32MB, 16K granule) at 0xfc000000 so early C
++	 * (arm_init/arm_vm_init, where TTBR0 V=P is still active) and the post-MMU
++	 * asm breadcrumb can reach the ramoops pmsg ring at 0xfd5ff000. This block
++	 * (0xfc000000-0xfe000000) is log/ramoops RAM only - it does NOT cover the
++	 * firewall-protected gsa/coprocessor region (0x90200000), so no speculative
++	 * access to protected memory.
++	 */
++	movz	x0, #0x0000
++	movk	x0, #0xfc00, lsl #16		// 0xfc000000
++	mov		x4, x0
++	mov		x5, #1				// one 32MB L2 block
++	create_bootstrap_mapping x0, x4, x5, x1, x2, x6, x10, x11, x12, x13
++#endif /* HUSKY */
++
+ 	/* Ensure TTEs are visible */
+ 	dsb		ish
+ 
+@@ -792,6 +808,10 @@ common_start:
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+ 
++#if defined(HUSKY)
++	HUSKY_BC 0x4e					// 'N': MMU+caches enabled, now writing pmsg via the V=P map
++#endif /* HUSKY */
++
+ #if !VMAPPLE && !defined(HUSKY)
+ 	MOV64	x1, SCTLR_EL1_DEFAULT
+ 	cmp		x0, x1
