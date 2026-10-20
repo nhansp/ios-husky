@@ -1,0 +1,40 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index dbac2e2..a44aaa9 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1841,6 +1841,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	 */
+ 	gPhysSize = mem_size = ((gPhysBase + args->memSize) & ~PAGE_MASK) - gPhysBase;
+ 	mem_actual = args->memSizeActual ? args->memSizeActual : mem_size;
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: start\n"); }
++#endif
+ 
+ 	if ((memory_size != 0) && (mem_size > memory_size)) {
+ 		mem_size = memory_size;
+@@ -1861,9 +1864,15 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	physmap_base = phystokv(args->topOfKernelData);
+ #endif
+ 
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: pre early_random\n"); }
++#endif
+ 	// Slide the physical aperture to a random page-aligned location within the slide range
+ 	uint64_t physmap_slide = early_random() & ARM64_PHYSMAP_SLIDE_MASK & ~((uint64_t)PAGE_MASK);
+ 	assert(physmap_slide < ARM64_PHYSMAP_SLIDE_RANGE);
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: post early_random\n"); }
++#endif
+ 
+ 	physmap_base += physmap_slide;
+ 
+@@ -1981,6 +1990,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	 */
+ 	init_ptpages(cpu_tte, physmap_base, ROUND_L1(physmap_end), TRUE, ARM_DYNAMIC_TABLE_XN | ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA));
+ #endif
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: post init_ptpages\n"); }
++#endif
+ 
+ 
+ #if __ARM_KERNEL_PROTECT__
