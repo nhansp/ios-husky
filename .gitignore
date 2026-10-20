@@ -1,0 +1,5 @@
+# Reference project (its own repo) — do not track
+ios-sweet/
+
+# Downloaded factory packages + extracted images — large, redistributable only by Google
+artifacts/
