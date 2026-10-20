@@ -1,0 +1,59 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index bde5c22..1f85732 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -645,9 +645,8 @@ arm_init(
+ 	arm_vm_init(xmaxmem, args);
+ 
+ #if defined(HUSKY)
+-	/* arm_vm_init done. Use the TTBR0 V=P breadcrumb too (still valid here if
+-	 * TTBR0 is live), then switch to ml_io_map-based once confirmed. */
+-	husky_vp_bc("arm_init: arm_vm_init done (vp)\n");
++	/* arm_vm_init invalidated TTBR0, so husky_vp_bc (V=P) would fault here; use
++	 * ml_io_map-based husky_early_bc only. */
+ 	extern void husky_early_bc(const char *s);
+ 	husky_early_bc("arm_init: arm_vm_init done\n");
+ #endif
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 756af52..dbac2e2 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2122,6 +2122,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	vm_prelink_edata = segPRELINKDATAB + segSizePRELINKDATA;
+ 
+ 	arm_vm_prot_init(args);
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: prot_init ok\n"); }
++#endif
+ 
+ 	/*
+ 	 * Initialize the page tables for the low globals:
+@@ -2162,9 +2165,17 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #endif /* KASAN */
+ 
+ 	arm_vm_physmap_init(args);
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: physmap_init ok\n"); }
++#endif
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
+ 
+ 	ml_enable_monitor();
++#if defined(HUSKY)
++	/* TTBR0 V=P still valid here; last point husky_vp_bc works (set_mmu_ttb
++	 * below invalidates TTBR0). */
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: pre ttbr0-invalidate\n"); }
++#endif
+ 
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+@@ -2266,6 +2277,10 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #endif
+ #endif
+ 	pmap_bootstrap(dynamic_memory_begin);
++#if defined(HUSKY)
++	/* ml_io_map works now; husky_vp_bc would fault (TTBR0 invalidated above). */
++	{ extern void husky_early_bc(const char *); husky_early_bc("  avi: pmap_bootstrap ok\n"); }
++#endif
+ 
+ 	disable_preemption();
+ 
