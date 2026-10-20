@@ -1,0 +1,52 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 561f507..bde5c22 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -352,7 +352,8 @@ arm_auxkc_init(void *mh, void *base)
+  * Continues the shim's log. Stays within the first 16KB of the ring (the only
+  * part guaranteed mapped) - breadcrumbs are tiny.
+  */
+-static void
++void husky_vp_bc(const char *s);
++void
+ husky_vp_bc(const char *s)
+ {
+ 	volatile struct { uint32_t sig, start, size; uint8_t data[]; } *p =
+diff --git a/osfmk/kern/static_if_common.c b/osfmk/kern/static_if_common.c
+index 1e553d6..bcaa4c4 100644
+--- a/osfmk/kern/static_if_common.c
++++ b/osfmk/kern/static_if_common.c
+@@ -253,6 +253,10 @@ static_if_init(const char *args)
+ 	unsigned long sie_flags;
+ 	static_if_key_t sie_key;
+ 
++#if defined(HUSKY)
++	extern void husky_vp_bc(const char *s);
++	husky_vp_bc("  sif: enter\n");
++#endif
+ 	while (--sie >= __static_if_entries) {
+ 		sie_flags = sie->sie_link & 3ul;
+ 		sie_key   = __static_if_entry_next(sie);
+@@ -261,13 +265,22 @@ static_if_init(const char *args)
+ 		sie_key->sik_entries_head = sie;
+ 		sie_key->sik_entries_count++;
+ 	}
++#if defined(HUSKY)
++	husky_vp_bc("  sif: chain loop done\n");
++#endif
+ 
+ 	for (static_if_initializer *f = __static_if_initializer_entries;
+ 	    f < __static_if_initializer_entries_end; f++) {
+ 		(*f)(args);
+ 	}
++#if defined(HUSKY)
++	husky_vp_bc("  sif: initializers done\n");
++#endif
+ 
+ 	ml_static_if_flush_icache();
++#if defined(HUSKY)
++	husky_vp_bc("  sif: flush_icache done\n");
++#endif
+ }
+ 
+ MARK_AS_FIXUP_TEXT void
