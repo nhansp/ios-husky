@@ -82,33 +82,38 @@ index 8213f33..91e672c 100644
  	husky_early_bc("arm_init: arm_vm_init done\n");
  #endif
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index d08e7ed..99d6169 100644
+index d08e7ed..b2ce635 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -645,6 +645,22 @@ Lkernelcache_base_found:
+@@ -645,6 +645,27 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
 +#if defined(HUSKY)
 +	/*
-+	 * husky: map one V=P L2 block (32MB, 16K granule) at 0xfc000000 so early C
++	 * husky: add ONE V=P L2 block (32MB, 16K granule) at 0xfc000000 so early C
 +	 * (arm_init/arm_vm_init, where TTBR0 V=P is still active) and the post-MMU
 +	 * asm breadcrumb can reach the ramoops pmsg ring at 0xfd5ff000. This block
 +	 * (0xfc000000-0xfe000000) is log/ramoops RAM only - it does NOT cover the
-+	 * firewall-protected gsa/coprocessor region (0x90200000), so no speculative
-+	 * access to protected memory.
++	 * firewall-protected gsa/coprocessor region (0x90200000).
++	 *
++	 * Under 16K granule L1 entries span 64GB, so pmsg shares the kernel's V=P
++	 * L1 entry (index 0) and therefore its L2 table. We must NOT allocate a new
++	 * L2 (that overwrites L1[0] and unmaps the kernel); instead write the block
++	 * straight into the existing V=P L2 table, read back from V=P L1[0].
 +	 */
++	ldr		x6, [x1]				// x1 = V=P L1 table; x6 = L1[0] (-> V=P L2)
++	and		x6, x6, #(ARM_TTE_TABLE_MASK)		// x6 = V=P L2 table address
 +	movz	x0, #0x0000
-+	movk	x0, #0xfc00, lsl #16		// 0xfc000000
++	movk	x0, #0xfc00, lsl #16			// vbase = pbase = 0xfc000000
 +	mov		x4, x0
-+	mov		x5, #1				// one 32MB L2 block
-+	create_bootstrap_mapping x0, x4, x5, x1, x2, x6, x10, x11, x12, x13
++	create_l2_block_entries x0, x4, x6, #1, x10, x11, x12, x13
 +#endif /* HUSKY */
 +
  	/* Ensure TTEs are visible */
  	dsb		ish
  
-@@ -792,6 +808,10 @@ common_start:
+@@ -792,6 +813,10 @@ common_start:
  	MSR_SCTLR_EL1_X0
  	isb		sy
  
