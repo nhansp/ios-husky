@@ -75,7 +75,7 @@ does not implement extraction, decryption, or repackaging.
 | DRAM base | `0x8000_0000` | different | shim MMU (16K granule) |
 | Interrupt ctrl | `arm,gic-v3 @ 0x1040_0000` | also GICv3 | reuse sweet's GICv3 path |
 | Debug UART | `ttySAC0 @ 0x1087_0000`, exynos4210 mmio32 | sweet had none | real serial console (big win) |
-| UFS | `ufs@1302_0000`, `ufs@1320_0000` | Qualcomm → Exynos | rewrite host driver |
+| UFS | boot UFS **`ufs@1320_0000`** (`androidboot.boot_devices=13200000.ufs`); DTS also lists `ufs@1302_0000` | Qualcomm → Exynos | rewrite host driver |
 | Display | `decon@1947_0000`, `dsim@1944_0000`, panel `google,hk3` | MDSS → DECON/DSIM | ABL-framebuffer blit |
 | Touch | **`st,fts`** over SPI / touch-bus-negotiator | Goodix GENI → ST FTS | rewrite driver |
 | PMIC | **`s2mpg14mfd` + `s2mpg15mfd`** over bit-bang SPMI | Qualcomm RPMh/SPMI → S2MPG | buttons + rail enables |
@@ -276,9 +276,12 @@ with root. Decisive findings:
 - **PSCI v1.1 / SMC conduit / SMCCC v1.2** → PSCI SMC CPU bring-up (sweet patch 0065).
 - **Timers:** arch timer (`arch_sys_counter`) + exynos-mct per-CPU IRQs 790–798.
 - **RAM 12 GB**; **UFS** live at `0x13200000` (+ PHY/UNIPRO windows `…13280000/…132a0000`).
-- **pKVM owns EL2** (`kvm-arm.mode=protected`, `pkvm_s2mpu-v9`); **DPU S2MPU** at
-  `0x19870000/0x19c70000` gates display DMA. Shim must handle the EL2→EL1 handoff and
-  the display-path stage-2 protection.
+- **ABL enters the kernel at EL2** (`CPU: All CPU(s) started at EL2`; husky is GKI).
+  pKVM (`kvm-arm.mode=protected`, `pkvm_s2mpu-v9`) is something *Linux* installs into
+  EL2 after entry, so it is absent when we `fastboot boot` our own image: the shim owns
+  EL2 and drops to EL1 itself (sweet's Qualcomm ABL entered at EL1 — not the case here).
+  **DPU S2MPU** at `0x19870000/0x19c70000` gates display DMA; its state as left by ABL
+  is still to be probed (P4).
 
 ### Debug-strategy correction (supersedes the earlier "serial = jackpot")
 The AP UART (`ttySAC0 @ 0x10870000`) exits via USB-C **SBU pins** and needs a debug
@@ -303,10 +306,33 @@ So the realistic debug model:
   `console-ramoops-0`. Bonus ABL verbs: `oem dbgc uart-mux`/`uart-console` (debug-UART
   routing for a future SuzyQ), plus a USB-ramdump panic dumper.
 
+## Shim P0a (2026-10-20) — `shim/`
+
+Ground truth from the stock images and LineageOS `device/google/zuma`
+`BoardConfig-common.mk` (lineage-24.0):
+- `BOARD_BOOT_HEADER_VERSION := 4`; stock `boot.img` is **kernel-only** (ramdisk in
+  `init_boot`); **DTB lives in `vendor_kernel_boot`** (stock `vendor_boot` dtb size 0).
+  So the shim ships as a kernel-only v4 `boot.img` and `fastboot boot` still gets the
+  device's own zuma FDT in `x0`.
+- Kernel cmdline has `earlycon=exynos4210,0x10870000 console=ttySAC0,115200`.
+- **16 KB-page developer option** (`TARGET_KERNEL_DIR/16kb`, separate `dtbo`): Google
+  ships a 16K-granule EL1 kernel on this SoC/ABL, which largely retires "does 16K
+  translation work on all three core types" for XNU.
+- ramoops (live `/sys/module/ramoops/parameters`): `mem 0x400000@0xfd3ff000,
+  record_size 0, console_size 2M, pmsg_size 2M, ecc 0` → per `fs/pstore/ram.c` the
+  **console zone is `0xfd3ff000`..+2M**, a `persistent_ram_buffer` `{sig 0x43474244,
+  start, size, data}`; Linux keeps it if `start <= size <= 2M-12`.
+
+P0a shim (`shim/`, ported from `ios-sweet/shim/`): EL2→EL1 drop modelled on Linux
+`init_kernel_el` for an nVHE host (HCR_EL2 RW|API|APK, timers/GIC sysregs/PMU
+untrapped, FGT/HCRX cleared when present), text log in the ramoops console zone,
+reports EL, load address, FDT header, ID registers, PSCI/SMCCC, then warm-resets
+(SYSTEM_RESET2 if offered). Pass = the log shows up in `console-ramoops-0`.
+
 ## Left to the builder
 
 - Exact ABL framebuffer address/format (one live `fastboot boot` probe).
 - Which `xnu-12377.x` point tag to pin against the chosen 26.x userland.
-- `boot.img` v4 packaging specifics for the shim on husky.
+- ~~`boot.img` v4 packaging specifics~~ — resolved, see *Shim P0a* below.
 - ST FTS SPI bring-up specifics and S2MPG register map for buttons/rails
   (from the `gs-6.1` drivers).
