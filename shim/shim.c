@@ -89,9 +89,37 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 		__asm__ volatile("wfe");
 }
 
+/*
+ * Minimal VMAPPLE paravirt "host": xnu (the EL1 guest) makes hvc calls that a
+ * real VMAPPLE VMM would service. There is no host on husky, so VBAR_EL2 points
+ * here; emulate the calls and eret back to EL1 instead of panicking. Return
+ * values go in the saved register frame (restored on eret). PAC is off for
+ * bring-up, so returning zero keys/state is fine. x0 is the function id.
+ */
+static void husky_hvc(uint64_t *regs)
+{
+	/*
+	 * Success for everything; zero any returned keys/offsets/uuid words. The
+	 * guest only reads x0..x4 back. Silent (no con_* here) so it doesn't fight
+	 * xnu's own pmsg breadcrumbs for the ring write position.
+	 */
+	regs[0] = 0;
+	regs[1] = 0;
+	regs[2] = 0;
+	regs[3] = 0;
+	regs[4] = 0;
+}
+
 void exc_handler(uint64_t slot, uint64_t *regs)
 {
 	int el2 = (rsr("CurrentEL") >> 2) == 2;
+
+	/* Lower-EL (slot 8) sync at EL2 that is an HVC: emulate the paravirt host
+	 * and return to the guest, rather than treating it as a panic. */
+	if (el2 && slot == 8 && (rsr("esr_el2") >> 26) == 0x16) {
+		husky_hvc(regs);
+		return;
+	}
 
 	if (el2)	/* faulted in the drop, before shim_main started the log */
 		con_clear(BLUE);

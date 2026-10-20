@@ -75,6 +75,15 @@ _start:
 	smc	#0
 	cmp	x20, #(2 << 2)
 	b.ne	1f
+	/*
+	 * Give EL2 a valid stack (SP_EL2) before the drop. VBAR_EL2 stays pointed
+	 * at our vectors after dropping to EL1, so if xnu (now the EL1 guest) ever
+	 * executes an HVC or a trapped instruction, it lands here; without a stack
+	 * the handler would fault instead of logging ESR_EL2.
+	 */
+	msr	spsel, #1
+	adr	x1, _stack_top
+	mov	sp, x1
 	adr	x1, vectors		/* catch faults in the drop itself */
 	msr	vbar_el2, x1
 	isb

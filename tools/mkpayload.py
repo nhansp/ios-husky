@@ -121,8 +121,13 @@ def apply_chained_fixups(buf, m):
                     diversity = (raw >> 32) & 0xffff
                     auth.append((slot_va, key, addr_div, diversity))
                 else:
+                    # DYLD_CHAINED_PTR_ARM64E_KERNEL non-auth rebase: the 43-bit
+                    # target is an OFFSET from the image base (+ high8 as the top
+                    # byte), so add image_base. (XNU's rebase_chain() is for the
+                    # older __thread_starts threaded format, which does NOT add a
+                    # base and sign-extends - wrong for this chain format.)
                     top8 = (raw >> 43) & 0xff
-                    target = ((top8 << 56) | (sext(raw & 0x7ffffffffff, 43) & 0x00ffffffffffffff)) & 0xffffffffffffffff
+                    target = (((top8 << 56) | (raw & 0x7ffffffffff)) + image_base) & 0xffffffffffffffff
                 struct.pack_into('<Q', buf, loc, target)
                 if not nxt:
                     break
