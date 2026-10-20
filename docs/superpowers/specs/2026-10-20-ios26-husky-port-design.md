@@ -260,6 +260,37 @@ channel independent of the UART. Key facts:
   `lsusb` shows only the fastboot device, no USB-serial bridge / `/dev/ttyUSB*`, so the
   dongle path must be sorted before the shim-UART spike.
 
+## Live Android recon (rooted, 2026-10-20) — `artifacts/live-recon/`
+
+Booted stock Android (`fastboot continue`) and harvested `dmesg`/`iomem`/`interrupts`
+with root. Decisive findings:
+
+- **PAC confirmed + working: `Address authentication (architected QARMA5 algorithm)`.**
+  Risk #1 recast: the arm64e userland's PAC is runtime-computed, so QARMA5 round-trips
+  it; the job is **retarget Apple's PAC key-management (Apple SPRs/GXF) to architected
+  `APIAKey_EL1`-class regs**, not make PAC exist. Much lower risk than feared.
+- **CPU topology (live):** CPU0–3 `0x411fd461` (A510, **boot CPU = little A510**),
+  CPU4–7 `0x411fd4d0` (A715), CPU8 X3. Heterogeneous `ID_AA64MMFR1_EL1` across clusters
+  → XNU SMP must tolerate non-uniform ID regs (it assumes Apple-homogeneous clusters).
+- **GICv3:** GICD `0x10400000`; redistributor **stride `0x20000`** from `0x10440000`.
+- **PSCI v1.1 / SMC conduit / SMCCC v1.2** → PSCI SMC CPU bring-up (sweet patch 0065).
+- **Timers:** arch timer (`arch_sys_counter`) + exynos-mct per-CPU IRQs 790–798.
+- **RAM 12 GB**; **UFS** live at `0x13200000` (+ PHY/UNIPRO windows `…13280000/…132a0000`).
+- **pKVM owns EL2** (`kvm-arm.mode=protected`, `pkvm_s2mpu-v9`); **DPU S2MPU** at
+  `0x19870000/0x19c70000` gates display DMA. Shim must handle the EL2→EL1 handoff and
+  the display-path stage-2 protection.
+
+### Debug-strategy correction (supersedes the earlier "serial = jackpot")
+The AP UART (`ttySAC0 @ 0x10870000`) exits via USB-C **SBU pins** and needs a debug
+adapter (SuzyQ-type) on the host; with only a charging cable there is **no live serial**.
+So the realistic debug model:
+- **Bootloader stage:** `fastboot oem dmesg`.
+- **Android stage:** adb + root `dmesg`/`logcat` (used for this recon).
+- **Bare-metal shim/XNU stage (no adb, no serial):** back to sweet's model — a
+  **persistent in-flash log ring read back from Android/recovery** (the framebuffer
+  console is harder here: command-mode + DSC panel). A ~$15 SuzyQ-type USB-C debug cable
+  would restore live UART and materially speed shim/XNU bring-up — recommended, optional.
+
 ## Left to the builder
 
 - Exact ABL framebuffer address/format (one live `fastboot boot` probe).
