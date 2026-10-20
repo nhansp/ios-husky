@@ -211,10 +211,16 @@ const char *loader_boot(uintptr_t dtb)
 	}
 	con_hex2("SEGS", "n=", p->nsegs, "end=", p->kernel_end + pa_of_va_base);
 
-	/* Sign the arm64e auth pointers now that the segments are in place. */
+	/* Sign the arm64e auth pointers now that the segments are in place.
+	 * HUSKY_NO_PAC_SIGN: leave them as the plain targets mkpayload wrote, for
+	 * bring-up against a kernel built with PAC enforcement off (0010). */
+#ifndef HUSKY_NO_PAC_SIGN
 	pac_install_keys();
 	sign_auth_fixups(p, pa_of_va_base);
 	con_hex("SIGNED", p->auth_count);
+#else
+	con_str("SIGNED", "skipped (HUSKY_NO_PAC_SIGN)");
+#endif
 
 	/* ADT, then boot_args, behind the kernel; all below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
