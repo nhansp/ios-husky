@@ -1,0 +1,128 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 032d9e0..31040a9 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -792,6 +792,99 @@ serial_hibernation_cleanup(void)
+ }
+ #endif /* HIBERNATION */
+ 
++#if defined(HUSKY)
++/*
++ * husky: the board has no Apple/PL011 UART driver match and no linear boot
++ * framebuffer, so route the kernel's serial console into the ramoops *pmsg*
++ * persistent zone (fs/pstore/ram) at physical 0xfd5ff000 - the same channel the
++ * boot shim uses. After a reset Android exposes it as
++ * /sys/fs/pstore/pmsg-ramoops-0. We continue after the shim's log (from the
++ * persistent_ram_buffer's recorded size) so both survive. Selected by a
++ * "serial-device" phandle in the ADT 'defaults' node pointing at a node with
++ * compatible "husky,pmsg-console".
++ */
++#define HUSKY_PMSG_PHYS		0xfd5ff000ULL
++#define HUSKY_PMSG_SIZE		0x200000U
++#define HUSKY_PMSG_SIG		0x43474244U	/* "DBGC" */
++
++struct husky_prz {
++	uint32_t sig;
++	uint32_t start;
++	uint32_t size;
++	uint8_t data[];
++};
++
++static volatile struct husky_prz *husky_prz;
++static uint32_t husky_pmsg_pos;
++#define HUSKY_PMSG_CAP		(HUSKY_PMSG_SIZE - sizeof(struct husky_prz))
++
++static void
++husky_pmsg_init(void)
++{
++	if (husky_prz == NULL) {
++		return;
++	}
++	/* Continue after the shim's log if the zone is already a valid ring. */
++	if (husky_prz->sig == HUSKY_PMSG_SIG && husky_prz->size <= HUSKY_PMSG_CAP) {
++		husky_pmsg_pos = husky_prz->size;
++	} else {
++		husky_prz->sig = HUSKY_PMSG_SIG;
++		husky_pmsg_pos = 0;
++		husky_prz->start = 0;
++		husky_prz->size = 0;
++	}
++}
++
++static unsigned int
++husky_pmsg_transmit_ready(void)
++{
++	return 1;
++}
++
++static void
++husky_pmsg_transmit_data(uint8_t c)
++{
++	if (husky_prz == NULL) {
++		return;
++	}
++	if (husky_pmsg_pos < HUSKY_PMSG_CAP) {
++		husky_prz->data[husky_pmsg_pos++] = c;
++	}
++	husky_prz->start = husky_pmsg_pos;
++	husky_prz->size = husky_pmsg_pos;
++}
++
++static unsigned int
++husky_pmsg_receive_ready(void)
++{
++	return 0;
++}
++
++static uint8_t
++husky_pmsg_receive_data(void)
++{
++	return 0;
++}
++
++static struct pe_serial_functions husky_pmsg_serial_functions =
++{
++	.init = husky_pmsg_init,
++	.transmit_ready = husky_pmsg_transmit_ready,
++	.transmit_data = husky_pmsg_transmit_data,
++	.receive_ready = husky_pmsg_receive_ready,
++	.receive_data = husky_pmsg_receive_data,
++	.device = SERIAL_HUSKY_PMSG
++};
++
++static void
++husky_pmsg_setup(const DeviceTreeNode *const devicetree_node)
++{
++	(void)devicetree_node;
++	husky_prz = (volatile struct husky_prz *)ml_io_map(HUSKY_PMSG_PHYS, HUSKY_PMSG_SIZE);
++	register_serial_functions(&husky_pmsg_serial_functions);
++}
++#endif /* HUSKY */
++
+ /**
+  * @brief This array maps "compatible" strings from the devicetree identifying
+  * different serial device drivers to their corresponding setup functions.
+@@ -809,6 +902,9 @@ static const struct {
+ #ifdef PL011_UART
+ 	{ .compatible = "arm,pl011", .setup = pl011_uart_setup },
+ #endif // PL011_UART
++#if defined(HUSKY)
++	{ .compatible = "husky,pmsg-console", .setup = husky_pmsg_setup },
++#endif // HUSKY
+ };
+ 
+ /**
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index f8fcbc2..01d43b2 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -47,7 +47,8 @@ typedef enum serial_device {
+ 	SERIAL_APPLE_UART=0x1,
+ 	SERIAL_DOCKCHANNEL=0x2,
+ 	SERIAL_PL011_UART=0x4,
+-	SERIAL_DCC_UART=0x8
++	SERIAL_DCC_UART=0x8,
++	SERIAL_HUSKY_PMSG=0x10	/* husky: ramoops pmsg console, no IRQ */
+ } serial_device_t;
+ 
+ kern_return_t serial_irq_enable(serial_device_t device);

@@ -94,6 +94,7 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
+    serial_phandle = next(phandle)   # fixed id: the 'defaults' serial-device points here
 
     chosen = node('chosen', [
         ph(),
@@ -171,6 +172,11 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
         ('#size-cells', u32(2)),
         ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
     ], [gic,
+        # husky,pmsg-console: pe_serial.c routes the kernel console into the
+        # ramoops pmsg zone (0xfd5ff000); 'defaults' serial-device selects it.
+        node('serial0', [('AAPL,phandle', u32(serial_phandle)),
+                         ('device_type', cstr('serial')),
+                         ('compatible', cstr('husky,pmsg-console'))]),
         # watchdogd checks /arm-io/wdt for no-pmu, else crashes.
         node('wdt', [ph(), ('no-pmu', u32(1))]),
         # IOMobileFramebuffer counts /arm-io children with this device_type and
@@ -185,7 +191,10 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
 
     # pmap_compute_max_asids needs the node; no-effaceable-storage makes
     # keybagd read systembag.kb as a plain plist (no effaceable key here).
-    defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
+    # serial-device points serial_init at our ramoops pmsg console (the node is
+    # under arm-io below); XNU's kprintf/panic then lands in pmsg-ramoops-0.
+    defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1)),
+                                 ('serial-device', u32(serial_phandle))])
 
     # MobileGestalt HomeButtonType = /buttons home-button-type (2 = no Home
     # button, matching the iPhone 11 Pro Max).
