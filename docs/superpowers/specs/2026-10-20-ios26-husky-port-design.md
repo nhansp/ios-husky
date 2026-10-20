@@ -293,6 +293,15 @@ So the realistic debug model:
   Serial-free, works on the charging cable; slower turnaround (reboot per read). The
   framebuffer console is a poor fallback here (command-mode + DSC panel). A ~$15
   SuzyQ-type USB-C debug cable would restore live UART and speed bring-up — optional.
+- **Fastest serial-free loop (bootloader-side, no Android boot) — confirmed in ABL RE:**
+  ABL parses pstore/ramoops (`[PSTORE]`/`[RAMOOPS]`/`pstore_pram_update`) and exposes
+  `fastboot oem ramdump stage_file <region>` + `fastboot get_staged <file>` to pull a
+  memory region to the host. So: shim/XNU writes ramoops → reboot bootloader →
+  `oem ramdump stage_file <region>` + `get_staged`. (`fastboot oem dmesg` may also merge
+  a `[RAMOOPS]` section when present.) Exact `<region>` token (dmesg/console/ramoops/
+  pstore/debug_snapshot log name) TBD by a one-time live probe against the existing
+  `console-ramoops-0`. Bonus ABL verbs: `oem dbgc uart-mux`/`uart-console` (debug-UART
+  routing for a future SuzyQ), plus a USB-ramdump panic dumper.
 
 ## Left to the builder
 
