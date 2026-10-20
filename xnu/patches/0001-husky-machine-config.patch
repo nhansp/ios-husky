@@ -2,8 +2,9 @@ makedefs/MakeInc.def                 |  3 +-
  osfmk/arm64/proc_reg.h               |  8 ++++
  osfmk/arm64/start.s                  |  4 +-
  pexpert/pexpert/arm64/HUSKY.h        | 73 ++++++++++++++++++++++++++++++++++++
+ pexpert/pexpert/arm64/Makefile       |  3 +-
  pexpert/pexpert/arm64/board_config.h | 15 ++++++++
- 5 files changed, 100 insertions(+), 3 deletions(-)
+ 6 files changed, 102 insertions(+), 4 deletions(-)
 
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
 index e37762b..7cf8459 100644
@@ -142,6 +143,20 @@ index 0000000..ed10540
 +#define ICC_SRE_SRE                             0x1
 +
 +#endif /* ! _PEXPERT_ARM64_HUSKY_H */
+diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
+index 75938b5..06ae8d4 100644
+--- a/pexpert/pexpert/arm64/Makefile
++++ b/pexpert/pexpert/arm64/Makefile
+@@ -33,7 +33,8 @@ PRIVATE_KERNELFILES = \
+ 	H15.h \
+ 	H16.h \
+ 	H17.h \
+-	VMAPPLE.h
++	VMAPPLE.h \
++	HUSKY.h
+ 
+ 
+ # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
 diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
 index 5a6cd33..d1c0962 100644
 --- a/pexpert/pexpert/arm64/board_config.h
@@ -290,6 +305,16 @@ pexpert/pexpert/arm64/HUSKY.h
   +
   +#endif /* ! _PEXPERT_ARM64_HUSKY_H */
   +73 -0
+
+pexpert/pexpert/arm64/Makefile
+  @@ -33,7 +33,8 @@ PRIVATE_KERNELFILES = \
+  -	VMAPPLE.h
+  +	VMAPPLE.h \
+  +	HUSKY.h
+   
+   
+   # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
+  +2 -1
 
 pexpert/pexpert/arm64/board_config.h
   @@ -319,6 +319,21 @@
