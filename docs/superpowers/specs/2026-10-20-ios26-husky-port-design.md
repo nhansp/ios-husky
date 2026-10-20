@@ -286,10 +286,13 @@ adapter (SuzyQ-type) on the host; with only a charging cable there is **no live 
 So the realistic debug model:
 - **Bootloader stage:** `fastboot oem dmesg`.
 - **Android stage:** adb + root `dmesg`/`logcat` (used for this recon).
-- **Bare-metal shim/XNU stage (no adb, no serial):** back to sweet's model — a
-  **persistent in-flash log ring read back from Android/recovery** (the framebuffer
-  console is harder here: command-mode + DSC panel). A ~$15 SuzyQ-type USB-C debug cable
-  would restore live UART and materially speed shim/XNU bring-up — recommended, optional.
+- **Bare-metal shim/XNU stage (no adb, no serial):** use the device's **ramoops
+  persistent RAM at `0x400000 @ 0xfd3ff000`** (confirmed live: pstore backend,
+  `/sys/fs/pstore/console-ramoops-0` readable). Shim/XNU writes its console there in
+  ramoops record format → reboot to Android → `cat /sys/fs/pstore/console-ramoops-*`.
+  Serial-free, works on the charging cable; slower turnaround (reboot per read). The
+  framebuffer console is a poor fallback here (command-mode + DSC panel). A ~$15
+  SuzyQ-type USB-C debug cable would restore live UART and speed bring-up — optional.
 
 ## Left to the builder
 
