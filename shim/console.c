@@ -68,6 +68,14 @@ static void fmt_hex(char *buf, uint64_t v, int digits)
 void con_clear(uint32_t bg)
 {
 	(void)bg;
+	/*
+	 * ABL writes its own log here through a cacheable mapping just before
+	 * jumping to us; clean+invalidate the zone so none of its dirty lines
+	 * can be evicted over our Device-memory writes later.
+	 */
+	for (uintptr_t a = RAMOOPS_CON_BASE; a < RAMOOPS_CON_BASE + RAMOOPS_CON_SIZE; a += 64)
+		__asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
 	pos = 0;
 	PRZ->sig = PERSISTENT_RAM_SIG;
 	PRZ->start = 0;

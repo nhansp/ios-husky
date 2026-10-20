@@ -26,6 +26,9 @@ _start:
 	mrs	x20, CurrentEL		/* entry EL, reported by shim_main */
 	cmp	x20, #(2 << 2)
 	b.ne	1f
+	adr	x1, vectors		/* catch faults in the drop itself */
+	msr	vbar_el2, x1
+	isb
 	bl	el2_to_el1
 1:	msr	spsel, #1
 	adr	x1, _stack_top
@@ -126,8 +129,8 @@ el2_to_el1:
 /*
  * Exception vectors. Each slot stashes x29/x30, loads its slot number
  * and jumps to the common path, which saves x0-x28 and calls
- * exc_handler(slot, regs). IRQs return; everything else is logged to
- * ramoops and resets.
+ * exc_handler(slot, regs). Also installed at VBAR_EL2 while we drop to
+ * EL1. IRQs return; everything else is logged to ramoops and resets.
  */
 .macro vent slot
 	.balign	0x80

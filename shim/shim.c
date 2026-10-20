@@ -5,8 +5,15 @@
  *   - where ABL put us and the FDT it passed (x0)
  *   - the CPU feature registers XNU cares about (16K granule, PAC)
  *   - PSCI/SMCCC versions and whether a warm reset is on offer
- * Everything goes to the ramoops console zone, then we warm-reset so
- * Android shows it as /sys/fs/pstore/console-ramoops-0.
+ * Everything goes to the ramoops console zone, then we reset the way Linux
+ * does (PSCI SYSTEM_RESET) so Android shows it as
+ * /sys/fs/pstore/console-ramoops-0.
+ *
+ * Breadcrumb that doesn't depend on DRAM surviving: the first thing we do
+ * is set the Pixel reboot mode (PMU_ALIVE SYSIP_DAT0, written through EL3
+ * like pixel-zuma-reboot.c does) to NORMAL. Entered from `fastboot boot`
+ * the mode still says BOOTLOADER, so landing in Android rather than
+ * fastboot means the shim ran.
  */
 #include <stdint.h>
 #include "console.h"
@@ -14,10 +21,14 @@
 
 #define PSCI_VERSION		0x84000000UL
 #define PSCI_SYSTEM_RESET	0x84000009UL
-#define PSCI_FEATURES		0x8400000aUL
-#define PSCI_SYSTEM_RESET2	0xc4000012UL
-#define PSCI_SYSTEM_WARM_RESET	0
 #define SMCCC_VERSION		0x80000000UL
+
+/* soc/gs exynos-smc.h, exynos-el3_mon.h, pixel-zuma-reboot.c */
+#define SMC_CMD_PRIV_REG	0x82000504UL
+#define PRIV_REG_OPTION_WRITE	1
+#define PMU_ALIVE_BASE		0x15460000UL	/* system-controller@15460000 */
+#define PMU_SYSIP_DAT0		0x0810		/* pixel-reboot reboot-cmd-offset */
+#define REBOOT_MODE_NORMAL	0x00
 
 #define FDT_MAGIC		0xd00dfeedU
 
@@ -57,15 +68,11 @@ static void delay_ms(unsigned ms)
 		;
 }
 
-/* Warm reset keeps DRAM, and with it the ramoops zone. */
+/* What Linux ends in on a plain reboot; DRAM (and ramoops) survives it. */
 static void __attribute__((noreturn)) reset(unsigned after_s)
 {
-	int warm = (int64_t)smc(PSCI_FEATURES, PSCI_SYSTEM_RESET2, 0, 0) >= 0;
-
-	con_str("RESET", warm ? "SYSTEM_RESET2 warm" : "SYSTEM_RESET");
+	con_str("RESET", "SYSTEM_RESET");
 	delay_ms(after_s * 1000);
-	if (warm)
-		smc(PSCI_SYSTEM_RESET2, PSCI_SYSTEM_WARM_RESET, 0, 0);
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
 	con_str("RESET", "returned, parking");
 	for (;;)
@@ -74,6 +81,10 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 
 void exc_handler(uint64_t slot, uint64_t *regs)
 {
+	int el2 = (rsr("CurrentEL") >> 2) == 2;
+
+	if (el2)	/* faulted in the drop, before shim_main started the log */
+		con_clear(BLUE);
 	switch (slot & 3) {
 	case 0: con_str("PANIC", "SYNC"); break;
 	case 1: con_str("PANIC", "IRQ"); break;
@@ -82,10 +93,11 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	}
 	con_hex2("SLOT", "n=", slot, "cpu=", rsr("mpidr_el1"));
 	con_str("STAGE", stage);
-	con_hex("ESR", rsr("esr_el1"));
-	con_hex("ELR", rsr("elr_el1"));
-	con_hex("FAR", rsr("far_el1"));
-	con_hex("SPSR", rsr("spsr_el1"));
+	con_str("EL", el2 ? "2" : "1");
+	con_hex("ESR", el2 ? rsr("esr_el2") : rsr("esr_el1"));
+	con_hex("ELR", el2 ? rsr("elr_el2") : rsr("elr_el1"));
+	con_hex("FAR", el2 ? rsr("far_el2") : rsr("far_el1"));
+	con_hex("SPSR", el2 ? rsr("spsr_el2") : rsr("spsr_el1"));
 	con_hex("X0", regs[0]);
 	con_hex("X1", regs[1]);
 	con_hex("X30", regs[29]);	/* stashed lr is just above the frame */
@@ -121,8 +133,12 @@ static void report_fdt(uintptr_t dtb)
 
 void shim_main(uint64_t dtb, uint64_t entry_el)
 {
+	uint64_t mode_ret = smc(SMC_CMD_PRIV_REG, PMU_ALIVE_BASE + PMU_SYSIP_DAT0,
+				PRIV_REG_OPTION_WRITE, REBOOT_MODE_NORMAL);
+
 	con_clear(BLUE);
 	con_str("HUSKY", "p0a shim");
+	con_hex("BOOTMODE", mode_ret);	/* set_priv_reg result, 0 = ok */
 	stage = "regs";
 	con_hex2("EL", "entry=", entry_el, "now=", rsr("CurrentEL") >> 2);
 	con_hex("IMAGE", (uintptr_t)_head);
