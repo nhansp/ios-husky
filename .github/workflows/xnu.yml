@@ -26,6 +26,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      use_ccache:
+        description: route the compiler through ccache (off until the deployment-target interaction is resolved)
+        default: "false"
   push:
     branches: [main, master]
     paths:
@@ -42,6 +45,7 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '26.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'VMAPPLE' }}
+  USE_CCACHE: ${{ inputs.use_ccache || 'false' }}
   # ccache gives fast incremental rebuilds across runs (content-addressed, so
   # it survives DXB re-cloning xnu each run, unlike mtime-based object caches).
   CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -75,18 +79,25 @@ jobs:
           files=(xnu/patches/*.patch xnu/patches/*.sh)
           if [ ${#files[@]} -gt 0 ]; then cp "${files[@]}" "$PD"/; fi
           echo "patch dir $PD:"; ls "$PD" || true
-          # Route the compiler through ccache via SINGLE-executable wrappers:
-          # make splits $(CC) into words, but xcodebuild (DXB's host tools)
-          # execs CC as one path, so "ccache clang" must be one script.
-          WRAP="$GITHUB_WORKSPACE/ccwrap"; mkdir -p "$WRAP"
-          printf '#!/bin/sh\nexec ccache "$(xcrun -find clang)" "$@"\n'   > "$WRAP/clang"
-          printf '#!/bin/sh\nexec ccache "$(xcrun -find clang++)" "$@"\n' > "$WRAP/clang++"
-          chmod +x "$WRAP/clang" "$WRAP/clang++"
-          sed -i '' "s#export CC=\"\$(xcrun -find clang)\"#export CC=\"$WRAP/clang\"#" dxb/build.sh
-          sed -i '' "s#export CXX=\"\$(xcrun -find clang++)\"#export CXX=\"$WRAP/clang++\"#" dxb/build.sh
-          grep -n 'export C\(C\|XX\)=' dxb/build.sh | head
+          # Optionally route the compiler through ccache via SINGLE-executable
+          # wrappers (make splits $(CC) into words, but xcodebuild execs CC as
+          # one path). Off by default until the deployment-target interaction
+          # with the Libsyscall mig step is sorted out.
+          if [ "$USE_CCACHE" = "true" ]; then
+            WRAP="$GITHUB_WORKSPACE/ccwrap"; mkdir -p "$WRAP"
+            CLANG="$(xcrun -find clang)"; CLANGXX="$(xcrun -find clang++)"
+            printf '#!/bin/sh\nexec ccache "%s" "$@"\n' "$CLANG"   > "$WRAP/clang"
+            printf '#!/bin/sh\nexec ccache "%s" "$@"\n' "$CLANGXX" > "$WRAP/clang++"
+            chmod +x "$WRAP/clang" "$WRAP/clang++"
+            sed -i '' "s#export CC=\"\$(xcrun -find clang)\"#export CC=\"$WRAP/clang\"#" dxb/build.sh
+            sed -i '' "s#export CXX=\"\$(xcrun -find clang++)\"#export CXX=\"$WRAP/clang++\"#" dxb/build.sh
+            grep -n 'export C\(C\|XX\)=' dxb/build.sh | head
+          else
+            echo "ccache disabled for this run"
+          fi
 
       - name: ccache cache
+        if: ${{ (inputs.use_ccache || 'false') == 'true' }}
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.ccache
@@ -97,8 +108,8 @@ jobs:
 
       - name: Deps
         run: |
-          brew install jq gum bash cmake ninja ccache || true
-          ccache -z || true
+          brew install jq gum bash cmake ninja || true
+          if [ "$USE_CCACHE" = "true" ]; then brew install ccache || true; ccache -z || true; fi
           # build.sh only checks that `xcodes` exists (Xcode is preinstalled).
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
@@ -117,7 +128,7 @@ jobs:
         run: bash build.sh
 
       - name: ccache stats
-        if: always()
+        if: ${{ always() && (inputs.use_ccache || 'false') == 'true' }}
         run: ccache -s || true
 
       - name: Package build tree for local compiles
