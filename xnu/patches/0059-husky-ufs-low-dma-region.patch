@@ -1,0 +1,95 @@
+diff --git a/bsd/dev/husky_ufs.c b/bsd/dev/husky_ufs.c
+index 0066daf..ce9b58d 100644
+--- a/bsd/dev/husky_ufs.c
++++ b/bsd/dev/husky_ufs.c
+@@ -17,9 +17,12 @@
+  * with 512-byte logical sectors over the device's 4 KiB blocks. Root on it
+  * with rd=ufsroot0.
+  *
+- * All DMA goes through one physically contiguous allocation below 4 GiB
++ * All DMA goes through one physically contiguous buffer below 4 GiB
+  * (descriptors and a 1 MiB bounce buffer), with caches cleaned/invalidated
+- * around each command. Exynos hosts cap a PRDT entry at 4 KiB (the shim sets
++ * around each command. The host only DMAs below 4 GiB, so when the kernel's
++ * RAM is the high bank (mkadt --highmem) /husky-ufs dma-region names a fixed
++ * low buffer outside it instead, mapped write-combined (Normal non-cacheable:
++ * no cache maintenance, and bzero's dc zva works there). Exynos hosts cap a PRDT entry at 4 KiB (the shim sets
+  * HCI_{TX,RX}PRDT_ENTRY_SIZE = 12) and want HCI_UTRL_NEXUS_TYPE set for SCSI
+  * slots.
+  *
+@@ -51,6 +54,7 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+@@ -106,6 +110,7 @@ static struct {
+ 	vm_offset_t regs;
+ 	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
+ 	uint64_t dma_pa;
++	bool dma_uncached;                      /* dma-region: no cache maintenance */
+ 	uint8_t lun;
+ 	uint8_t tag;
+ 	uint64_t first_block, nblocks;          /* window, in 4 KiB device blocks */
+@@ -135,6 +140,9 @@ ufs_wr(uint32_t off, uint32_t v)
+ static void
+ dma_sync(uint32_t off, uint32_t len)
+ {
++	if (hu.dma_uncached) {
++		return;
++	}
+ 	flush_dcache64((addr64_t)(hu.dma_pa + off), len, TRUE);
+ }
+ 
+@@ -599,18 +607,27 @@ husky_ufs_init(void)
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+ 
+ 	hu.regs = ml_io_map(reg[0], reg[1]);
+-	/* Below 4 GiB, so the host never needs 64-bit addressing. */
+-	if (kmem_alloc_contig(kernel_map, &hu.dma, DMA_SIZE, PAGE_MASK,
+-	    (ppnum_t)atop_64(1ULL << 32) - 1, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		HU_LOG("HUSKY UFS: no contiguous DMA memory\n");
+-		return ENOMEM;
+-	}
+-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)hu.dma);
+-	if (!pn) {
+-		return ENOMEM;
+-	}
+-	hu.dma_pa = ptoa_64(pn);
++	uint64_t const *dma_region = NULL;
++	if (SecureDTGetProperty(node, "dma-region", (void const **)&dma_region, &size) == kSuccess &&
++	    size == 2 * sizeof(uint64_t) && dma_region[1] >= DMA_SIZE) {
++		hu.dma_pa = dma_region[0];
++		hu.dma = ml_io_map_wcomb((vm_offset_t)hu.dma_pa, DMA_SIZE);
++		hu.dma_uncached = true;
++		bzero((void *)hu.dma, DMA_SIZE);
++	} else {
++		/* Below 4 GiB, so the host never needs 64-bit addressing. */
++		if (kmem_alloc_contig(kernel_map, &hu.dma, DMA_SIZE, PAGE_MASK,
++		    (ppnum_t)atop_64(1ULL << 32) - 1, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			HU_LOG("HUSKY UFS: no contiguous DMA memory\n");
++			return ENOMEM;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)hu.dma);
++		if (!pn) {
++			return ENOMEM;
++		}
++		hu.dma_pa = ptoa_64(pn);
++	}
+ 	hu.lun = 0;
+ 	hu.secsize = DEV_BSIZE;
+ 
+@@ -658,6 +675,9 @@ husky_ufs_init(void)
+ 	HU_LOG("HUSKY UFS: \"%s\" +%llu MiB on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, root_off >> 20, hu.lun, hu.first_block, hu.nblocks * UFS_BLOCK >> 20,
+ 	    hu.writable ? "read-write" : "read-only", hu.dma_pa);
++	if (hu.dma_uncached) {
++		HU_LOG("HUSKY UFS: DMA through the fixed low dma-region (uncached)\n");
++	}
+ 	husky_log_start();
+ 	return 0;
+ }

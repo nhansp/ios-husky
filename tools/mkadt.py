@@ -35,9 +35,14 @@ PLATFORM_UUID_FROM_ECID = False
 
 PHYS_BASE = 0x82000000
 MEM_SIZE = 0x0d000000	# -> ends 0x8f000000, ~2MB clear of gsa@90200000
-# --highmem: the 4GB-mark bank, an unbacked gap (faults); kept for experiments.
-LOW_PHYS_BASE = 0x100000000
-LOW_MEM_SIZE = 0x80000000
+# --highmem: the high DRAM banks. Linux's /proc/iomem shows 880000000-affffffff
+# as one 10 GiB System RAM range with no static carve-outs (0x100000000 is an
+# unbacked hole). The UFS host only DMAs below 4 GiB (Exynos 32-bit mask), so
+# husky_ufs then bounces through UFS_DMA_REGION in the old low window, which
+# nothing else uses once the kernel lives up high.
+HIGH_PHYS_BASE = 0x880000000
+HIGH_MEM_SIZE = 0x100000000	# 4 GiB to start; the bank allows 10 GiB
+UFS_DMA_REGION = (0x8e000000, 0x200000)
 
 # /arm-io children are relative to this; it must not be 0 (serial_init bails).
 SOC_BASE = 0x01000000
@@ -96,7 +101,7 @@ def node(name, props=(), children=()):
 
 
 def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
-    phys_base, mem_size = (LOW_PHYS_BASE, LOW_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -240,7 +245,7 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
         ('root-partition', cstr('userdata')),
         ('root-offset', u64(40 << 30)),
         ('log-size', u64(64 << 20)),
-    ])
+    ] + ([('dma-region', u64(*UFS_DMA_REGION))] if highmem else []))
 
     product_props = d431ap_product()
     product = [node('product', [ph()] + product_props)] if product_props else []
