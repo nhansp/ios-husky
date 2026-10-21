@@ -1,0 +1,83 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 9e56170..3130262 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -851,6 +851,8 @@ arm_init(
+ 	fiq_context_init(TRUE);
+ #if defined(HUSKY)
+ 	husky_early_bc("arm_init: fiq_context_init ok\n");
++	extern void husky_gic_dump(const char *);
++	husky_gic_dump("arm_init");
+ #endif
+ 
+ 
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index 89b4c36..e3ef954 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -905,6 +905,10 @@ kernel_bootstrap_thread(void)
+ 	PE_lockdown_iokit();
+ #if defined(HUSKY)
+ 	kernel_bootstrap_log("PE_lockdown_iokit done");
++	{
++		extern void husky_gic_dump(const char *);
++		husky_gic_dump("lockdown");
++	}
+ #endif
+ #endif
+ 	/*
+@@ -912,6 +916,9 @@ kernel_bootstrap_thread(void)
+ 	 * at the latest
+ 	 */
+ 	vm_set_restrictions(machine_info.max_cpus);
++#if defined(HUSKY)
++	kernel_bootstrap_log("vm_set_restrictions done");
++#endif
+ 
+ 
+ #if KPERF
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 626d7fe..ab87aa0 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -218,6 +218,40 @@ pe_init_fiq()
+ 	husky_early_bc("  fiq: done\n");
+ #endif
+ }
++
++#if defined(HUSKY)
++/*
++ * Bring-up: snapshot everything between the vtimer and the CPU, to see why
++ * PPI 27 never reaches sleh_irq. SGI-frame offsets as in VMAPPLE.h.
++ */
++#define HUSKY_GICR_ISPENDR0     0x10200
++#define HUSKY_GICR_ISACTIVER0   0x10300
++#define HUSKY_GICR_IPRIORITYR   0x10400
++#define HUSKY_GICR_IGRPMODR0    0x10D00
++void husky_gic_dump(const char *tag);
++void
++husky_gic_dump(const char *tag)
++{
++	if (!gicd_base) {
++		kprintf("husky gic[%s]: not mapped\n", tag);
++		return;
++	}
++	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++	kprintf("husky gic[%s]: GICD_CTLR=%x IGROUPR0=%x IGRPMODR0=%x ISENABLER0=%x ISPENDR0=%x ISACTIVER0=%x IPRIO[24..27]=%x WAKER=%x\n",
++	    tag, gicd_read32(GICD_CTLR), gicr_read32(GICR_IGROUPR0), gicr_read32(HUSKY_GICR_IGRPMODR0),
++	    gicr_read32(GICR_ISENABLER0), gicr_read32(HUSKY_GICR_ISPENDR0), gicr_read32(HUSKY_GICR_ISACTIVER0),
++	    gicr_read32(HUSKY_GICR_IPRIORITYR + 24), gicr_read32(GICR_WAKER));
++	kprintf("husky gic[%s]: IGRPEN1=%llx PMR=%llx CTLR=%llx SRE=%llx RPR=%llx HPPIR1=%llx HPPIR0=%llx\n",
++	    tag, __builtin_arm_rsr64("ICC_IGRPEN1_EL1"), __builtin_arm_rsr64("ICC_PMR_EL1"),
++	    __builtin_arm_rsr64("ICC_CTLR_EL1"), __builtin_arm_rsr64("ICC_SRE_EL1"),
++	    __builtin_arm_rsr64("ICC_RPR_EL1"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"),
++	    __builtin_arm_rsr64("ICC_HPPIR0_EL1"));
++	kprintf("husky gic[%s]: DAIF=%llx ISR=%llx CNTV_CTL=%llx CNTV_CVAL=%llx CNTVCT=%llx CNTFRQ=%llx\n",
++	    tag, __builtin_arm_rsr64("DAIF"), __builtin_arm_rsr64("ISR_EL1"),
++	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("CNTV_CVAL_EL0"),
++	    __builtin_arm_rsr64("CNTVCT_EL0"), __builtin_arm_rsr64("CNTFRQ_EL0"));
++}
++#endif /* HUSKY */
+ #else
+ void
+ pe_init_fiq()
