@@ -1,0 +1,86 @@
+diff --git a/bsd/kern/husky_amfi.c b/bsd/kern/husky_amfi.c
+index 41c67dc..34eef2d 100644
+--- a/bsd/kern/husky_amfi.c
++++ b/bsd/kern/husky_amfi.c
+@@ -283,6 +283,51 @@ husky_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+ 	return 0;
+ }
+ 
++/*
++ * Policy "Sandbox" (ported from ios-sweet 0050): libsystem_sandbox calls
++ * __mac_syscall("Sandbox", op, arg). Without a policy of that name every
++ * call fails with ENOPOLICY, and iOS 26 launchd dies in libSystem's
++ * _container_init (sandbox_get_container_expected() failed: -1). HUSKY
++ * runs without a sandbox: operations succeed (checks allow, profile init
++ * is accepted, no container is expected); the few that must return data
++ * (container paths, extension tokens) fail with ENOENT. The first use of
++ * each operation number is logged (op numbers are those of iOS 16 in
++ * ios-sweet; check them against the log for iOS 26).
++ */
++static uint64_t husky_sandbox_seen;
++
++static int
++husky_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++{
++	if (call >= 0 && call < 128 && !(husky_sandbox_seen & (1ULL << (call & 63)))) {
++		husky_sandbox_seen |= 1ULL << (call & 63);
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("HUSKY Sandbox: %s op %d\n", name, call);
++		kprintf("HUSKY Sandbox: %s op %d\n", name, call);
++	}
++	switch (call) {
++	case 4:         /* container path (audit token / pid) */
++	case 5:         /* extension issue */
++	case 6:         /* extension consume */
++		return ENOENT;
++	default:        /* including 0x43, container expected: none */
++		return 0;
++	}
++}
++
++static const struct mac_policy_ops husky_sandbox_mac_ops = {
++	.mpo_policy_syscall = husky_sandbox_syscall,
++};
++
++static struct mac_policy_conf husky_sandbox_mac_conf = {
++	.mpc_name = "Sandbox",
++	.mpc_fullname = "HUSKY permissive sandbox stand-in",
++	.mpc_ops = &husky_sandbox_mac_ops,
++};
++
++static mac_policy_handle_t husky_sandbox_mac_handle;
++
+ static const struct mac_policy_ops husky_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = husky_amfi_vnode_check_signature,
+ };
+@@ -306,5 +351,10 @@ husky_amfi_policy_register(void)
+ 	    error ? "NOT registered" : "registered", error);
+ 	kprintf("HUSKY AMFI: platform binary policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&husky_sandbox_mac_conf, &husky_sandbox_mac_handle, NULL);
++	printf("HUSKY Sandbox: permissive policy %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
++	kprintf("HUSKY Sandbox: permissive policy %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
+ }
+ #endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2467b24..b54ed2f 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8633,8 +8633,12 @@ process_signature(proc_t p, struct image_params *imgp)
+ 		}
+ 	}
+ 
+-#if XNU_TARGET_OS_OSX
+-	/* Check for platform passed in spawn attr if iOS binary is being spawned */
++#if XNU_TARGET_OS_OSX && !defined(ARM64_BOARD_CONFIG_HUSKY)
++	/*
++	 * Check for platform passed in spawn attr if iOS binary is being spawned.
++	 * HUSKY: the kernel is built against the macOS SDK, but iOS is the
++	 * native userland, so iOS binaries are never "iOS apps on a Mac".
++	 */
+ 	if (proc_platform(p) == PLATFORM_IOS) {
+ 		struct _posix_spawnattr *psa = (struct _posix_spawnattr *) imgp->ip_px_sa;
+ 		if (psa == NULL || psa->psa_platform == 0) {
