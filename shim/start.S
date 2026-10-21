@@ -107,19 +107,40 @@ _start:
 3:	wfe
 	b	3b
 
-/* PSCI CPU_ON target. x0 = context id = cpu index (1..8). */
+/*
+ * PSCI CPU_ON target. Firmware enters at EL2 (MMU off) with x0 = context id:
+ * the EL1 physical address to continue at (xnu's husky_secondary_entry), or
+ * 0 to park in secondary_main. Each core gets its own EL2 stack, indexed by
+ * MPIDR Aff1 (the core number on Tensor G3), and our VBAR_EL2, so the HVCs
+ * xnu makes on that core reach husky_hvc like the boot core's do.
+ * loader.c publishes this address to xnu in the ADT.
+ */
 	.globl secondary_entry
 secondary_entry:
 	msr	daifset, #0xf
 	mov	x19, x0
+	mrs	x20, mpidr_el1
+	ubfx	x20, x20, #8, #8		/* Aff1 = core 0..8 */
+	cmp	x20, #9
+	b.hs	4f				/* no stack for it: park */
+	msr	spsel, #1
+	adr	x1, _sec_stacks
+	add	x1, x1, x20, lsl #12
+	add	x1, x1, #0x1000
+	mov	sp, x1
 	mrs	x1, CurrentEL
 	cmp	x1, #(2 << 2)
 	b.ne	1f
+	adr	x1, vectors
+	msr	vbar_el2, x1
+	isb
 	bl	el2_to_el1
-1:	mov	x0, x19
+1:	cbz	x19, 2f
+	br	x19				/* xnu: EL1, MMU off, sets up its own stack */
+2:	mov	x0, x20
 	msr	spsel, #1
 	adr	x1, _sec_stacks
-	add	x1, x1, x0, lsl #12
+	add	x1, x1, x20, lsl #12
 	add	x1, x1, #0x1000
 	mov	sp, x1
 	adr	x1, vectors

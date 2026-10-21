@@ -98,6 +98,35 @@ static int magic_ok(const char *m)
 }
 
 /*
+ * Fill an 8-byte ADT property placeholder by name (mkadt emits it zeroed).
+ * ADT properties are {char name[32]; u32 length; value}, 4-byte aligned, so
+ * names sit on 4-byte boundaries. 32-bit stores: Device memory (MMU off)
+ * faults on the unaligned 8-byte access the value field may need.
+ */
+static int adt_set_u64(uintptr_t adt, uint64_t size, const char *name, uint64_t val)
+{
+	for (uint64_t off = 0; off + 44 <= size; off += 4) {
+		volatile const char *n = (volatile const char *)(adt + off);
+		int i = 0;
+		while (i < 32 && name[i] && n[i] == name[i])
+			i++;
+		if (i == 32 || name[i] != 0)
+			continue;
+		while (i < 32 && n[i] == 0)
+			i++;
+		if (i != 32)
+			continue;
+		volatile uint32_t *w = (volatile uint32_t *)(adt + off + 32);
+		if ((w[0] & 0x7fffffffU) != 8)
+			continue;
+		w[1] = (uint32_t)val;
+		w[2] = (uint32_t)(val >> 32);
+		return 1;
+	}
+	return 0;
+}
+
+/*
  * PAC. Install the fixed architected keys (0002's constant) in every key
  * register and enable the pac/aut instructions, so the sign_slot() helpers
  * below produce signatures the kernel will authenticate after PAC_INIT.
@@ -225,6 +254,12 @@ const char *loader_boot(uintptr_t dtb)
 	/* ADT, then boot_args, behind the kernel; all below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, (uintptr_t)p + p->adt_off, p->adt_size);
+	/* SMP: secondaries must enter through our EL2 trampoline (start.S). */
+	extern char secondary_entry[];
+	if (adt_set_u64(adt_pa, p->adt_size, "husky,secondary-entry", (uintptr_t)secondary_entry))
+		con_hex("SMPENTRY", (uintptr_t)secondary_entry);
+	else
+		con_str("SMP", "no husky,secondary-entry in ADT");
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 

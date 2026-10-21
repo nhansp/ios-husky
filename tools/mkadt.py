@@ -134,28 +134,28 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
         # lp-sip1 unauthenticated (unsealed) root for the extracted iOS cache.
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # husky SMP: 4x Cortex-A510 (little, cores 0-3), 4x Cortex-A715 (cores
-    # 4-7), 1x Cortex-X3 (core 8). The kernel defaults to one core and takes
-    # cpus=N as an initial prefix. cpu0's reg must match the boot MPIDR.
-    CORES = [('a510', 0), ('a510', 1), ('a510', 2), ('a510', 3),
-             ('a715', 0), ('a715', 1), ('a715', 2), ('a715', 3),
-             ('x3', 0)]
+    # husky SMP: 4x Cortex-A510 (cores 0-3), 4x Cortex-A715 (cores 4-7),
+    # 1x Cortex-X3 (core 8), all in ONE DynamIQ cluster: the live device tree
+    # has cpu@0..cpu@800 (MPIDR Aff1 = core, Aff0 = 0) and Linux reports
+    # cluster_id 0 for every core. Bring-up runs them as homogeneous SMP (same
+    # ISA level and line size); the kernel takes cpus=N as an initial prefix.
+    # cpu0's reg must match the boot MPIDR.
+    CORES = ['a510'] * 4 + ['a715'] * 4 + ['x3']
     cpu_nodes = []
-    for idx, (kind, in_cluster) in enumerate(CORES):
-        cluster = {'a510': 0, 'a715': 1, 'x3': 2}[kind]
-        reg = boot_mpidr if idx == 0 else (cluster << 8) | in_cluster
+    for idx, kind in enumerate(CORES):
+        reg = boot_mpidr if idx == 0 else idx << 8
         cpu_nodes.append(node(f'cpu{idx}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('arm,cortex-' + kind) + cstr('ARM,v8')),
             ('reg', u32(reg)),             # MPIDR Aff1:Aff0, NOT the logical id
             ('cpu-id', u32(idx)),          # XNU assigns ids by DT order
-            ('cluster-id', u32(cluster)),
-            ('cluster-type', u32(0)),      # treat as homogeneous SMP for bring-up
+            ('cluster-id', u32(0)),
+            ('cluster-type', u32(0)),      # homogeneous SMP for bring-up
             ('die-cluster-id', u32(0)),
-            ('cluster-core-id', u32(in_cluster)),
-            ('l2-cache-id', u32(cluster)),
-            ('l3-cache-id', u32(0)),
+            ('cluster-core-id', u32(idx)),
+            ('l2-cache-id', u32(idx)),     # DynamIQ: private L2 per core
+            ('l3-cache-id', u32(0)),       # shared DSU L3
             ('state', cstr('running' if idx == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
             ('clock-frequency', u32(2914000000 if kind == 'x3' else 2368000000 if kind == 'a715' else 1803000000)),
@@ -164,7 +164,10 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
             ('peripheral-frequency', u32(timebase)),
             ('fixed-frequency', u32(timebase)),
         ]))
-    cpus = node('cpus', [ph(), ('#address-cells', u32(1)), ('#size-cells', u32(0))], cpu_nodes)
+    # husky,secondary-entry: the shim fills in its PSCI CPU_ON trampoline
+    # (EL2 -> EL1, per-core EL2 stack for the HVC emulation) at boot.
+    cpus = node('cpus', [ph(), ('#address-cells', u32(1)), ('#size-cells', u32(0)),
+                         ('husky,secondary-entry', u64(0))], cpu_nodes)
 
     gic = node('gic', [
         ph(),
