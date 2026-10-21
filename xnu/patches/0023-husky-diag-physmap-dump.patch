@@ -1,0 +1,69 @@
+osfmk/arm/arm_init.c      | 21 +++++++++++++++++++++
+ osfmk/arm64/arm_vm_init.c | 28 ++++++++++++++++++++++++++--
+ 2 files changed, 47 insertions(+), 2 deletions(-)
+
+--- Changes ---
+
+osfmk/arm/arm_init.c
+  @@ -376,6 +376,27 @@ husky_vp_bc(const char *s)
+  +
+  +/* "<label>=0x<16 hex digits>\n" through husky_vp_bc. */
+  +void husky_vp_hex(const char *label, uint64_t v);
+  +void
+  +husky_vp_hex(const char *label, uint64_t v)
+  +{
+  +	char buf[64];
+  +	unsigned int n = 0;
+  +	while (*label && n < sizeof(buf) - 21) {
+  +		buf[n++] = *label++;
+  +	}
+  +	buf[n++] = '=';
+  +	buf[n++] = '0';
+  +	buf[n++] = 'x';
+  +	for (int sh = 60; sh >= 0; sh -= 4) {
+  +		buf[n++] = "0123456789abcdef"[(v >> sh) & 0xf];
+  +	}
+  +	buf[n++] = '\n';
+  +	buf[n] = '\0';
+  +	husky_vp_bc(buf);
+  +}
+   #endif /* HUSKY */
+   
+   __startup_func
+  +21 -0
+
+osfmk/arm64/arm_vm_init.c
+  @@ -1661,9 +1661,33 @@ arm_vm_physmap_init(boot_args *args)
+  -	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi2: pre assert\n"); }
+  -#endif
+  +	{
+  +		extern void husky_vp_bc(const char *);
+  +		extern void husky_vp_hex(const char *, uint64_t);
+  +		husky_vp_bc("    pmi2: pre assert\n");
+  +		husky_vp_hex("gVirtBase", gVirtBase);
+  +		husky_vp_hex("gPhysBase", gPhysBase);
+  +		husky_vp_hex("segLOWEST", segLOWEST);
+  +		husky_vp_hex("end_kern", end_kern);
+  +		husky_vp_hex("topOfKD", args->topOfKernelData);
+  +		husky_vp_hex("real_avail_end", real_avail_end);
+  +		husky_vp_hex("real_phys_size", real_phys_size);
+  +		husky_vp_hex("physmap_base", physmap_base);
+  +		husky_vp_hex("physmap_end", physmap_end);
+  +		husky_vp_hex("ptov_index", ptov_index);
+  +		for (unsigned int i = 0; i < ptov_index; i++) {
+  +			husky_vp_hex(" pa", temp_ptov_table[i].pa);
+  +			husky_vp_hex(" va", temp_ptov_table[i].va);
+  +			husky_vp_hex(" len", temp_ptov_table[i].len);
+  +		}
+  +		/* Bring-up: report instead of panicking so the boot keeps going. */
+  +		if ((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) > physmap_end) {
+  +			husky_vp_bc("    pmi2: ASSERT WOULD FAIL (va+len > physmap_end), continuing\n");
+  +		}
+  +	}
+  +#else
+   	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
+  +#endif
+   #if defined(HUSKY)
+   	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi2: post assert\n"); }
+   #endif
+  +26 -2
