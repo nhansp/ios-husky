@@ -18,6 +18,11 @@
 #include <stdint.h>
 #include "console.h"
 #include "ufs.h"
+/* Samsung's zuma UFS CAL (shim/ufscal, vendored from Google's GPL kernel). */
+#include "linux/types.h"
+#include "linux/io.h"
+#include "ufs-vs-mmio.h"
+#include "ufs-cal-if.h"
 
 #define UFS_BASE	0x13200000UL	/* zuma hci; vendor hci at +0x1100 */
 
@@ -44,6 +49,7 @@
 
 #define UIC_DME_GET		0x01
 #define UIC_DME_LINKSTARTUP	0x16
+#define UIC_DME_ENDPOINTRESET	0x15
 #define UIC_DME_HIBER_EXIT	0x18
 #define PA_PWRMODE		0x1571
 #define PA_CONNECTEDTXLANES	0x1561
@@ -405,56 +411,246 @@ static int query_flag(uint8_t opcode, uint8_t idn)
 	return ucd.resp[12 + 11];		/* flag value: last byte of the 16-byte area */
 }
 
+#define UNIPRO_BASE		0x13280000UL
+#define PMA_BASE		0x13204000UL
+#define CPORT_BASE		0x13208000UL
+#define UNIP_PA_DBG_OPTION_SUITE_1	0x39A8
+#define DBG_SUITE1_ENABLE		0x90913C1C
+#define UNIP_PA_DBG_OPTION_SUITE_2	0x39B4
+#define DBG_SUITE2_ENABLE		0xE01C115F
+#define UNIP_PA_AVAILTXDATALENS		0x3080
+#define UNIP_PA_AVAILRXDATALENS		0x3100
+#define VS_UFSHCI_V2P1_CTRL		0x8C	/* bit16 IA_TICK_SEL */
+#define VS_ERROR_EN_DL		0x7C
+#define VS_ERROR_EN_N		0x80
+#define VS_ERROR_EN_T		0x84
+#define PA_CONNECTEDRXLANES	0x1581
+#define PA_MAXRXHSGEAR		0x1587
+/* Fallback only: ABL's HCI_1US_TO_CNT_VAL (0xb2). The real rate is read back
+ * from ABL's UniPro programming (see abl_mclk_rate). */
+#define UFS_MCLK_RATE_GUESS	178000000u
+#define UNIP_COMP_CLK_PERIOD	0x44	/* CAL UNIPRO_DBG_PRD: 16e9 / mclk_rate */
+static uint32_t ufs_mclk_rate = UFS_MCLK_RATE_GUESS;
+
+/* ABL ran the same CAL: recover its mclk from the period it programmed. */
+static void abl_mclk_rate(void)
+{
+	uint32_t prd = *(volatile uint32_t *)(0x13280000UL + UNIP_COMP_CLK_PERIOD);
+	if (prd)
+		ufs_mclk_rate = (uint32_t)(16000000000ULL / prd);
+	con_hex2("UFS MCLK", "abl_prd=", prd, "rate=", ufs_mclk_rate);
+}
+
+static struct ufs_vs_handle cal_handle;
+static struct ufs_cal_param cal_param;
+static struct uic_pwr_mode cal_pmd;
+
+static void cal_udelay(u32 us)
+{
+	delay_us(us);
+}
+
+#define FORCE_HCS_UNIPRO_MCLK_STOP_EN	(1u << 5)
+#define FORCE_HCS_MPHY_APBCLK_STOP_EN	(1u << 10)
+
 /*
- * Reset the device and host the way Linux's hce_enable_notify does, start the
- * link without the Samsung CAL tables (betting ABL's PHY setup survives), then
- * run the UFS device init (NOP OUT, fDeviceInit). Returns 0 when the device
- * is ready for SCSI commands from our list.
+ * Linux's ufs_call_cal: the M-PHY's APB clock must run while the CAL writes
+ * PMA registers (else the writes are dropped and it still reports success),
+ * then may stop again.
+ */
+static uint32_t cal_call(uint32_t (*fn)(struct ufs_cal_param *))
+{
+	vs_wr(VS_FORCE_HCS, vs_rd(VS_FORCE_HCS) & ~(FORCE_HCS_UNIPRO_MCLK_STOP_EN | FORCE_HCS_MPHY_APBCLK_STOP_EN));
+	uint32_t ret = fn(&cal_param);
+	vs_wr(VS_FORCE_HCS, vs_rd(VS_FORCE_HCS) | FORCE_HCS_MPHY_APBCLK_STOP_EN);
+	return ret;
+}
+
+
+static uint32_t dme_get(uint32_t attr)
+{
+	uint32_t val = 0, is = 0;
+	return uic_cmd(UIC_DME_GET, attr << 16, &val, &is) ? 0xffffffffu : val;
+}
+
+/*
+ * Bring the host and link up from scratch the way Linux's ufshcd + ufs-exynos
+ * do (ufshcd_hba_execute_hce / ufshcd_link_startup and the exynos notify
+ * hooks), with Samsung's CAL providing the PHY/UniPro configuration around
+ * link startup; then run the UFS device init (NOP OUT, fDeviceInit). Returns
+ * 0 when the device is ready for SCSI commands from our list.
  */
 static int host_reset_and_link(void)
 {
-	con_str("UFS RESET", "device + host reset, link startup (no CAL)");
-	vs_wr(VS_GPIO_OUT, 0);			/* RST_n low */
-	delay_us(10);
-	vs_wr(VS_GPIO_OUT, 1);
-	delay_us(1000);
+	con_str("UFS INIT", "host + link bring-up with the zuma CAL");
+	cal_handle.std = (void *)UFS_BASE;
+	cal_handle.hci = (void *)VS_BASE;
+	cal_handle.ufsp = 0;			/* secure-only: the CAL must not need it */
+	cal_handle.unipro = (void *)UNIPRO_BASE;
+	cal_handle.pma = (void *)PMA_BASE;
+	cal_handle.cport = (void *)CPORT_BASE;
+	cal_handle.udelay = cal_udelay;
+	cal_pmd.lane = 2;			/* DT ufs,pmd-attr-lane / -gear */
+	cal_pmd.gear = 4;
+	cal_pmd.mode = 1;			/* FAST */
+	cal_pmd.hs_series = 2;			/* rate B */
+	cal_param.handle = &cal_handle;
+	cal_param.mclk_rate = ufs_mclk_rate;
+	cal_param.tbl = HOST_EMBD;
+	cal_param.board = BRD_SMDK;		/* DT brd-for-cal = 1 */
+	cal_param.evt_ver = 0;			/* no evt-ver in the DT */
+	cal_param.pmd = &cal_pmd;
+	ufs_cal_init(&cal_param, 0);
+
+	/*
+	 * Reset the device over the link ABL left up, before tearing the host
+	 * down: if HCI_GPIO_OUT does not drive its RST_n, the device would keep
+	 * its old link session and refuse a fresh link startup.
+	 */
+	con_hex("UFS INIT gpio_out", vs_rd(VS_GPIO_OUT));
+	/*
+	 * Pin mux (zuma-base.dts pinctrl@13060000, sole bank gph5; Samsung
+	 * layout CON +0 [4 bits/pin], DAT +4, PUD +8, DRV +0xc): gph5-0 is the
+	 * device REF_CLK out and gph5-1 its RST_n, both function 2 (controller
+	 * driven). ABL left the device in reset; if it also took RST_n over as a
+	 * plain GPIO, HCI_GPIO_OUT never reaches the pin. Linux's pinctrl sets
+	 * function 2 at UFS probe.
+	 */
+	/*
+	 * Device VCC: DT "ufs-vcc" is a regulator-fixed, enable-active-high, on
+	 * gpp0-1 (pinctrl@10840000, gpp0 is its first bank). ABL powers the
+	 * device down with the rest of UFS; turn it back on (only pin 1 touched).
+	 */
+	{
+		volatile uint32_t *gpp0 = (volatile uint32_t *)0x10840000UL;
+		con_hex2("UFS GPP0", "con=", gpp0[0], "dat=", gpp0[1]);
+		uint32_t con = gpp0[0], dat = gpp0[1];
+		if (((con >> 4) & 0xf) != 1 || !(dat & 2)) {
+			gpp0[1] = dat | 2;			/* drive high first */
+			gpp0[0] = (con & ~0xf0u) | 0x10u;	/* pin1 -> output */
+			delay_us(20000);			/* VCC ramp */
+			con_hex2("UFS GPP0", "con'=", gpp0[0], "dat'=", gpp0[1]);
+		}
+	}
+	{
+		volatile uint32_t *gph5 = (volatile uint32_t *)0x13060000UL;
+		con_hex2("UFS GPH5", "con=", gph5[0], "dat=", gph5[1]);
+		con_hex2("UFS GPH5", "pud=", gph5[2], "drv=", gph5[3]);
+		uint32_t con = gph5[0];
+		uint32_t want = (con & ~0xffu) | 0x22u;	/* pin0, pin1 -> function 2 */
+		if (con != want) {
+			gph5[0] = want;
+			con_hex2("UFS GPH5", "con'=", gph5[0], "dat'=", gph5[1]);
+		}
+	}
+	{
+		uint32_t is = 0;
+		uint32_t rc0 = uic_cmd(UIC_DME_ENDPOINTRESET, 0, 0, &is);
+		con_hex2("UFS EPRESET", "rc=", rc0, "is=", is);
+		delay_us(50000);
+	}
+
+	/* ufshcd_hba_stop */
 	ufs_wr(REG_HCE, 0);
 	uint64_t start = ticks();
 	while (ufs_rd(REG_HCE) & 1)
 		if (ticks() - start > TICKS_1S / 10) {
-			con_str("UFS RESET", "HCE stuck at 1");
+			con_str("UFS INIT", "HCE stuck at 1");
 			return 1;
 		}
+
+	/* hce PRE: exynos_ufs_init_host (sw reset + config_host), device reset */
+	vs_wr(VS_SW_RST, 3);
+	start = ticks();
+	while (vs_rd(VS_SW_RST) & 3)
+		if (ticks() - start > TICKS_1S / 100) {
+			con_str("UFS INIT", "sw reset stuck");
+			return 2;
+		}
+	vs_wr(VS_FORCE_HCS, vs_rd(VS_FORCE_HCS) & ~FORCE_HCS_CORECLK_STOP_EN);
+	vs_wr(VS_UFSHCI_V2P1_CTRL, vs_rd(VS_UFSHCI_V2P1_CTRL) | (1u << 16));
+	vs_wr(VS_1US_TO_CNT_VAL, (ufs_mclk_rate / 1000000u) & 0x3ff);
 	vs_wr(VS_DATA_REORDER, 0xA);
 	vs_wr(VS_TXPRDT_ENTRY_SIZE, (1u << 31) | 12);
 	vs_wr(VS_RXPRDT_ENTRY_SIZE, 12);
 	vs_wr(VS_UTRL_NEXUS_TYPE, ~0u);
 	vs_wr(VS_UTMRL_NEXUS_TYPE, ~0u);
+	vs_wr(VS_AXIDMA_BURST, (1u << 31) | (3u << 27) | 3u);	/* WLU_EN | BURST_LEN(3) */
+	vs_wr(VS_IOP_ACG_DISABLE, vs_rd(VS_IOP_ACG_DISABLE) & ~1u);
+	*(volatile uint32_t *)(UNIPRO_BASE + UNIP_PA_DBG_OPTION_SUITE_1) = DBG_SUITE1_ENABLE;
+	*(volatile uint32_t *)(UNIPRO_BASE + UNIP_PA_DBG_OPTION_SUITE_2) = DBG_SUITE2_ENABLE;
+	vs_wr(VS_GPIO_OUT, 0);			/* device RST_n pulse */
+	delay_us(5);
+	vs_wr(VS_GPIO_OUT, 1);
+	delay_us(50000);			/* let the device come out of reset */
+
+	/* ufshcd_hba_start */
 	ufs_wr(REG_HCE, 1);
 	start = ticks();
 	while (!(ufs_rd(REG_HCE) & 1))
 		if (ticks() - start > TICKS_1S / 10) {
-			con_str("UFS RESET", "HCE never set");
-			return 2;
+			con_str("UFS INIT", "HCE never set");
+			return 3;
 		}
-	con_hex2("UFS RESET", "hce=", ufs_rd(REG_HCE), "hcs=", ufs_rd(REG_HCS));
+	/* hce POST: clock-stop control on, clocks ungated, available lanes */
+	vs_wr(VS_FORCE_HCS, vs_rd(VS_FORCE_HCS) | FORCE_HCS_CLK_STOP_CTRL_ALL);
+	vs_wr(VS_CLKSTOP_CTRL, vs_rd(VS_CLKSTOP_CTRL) & ~0x17u);
+	uint32_t avail_tx = *(volatile uint32_t *)(UNIPRO_BASE + UNIP_PA_AVAILTXDATALENS);
+	uint32_t avail_rx = *(volatile uint32_t *)(UNIPRO_BASE + UNIP_PA_AVAILRXDATALENS);
+	con_hex2("UFS INIT", "avail_tx=", avail_tx, "avail_rx=", avail_rx);
+	cal_param.available_lane = (uint8_t)(avail_rx ? avail_rx : 2);
+
+	/* link startup PRE: error reporting, unipro options, CAL pre_link */
+	vs_wr(VS_ERROR_EN_DL, (1u << 31) | 0x20 | 0x2000);
+	vs_wr(VS_ERROR_EN_N, (1u << 31) | 0x1 | 0x2 | 0x4);
+	vs_wr(VS_ERROR_EN_T, (1u << 31) | 0x1 | 0x2 | 0x4 | 0x10);
+	*(volatile uint32_t *)(UNIPRO_BASE + UNIP_PA_DBG_OPTION_SUITE_1) = DBG_SUITE1_ENABLE;
+	*(volatile uint32_t *)(UNIPRO_BASE + UNIP_PA_DBG_OPTION_SUITE_2) = DBG_SUITE2_ENABLE;
+	uint32_t cal = cal_call((uint32_t (*)(struct ufs_cal_param *))ufs_cal_pre_link);
+	con_hex("UFS CAL pre_link", cal);
+	if (cal)
+		return 4;
+
 	uint32_t rc = 0x100, is = 0;
 	for (int i = 0; i < 3 && rc; i++) {
 		rc = uic_cmd(UIC_DME_LINKSTARTUP, 0, 0, &is);
 		con_hex2("UFS LINKUP", "rc=", rc, "is=", is);
 		con_hex2("UFS LINKUP", "hcs=", ufs_rd(REG_HCS), "dp=", ufs_rd(REG_HCS) & HCS_DP);
+		/* UIC error codes: which layer failed (UFSHCI UECPA..UECDME). */
+		con_hex2("UFS UEC", "pa=", ufs_rd(0x60), "dl=", ufs_rd(0x64));
+		con_hex2("UFS UEC", "n=", ufs_rd(0x68), "t=", ufs_rd(0x6c));
+		con_hex2("UFS UEC", "dme=", ufs_rd(0x70), "upmcrs=", (ufs_rd(REG_HCS) >> 8) & 7);
+		/* UniPro's own DME confirm results (ufs-vs-regs.h UNIP_DME_*_CNF_RESULT). */
+		volatile uint32_t *up = (volatile uint32_t *)UNIPRO_BASE;
+		con_hex2("UFS UNIP", "ver=", up[0x000 / 4], "info=", up[0x004 / 4]);
+		con_hex2("UFS UNIP", "poweron=", up[0x7804 / 4], "enable=", up[0x7834 / 4]);
+		con_hex2("UFS UNIP", "linkstart=", up[0x7854 / 4], "reset_lvl=", up[0x7824 / 4]);
+		con_hex2("UFS UNIP", "conn_tx=", up[0x3184 / 4], "conn_rx=", up[0x3204 / 4]);
 		if (!rc && !(ufs_rd(REG_HCS) & HCS_DP))
 			rc = 0x200;
 	}
 	if (rc)
-		return 3;
+		return 5;
+
+	/* link startup POST: capabilities after link, CAL post_link */
+	cal_param.connected_tx_lane = (uint8_t)dme_get(PA_CONNECTEDTXLANES);
+	cal_param.connected_rx_lane = (uint8_t)dme_get(PA_CONNECTEDRXLANES);
+	uint32_t max_rx_gear = dme_get(PA_MAXRXHSGEAR);
+	cal_param.max_gear = (uint8_t)(max_rx_gear < cal_pmd.gear ? max_rx_gear : cal_pmd.gear);
+	con_hex2("UFS CAPS", "lanes tx/rx=", cal_param.connected_tx_lane << 8 | cal_param.connected_rx_lane,
+	    "max_gear=", cal_param.max_gear);
+	cal = cal_call((uint32_t (*)(struct ufs_cal_param *))ufs_cal_post_link);
+	con_hex("UFS CAL post_link", cal);
+	if (cal)
+		return 6;
 	dme_get_log("UFS PWRMODE", PA_PWRMODE);
 	ufs_wr(REG_IS, ufs_rd(REG_IS));
-	/* Our list, running. */
+
+	/* make operational: our list, running */
 	ufs_wr(REG_UTRLBA, (uint32_t)(uintptr_t)utrl);
 	ufs_wr(REG_UTRLBAU, 0);
 	ufs_wr(REG_UTRLRSR, 1);
-	con_hex2("UFS RESET", "utrlba=", ufs_rd(REG_UTRLBA), "rsr=", ufs_rd(REG_UTRLRSR));
+	con_hex2("UFS INIT", "utrlba=", ufs_rd(REG_UTRLBA), "rsr=", ufs_rd(REG_UTRLRSR));
 	/* NOP OUT until the device answers NOP IN. */
 	for (int i = 0; i < 10; i++) {
 		zero(&ucd, 1024);
@@ -466,7 +662,7 @@ static int host_reset_and_link(void)
 			break;
 	}
 	if (rc)
-		return 4;
+		return 7;
 	int f = query_flag(0x06, 0x01);		/* set fDeviceInit */
 	con_hex("UFS fDevInit set", (uint32_t)f);
 	for (int i = 0; i < 200 && f != 0; i++) {
@@ -474,12 +670,48 @@ static int host_reset_and_link(void)
 		f = query_flag(0x05, 0x01);
 	}
 	con_hex("UFS fDevInit", (uint32_t)f);
-	return f == 0 ? 0 : 5;
+	return f == 0 ? 0 : 8;
+}
+
+/*
+ * UFS PHY isolation (DT ufs-phy-iso: PMU offset 0x3ec0, bit0 = 1 releases).
+ * PMU_ALIVE reads are plain MMIO; writes go through EL3's secure-register
+ * SMC, as Linux's exynos-pmu-if does (set_priv_reg).
+ */
+#define PMU_ALIVE		0x15460000UL
+#define PMU_UFS_PHY_ISO		0x3ec0
+#define SMC_CMD_PRIV_REG	0x82000504u
+#define PRIV_REG_OPTION_WRITE	1u
+
+static uint64_t smc_priv_write(uint64_t addr, uint32_t val)
+{
+	register uint64_t x0 __asm__("x0") = SMC_CMD_PRIV_REG;
+	register uint64_t x1 __asm__("x1") = addr;
+	register uint64_t x2 __asm__("x2") = PRIV_REG_OPTION_WRITE;
+	register uint64_t x3 __asm__("x3") = val;
+	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
+	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+	    "x14", "x15", "x16", "x17", "memory");
+	return x0;
+}
+
+static void phy_iso_release(void)
+{
+	volatile uint32_t *iso = (volatile uint32_t *)(PMU_ALIVE + PMU_UFS_PHY_ISO);
+	uint32_t v = *iso;
+	con_hex("UFS PHYISO", v);
+	if (!(v & 1)) {
+		uint64_t r = smc_priv_write(PMU_ALIVE + PMU_UFS_PHY_ISO, v | 1);
+		delay_us(100);
+		con_hex2("UFS PHYISO", "smc=", (uint32_t)r, "now=", *iso);
+	}
 }
 
 void test_ufs(void)
 {
-	con_str("UFS", "probe v8 (read-only)");
+	con_str("UFS", "probe v17: VCC + pinmux + CAL bring-up (read-only)");
+	phy_iso_release();
+	abl_mclk_rate();
 	uint32_t cap = ufs_rd(REG_CAP), hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE);
 	con_hex2("UFS", "ver=", ufs_rd(REG_VER), "cap=", cap);
 	con_hex2("UFS", "hce=", hce, "hcs=", hcs);
