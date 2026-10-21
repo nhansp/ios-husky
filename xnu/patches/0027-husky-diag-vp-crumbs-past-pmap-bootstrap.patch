@@ -1,0 +1,107 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index cba1c81..f01702d 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -353,11 +353,25 @@ arm_auxkc_init(void *mh, void *base)
+  * part guaranteed mapped) - breadcrumbs are tiny.
+  */
+ void husky_vp_bc(const char *s);
++/* TTBR0 at the first crumb: the bootstrap V=P tables this path relies on. */
++uint64_t husky_vp_ttbr0;
+ void
+ husky_vp_bc(const char *s)
+ {
+ 	volatile struct { uint32_t sig, start, size; uint8_t data[]; } *p =
+ 	    (void *)0xfd5ff000UL;
++	if (husky_vp_ttbr0 == 0) {
++		__asm__ volatile ("mrs %0, TTBR0_EL1" : "=r" (husky_vp_ttbr0));
++	}
++	/*
++	 * The ring is also written through Device mappings (pe_serial's console),
++	 * so drop any stale cached copy before reading the header or merging bytes
++	 * into partly-written lines.
++	 */
++	for (uintptr_t a = 0xfd5ff000UL; a < 0xfd5ff000UL + 12 + 0x3000U; a += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r" (a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
+ 	if (p->sig != 0x43474244U || p->size > 0x3000U) {
+ 		p->sig = 0x43474244U;
+ 		p->start = 0;
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index fe5e0e2..4aeda20 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2394,7 +2394,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	pmap_bootstrap(dynamic_memory_begin);
+ #if defined(HUSKY)
+ 	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: post pmap_bootstrap (vp)\n"); }
+-	/* ml_io_map works now; husky_vp_bc would fault (TTBR0 invalidated above). */
++	/* Goes through the V=P path while TTBR0 keeps the bootstrap tables. */
+ 	{ extern void husky_early_bc(const char *); husky_early_bc("  avi: pmap_bootstrap ok\n"); }
+ #endif
+ 
+@@ -2447,6 +2447,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 		va_l1 = va_l2_end;
+ 		cpu_l1_tte++;
+ 	}
++#if defined(HUSKY)
++	{ extern void husky_early_bc(const char *); husky_early_bc("  avi: dyn l3 ok\n"); }
++#endif
+ 
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR)
+ 	/*
+@@ -2466,6 +2469,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	init_ptpages(cpu_tte, KERNEL_PMAP_HEAP_RANGE_START & ~ARM_TT_L1_OFFMASK, VM_MAX_KERNEL_ADDRESS, FALSE, ARM_DYNAMIC_TABLE_XN | ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA));
+ #endif
+ #endif // defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR)
++#if defined(HUSKY)
++	{ extern void husky_early_bc(const char *); husky_early_bc("  avi: heap ptpages ok\n"); }
++#endif
+ 
+ 	/*
+ 	 * Initialize l3 page table pages :
+@@ -2509,6 +2515,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 		va_l1 = va_l2_end;
+ 		cpu_l1_tte++;
+ 	}
++#if defined(HUSKY)
++	{ extern void husky_early_bc(const char *); husky_early_bc("  avi: cpuwindow l3 ok\n"); }
++#endif
+ 
+ 
+ 	/*
+@@ -2522,6 +2531,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #endif
+ 	first_avail = avail_start;
+ 	patch_low_glo_static_region(args->topOfKernelData, avail_start - args->topOfKernelData);
++#if defined(HUSKY)
++	{ extern void husky_early_bc(const char *); husky_early_bc("  avi: lowglo patched\n"); }
++#endif
+ 	enable_preemption();
+ }
+ 
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index db66c2e..ad50ac8 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -829,6 +829,19 @@ void husky_early_bc(const char *s);
+ void
+ husky_early_bc(const char *s)
+ {
++	/*
++	 * While TTBR0 still holds the bootstrap V=P tables (kept under HUSKY), use
++	 * the V=P path: ml_io_map is not safe until arm_vm_init has built the
++	 * dynamic region's L3 tables after pmap_bootstrap.
++	 */
++	extern uint64_t husky_vp_ttbr0;
++	extern void husky_vp_bc(const char *);
++	uint64_t ttbr0;
++	__asm__ volatile ("mrs %0, TTBR0_EL1" : "=r" (ttbr0));
++	if (husky_vp_ttbr0 != 0 && ttbr0 == husky_vp_ttbr0) {
++		husky_vp_bc(s);
++		return;
++	}
+ 	if (husky_bc_prz == NULL) {
+ 		husky_bc_prz = (volatile struct husky_prz *)ml_io_map(HUSKY_PMSG_PHYS, HUSKY_PMSG_SIZE);
+ 		if (husky_bc_prz->sig != HUSKY_PMSG_SIG || husky_bc_prz->size > HUSKY_PMSG_CAP) {
