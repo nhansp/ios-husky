@@ -1,0 +1,100 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 1b6de04..193f37e 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -833,6 +833,9 @@ arm_init(
+ 	/* kptimer_curcpu_up() must be called after cpu_timebase_init */
+ 	kptimer_curcpu_up();
+ #endif /* KPERF */
++#if defined(HUSKY)
++	husky_early_bc("arm_init: kptimer ok\n");
++#endif
+ 
+ 	PE_init_cpu();
+ #if defined(HUSKY)
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 3ad743f..c2f9d39 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -16,6 +16,9 @@
+ #define GICR_WAKE_TIMEOUT_NS (1000000000ULL) // timeout for redistributor wakeup (default 1s)
+ MACHINE_TIMEOUT(gicr_wake_timeout_ns, "gicr-wake-timeout", GICR_WAKE_TIMEOUT_NS, MACHINE_TIMEOUT_UNIT_NSEC, NULL);
+ 
++#if defined(HUSKY)
++extern void husky_early_bc(const char *s);
++#endif
+ static vm_offset_t gicd_base;
+ static vm_offset_t gicr_base;
+ static vm_offset_t gicr_size;
+@@ -73,6 +76,9 @@ pe_init_fiq()
+ 	int error;
+ 	DTEntry entry;
+ 
++#if defined(HUSKY)
++	husky_early_bc("  fiq: enter\n");
++#endif
+ 	// gicd_base is 0x0 only before it's initialized by the boot processor.
+ 	// Avoid calling SecureDT* routines on secondary processors to avoid
+ 	// race conditions because they are not thread-safe.
+@@ -120,8 +126,14 @@ pe_init_fiq()
+ 		gicr_size = gicr_size_prop;
+ 	}
+ 
++#if defined(HUSKY)
++	husky_early_bc("  fiq: gic mapped\n");
++#endif
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++#if defined(HUSKY)
++	husky_early_bc("  fiq: gicr_pe found\n");
++#endif
+ 
+ 	// Mark this PE to be awake
+ 	uint32_t gicr_waker = gicr_read32(GICR_WAKER);
+@@ -141,18 +153,27 @@ pe_init_fiq()
+ 		}
+ 	}
+ 
++#if defined(HUSKY)
++	husky_early_bc("  fiq: waker done\n");
++#endif
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+ 
+ 	// Enable PPI 27
+ 	gicr_write32(GICR_ISENABLER0, (1 << 27));
+ 
++#if defined(HUSKY)
++	husky_early_bc("  fiq: igroupr/isenabler done\n");
++#endif
+ 	// Enable system register access
+ 	uint64_t icc_sre = __builtin_arm_rsr64("ICC_SRE_EL1");
+ 	icc_sre |= ICC_SRE_SRE;
+ 	__builtin_arm_wsr64("ICC_SRE_EL1", icc_sre);
+ 	__builtin_arm_isb(ISB_SY);
+ 
++#if defined(HUSKY)
++	husky_early_bc("  fiq: icc_sre done\n");
++#endif
+ 	// Set priority masks and binary point for group 0
+ 	__builtin_arm_wsr64("ICC_BPR0_EL1", 0);
+ 	__builtin_arm_wsr64("ICC_PMR_EL1", 0xFF);
+@@ -162,12 +183,18 @@ pe_init_fiq()
+ 	icc_ctlr &= ~ICC_CTLR_EOIMODE;
+ 	__builtin_arm_wsr64("ICC_CTLR_EL1", icc_ctlr);
+ 
++#if defined(HUSKY)
++	husky_early_bc("  fiq: icc pmr/bpr/ctlr done\n");
++#endif
+ 	// Enable the forwarding of the vtimer interrupt
+ 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+ 	gicd_ctlr |= GICD_CTLR_ENABLEGRP0;
+ 	gicd_write32(GICD_CTLR, gicd_ctlr);
+ 	__builtin_arm_wsr64("ICC_IGRPEN0_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
++#if defined(HUSKY)
++	husky_early_bc("  fiq: done\n");
++#endif
+ }
+ #else
+ void
