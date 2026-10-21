@@ -1,0 +1,66 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index ab87aa0..c7ca3d5 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -18,6 +18,15 @@ MACHINE_TIMEOUT(gicr_wake_timeout_ns, "gicr-wake-timeout", GICR_WAKE_TIMEOUT_NS,
+ 
+ #if defined(HUSKY)
+ extern void husky_early_bc(const char *s);
++
++/* Non-secure view (GICD_CTLR.DS == 0, ARE_NS == 1). */
++#define HUSKY_GICD_CTLR_ENABLEGRP1A 0x2
++#define HUSKY_GICD_CTLR_RWP         0x80000000U
++/* Redistributor SGI-frame offsets, as GICR_IGROUPR0 in VMAPPLE.h. */
++#define HUSKY_GICR_ISPENDR0     0x10200
++#define HUSKY_GICR_ISACTIVER0   0x10300
++#define HUSKY_GICR_IPRIORITYR   0x10400
++#define HUSKY_GICR_IGRPMODR0    0x10D00
+ #endif
+ static vm_offset_t gicd_base;
+ static vm_offset_t gicr_base;
+@@ -203,7 +212,19 @@ pe_init_fiq()
+ 	husky_early_bc("  fiq: icc pmr/bpr/ctlr done\n");
+ #endif
+ #if defined(HUSKY)
+-	// Firmware already enabled Group 1 NS forwarding in GICD_CTLR.
++	/*
++	 * Nothing has enabled Group 1 NS forwarding yet: on Android, Linux's
++	 * gic_dist_init sets GICD_CTLR.EnableGrp1A itself, and the firmware
++	 * leaves it clear (measured GICD_CTLR=0x10, ARE_NS only). Without it the
++	 * distributor never delivers the vtimer. Also give PPI 27 Linux's default
++	 * priority rather than the reset value.
++	 */
++	*(volatile uint8_t *)(gicr_pe_base + HUSKY_GICR_IPRIORITYR + 27) = 0xa0;
++	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
++	gicd_write32(GICD_CTLR, gicd_ctlr | HUSKY_GICD_CTLR_ENABLEGRP1A);
++	while (gicd_read32(GICD_CTLR) & HUSKY_GICD_CTLR_RWP) {
++		/* wait for the register write to take effect */
++	}
+ 	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
+ #else
+@@ -224,10 +245,6 @@ pe_init_fiq()
+  * Bring-up: snapshot everything between the vtimer and the CPU, to see why
+  * PPI 27 never reaches sleh_irq. SGI-frame offsets as in VMAPPLE.h.
+  */
+-#define HUSKY_GICR_ISPENDR0     0x10200
+-#define HUSKY_GICR_ISACTIVER0   0x10300
+-#define HUSKY_GICR_IPRIORITYR   0x10400
+-#define HUSKY_GICR_IGRPMODR0    0x10D00
+ void husky_gic_dump(const char *tag);
+ void
+ husky_gic_dump(const char *tag)
+@@ -241,11 +258,10 @@ husky_gic_dump(const char *tag)
+ 	    tag, gicd_read32(GICD_CTLR), gicr_read32(GICR_IGROUPR0), gicr_read32(HUSKY_GICR_IGRPMODR0),
+ 	    gicr_read32(GICR_ISENABLER0), gicr_read32(HUSKY_GICR_ISPENDR0), gicr_read32(HUSKY_GICR_ISACTIVER0),
+ 	    gicr_read32(HUSKY_GICR_IPRIORITYR + 24), gicr_read32(GICR_WAKER));
+-	kprintf("husky gic[%s]: IGRPEN1=%llx PMR=%llx CTLR=%llx SRE=%llx RPR=%llx HPPIR1=%llx HPPIR0=%llx\n",
++	kprintf("husky gic[%s]: IGRPEN1=%llx PMR=%llx CTLR=%llx SRE=%llx RPR=%llx HPPIR1=%llx\n",
+ 	    tag, __builtin_arm_rsr64("ICC_IGRPEN1_EL1"), __builtin_arm_rsr64("ICC_PMR_EL1"),
+ 	    __builtin_arm_rsr64("ICC_CTLR_EL1"), __builtin_arm_rsr64("ICC_SRE_EL1"),
+-	    __builtin_arm_rsr64("ICC_RPR_EL1"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"),
+-	    __builtin_arm_rsr64("ICC_HPPIR0_EL1"));
++	    __builtin_arm_rsr64("ICC_RPR_EL1"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"));
+ 	kprintf("husky gic[%s]: DAIF=%llx ISR=%llx CNTV_CTL=%llx CNTV_CVAL=%llx CNTVCT=%llx CNTFRQ=%llx\n",
+ 	    tag, __builtin_arm_rsr64("DAIF"), __builtin_arm_rsr64("ISR_EL1"),
+ 	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("CNTV_CVAL_EL0"),
