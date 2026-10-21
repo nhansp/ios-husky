@@ -21,7 +21,7 @@ OUT=${2:-out/boot/xnu-boot.img}
 shift || true; shift || true
 EXTRA=("$@")					# forwarded to mkadt.py (e.g. --boot-mpidr/--timebase/--lowmem)
 MKBOOTIMG=${MKBOOTIMG:-artifacts/mkbootimg/mkbootimg.py}
-CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=1 keepsyms=1 -v -enable_kprintf_spam"}
+CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=1 keepsyms=1 -v -enable_kprintf_spam startup_debug=1"}
 
 mkdir -p out/boot
 echo ">> building shim"

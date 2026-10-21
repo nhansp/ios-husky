@@ -1,0 +1,98 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 0554aa8..e8f184d 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3008,6 +3008,27 @@ sleh_irq(arm_saved_state_t *state)
+ #endif
+ 
+ 
++#if defined(HUSKY)
++	/*
++	 * GIC Group 1 NS (see pe_init_fiq): the vtimer PPI arrives here rather
++	 * than at sleh_fiq. Ack it and run the timer path sleh_fiq would.
++	 */
++	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
++	uint32_t intid = (uint32_t)(iar & 0xffffff);
++	if (intid >= 1020) {
++		return; /* spurious / special */
++	}
++	sleh_interrupt_handler_prologue(state, intid == 27 ? DBG_INTR_TYPE_TIMER : DBG_INTR_TYPE_OTHER);
++	if (intid == 27) {
++		cdp->cpu_decrementer = -1; /* Large */
++		ml_interrupt_masked_debug_start(rtclock_intr, DBG_INTR_TYPE_TIMER);
++		rtclock_intr(TRUE);
++		ml_interrupt_masked_debug_end();
++	} else {
++		kprintf("husky: unhandled IRQ %u\n", intid);
++	}
++	__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++#else
+ 	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 
+ #if USE_APPLEARMSMP
+@@ -3019,6 +3040,7 @@ sleh_irq(arm_saved_state_t *state)
+ 	    cdp->interrupt_nub,
+ 	    cdp->interrupt_source);
+ #endif
++#endif /* HUSKY */
+ 
+ 	entropy_collect();
+ 
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index c2f9d39..626d7fe 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -156,8 +156,18 @@ pe_init_fiq()
+ #if defined(HUSKY)
+ 	husky_early_bc("  fiq: waker done\n");
+ #endif
++#if defined(HUSKY)
++	/*
++	 * husky runs XNU in the Non-secure world of a two-security-state GIC: EL3
++	 * owns Group 0 (SCR_EL3.FIQ), so Non-secure IGROUPR writes are ignored and
++	 * Group 0 CPU-interface registers (ICC_BPR0/IGRPEN0) trap to EL3. Firmware
++	 * leaves the PPIs in Group 1 NS, so the vtimer arrives as an IRQ instead
++	 * of a FIQ and sleh_irq handles it.
++	 */
++#else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
++#endif
+ 
+ 	// Enable PPI 27
+ 	gicr_write32(GICR_ISENABLER0, (1 << 27));
+@@ -174,9 +184,15 @@ pe_init_fiq()
+ #if defined(HUSKY)
+ 	husky_early_bc("  fiq: icc_sre done\n");
+ #endif
++#if defined(HUSKY)
++	// Set priority mask and binary point for group 1
++	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
++	__builtin_arm_wsr64("ICC_PMR_EL1", 0xFF);
++#else
+ 	// Set priority masks and binary point for group 0
+ 	__builtin_arm_wsr64("ICC_BPR0_EL1", 0);
+ 	__builtin_arm_wsr64("ICC_PMR_EL1", 0xFF);
++#endif
+ 
+ 	// Set EOI mode of this processor
+ 	uint64_t icc_ctlr = __builtin_arm_rsr64("ICC_CTLR_EL1");
+@@ -186,12 +202,18 @@ pe_init_fiq()
+ #if defined(HUSKY)
+ 	husky_early_bc("  fiq: icc pmr/bpr/ctlr done\n");
+ #endif
++#if defined(HUSKY)
++	// Firmware already enabled Group 1 NS forwarding in GICD_CTLR.
++	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
++	__builtin_arm_isb(ISB_SY);
++#else
+ 	// Enable the forwarding of the vtimer interrupt
+ 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+ 	gicd_ctlr |= GICD_CTLR_ENABLEGRP0;
+ 	gicd_write32(GICD_CTLR, gicd_ctlr);
+ 	__builtin_arm_wsr64("ICC_IGRPEN0_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
++#endif
+ #if defined(HUSKY)
+ 	husky_early_bc("  fiq: done\n");
+ #endif
