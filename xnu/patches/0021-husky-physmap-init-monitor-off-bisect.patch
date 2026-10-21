@@ -1,0 +1,33 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index e98d5e7..afcb2e0 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1637,16 +1637,28 @@ arm_vm_physmap_init(boot_args *args)
+ {
+ 	ptov_table_entry temp_ptov_table[PTOV_TABLE_SIZE];
+ 	bzero(temp_ptov_table, sizeof(temp_ptov_table));
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi2: enter\n"); }
++#endif
+ 
+ 	// Will be handed back to VM layer through ml_static_mfree() in arm_vm_prot_finalize()
+ 	arm_vm_physmap_slide(temp_ptov_table, gVirtBase, segLOWEST - gVirtBase, AP_RWNA,
+ 	    ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT);
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi2: slide1 ok\n"); }
++#endif
+ 
+ 	arm_vm_page_granular_RWNX(end_kern, phystokv(args->topOfKernelData) - end_kern,
+ 	    ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT); /* Device Tree (if not locked down), RAM Disk (if present), bootArgs */
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi2: granular ok\n"); }
++#endif
+ 
+ 	arm_vm_physmap_slide(temp_ptov_table, (args->topOfKernelData - gPhysBase + gVirtBase),
+ 	    real_avail_end - args->topOfKernelData, AP_RWNA, ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT); // rest of physmem
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi2: slide2 ok\n"); }
++#endif
+ 
+ 	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
+ 
