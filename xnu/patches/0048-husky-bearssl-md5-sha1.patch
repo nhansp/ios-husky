@@ -1,0 +1,244 @@
+diff --git a/libkern/conf/Makefile.template b/libkern/conf/Makefile.template
+index b6ea01d..bb13649 100644
+--- a/libkern/conf/Makefile.template
++++ b/libkern/conf/Makefile.template
+@@ -35,6 +35,11 @@ husky_aes_ct_enc.o_CFLAGS_ADD += -mgeneral-regs-only
+ husky_aes_ct_dec.o_CFLAGS_ADD += -mgeneral-regs-only
+ husky_aes_ct_cbcenc.o_CFLAGS_ADD += -mgeneral-regs-only
+ husky_aes_ct_cbcdec.o_CFLAGS_ADD += -mgeneral-regs-only
++# BearSSL MD5 and SHA-1 behind the legacy MD5*/SHA1* APIs (corecrypto_md5.c,
++# corecrypto_sha1.c); the HUSKY table has no ccmd5_di/ccsha1_di.
++HUSKY_HASH_OBJS = husky_md5.o husky_dec32le.o husky_enc32le.o husky_sha1.o husky_dec32be.o husky_enc32be.o corecrypto_md5.o corecrypto_sha1.o
++$(foreach o,$(HUSKY_HASH_OBJS),$(eval $(o)_INCFLAGS = $(HUSKY_AES_INC)))
++$(foreach o,$(HUSKY_HASH_OBJS),$(eval $(o)_CFLAGS_ADD += -mgeneral-regs-only))
+ endif
+ 
+ # Runtime support functions don't interact well with LTO (9294679)
+diff --git a/libkern/conf/files b/libkern/conf/files
+index e79e250..730fd39 100644
+--- a/libkern/conf/files
++++ b/libkern/conf/files
+@@ -103,6 +103,12 @@ libkern/crypto/husky_aes_ct_enc.c	optional crypto
+ libkern/crypto/husky_aes_ct_dec.c	optional crypto
+ libkern/crypto/husky_aes_ct_cbcenc.c	optional crypto
+ libkern/crypto/husky_aes_ct_cbcdec.c	optional crypto
++libkern/crypto/husky_md5.c	optional crypto
++libkern/crypto/husky_dec32le.c	optional crypto
++libkern/crypto/husky_enc32le.c	optional crypto
++libkern/crypto/husky_sha1.c	optional crypto
++libkern/crypto/husky_dec32be.c	optional crypto
++libkern/crypto/husky_enc32be.c	optional crypto
+ libkern/crypto/corecrypto_aesxts.c		optional crypto
+ libkern/crypto/corecrypto_rand.c		optional crypto
+ libkern/crypto/corecrypto_rsa.c		    optional crypto
+diff --git a/libkern/crypto/corecrypto_md5.c b/libkern/crypto/corecrypto_md5.c
+index 242dcdb..9e55a25 100644
+--- a/libkern/crypto/corecrypto_md5.c
++++ b/libkern/crypto/corecrypto_md5.c
+@@ -16,6 +16,63 @@ setCount(MD5_CTX *ctx, uint64_t count)
+ 	ctx->count[1] = (uint32_t)count;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++/*
++ * The HUSKY bring-up crypto table (register_crypto.c) has no ccmd5_di. MD5
++ * uses BearSSL's portable implementation (libkern/crypto/husky_md5.c), with
++ * MD5_CTX carrying exactly its state: chaining value, byte count and the
++ * partial block, converted around each call like the corecrypto path does
++ * (ported from ios-sweet 0027). HFS needs it for volume UUIDs.
++ */
++#include "bearssl_hash.h"
++
++static void
++MD5ToBr(MD5_CTX *md5_ctx, br_md5_context *br_ctx)
++{
++	br_md5_init(br_ctx);
++	memcpy(br_ctx->val, md5_ctx->state, sizeof(br_ctx->val));
++	br_ctx->count = getCount(md5_ctx);
++	memcpy(br_ctx->buf, md5_ctx->buffer, sizeof(br_ctx->buf));
++}
++
++static void
++BrToMD5(const br_md5_context *br_ctx, MD5_CTX *md5_ctx)
++{
++	memcpy(md5_ctx->state, br_ctx->val, sizeof(md5_ctx->state));
++	setCount(md5_ctx, br_ctx->count);
++	memcpy(md5_ctx->buffer, br_ctx->buf, sizeof(md5_ctx->buffer));
++}
++
++void
++MD5Init(MD5_CTX *ctx)
++{
++	br_md5_context br_ctx;
++
++	br_md5_init(&br_ctx);
++	BrToMD5(&br_ctx, ctx);
++}
++
++void
++MD5Update(MD5_CTX *ctx, const void *data, unsigned int len)
++{
++	br_md5_context br_ctx;
++
++	MD5ToBr(ctx, &br_ctx);
++	br_md5_update(&br_ctx, data, len);
++	BrToMD5(&br_ctx, ctx);
++}
++
++void
++MD5Final(unsigned char digest[MD5_DIGEST_LENGTH], MD5_CTX *ctx)
++{
++	br_md5_context br_ctx;
++
++	MD5ToBr(ctx, &br_ctx);
++	br_md5_out(&br_ctx, digest);
++}
++
++#else /* !ARM64_BOARD_CONFIG_HUSKY */
++
+ /* Copy a ccdigest ctx into a legacy MD5 context */
+ static void
+ DiToMD5(const struct ccdigest_info *di, struct ccdigest_ctx *di_ctx, MD5_CTX *md5_ctx)
+@@ -68,3 +125,5 @@ MD5Final(unsigned char digest[MD5_DIGEST_LENGTH], MD5_CTX *ctx)
+ 	MD5ToDi(di, ctx, di_ctx);
+ 	ccdigest_final(di, di_ctx, digest);
+ }
++
++#endif /* !ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/libkern/crypto/corecrypto_sha1.c b/libkern/crypto/corecrypto_sha1.c
+index 5fd982b..05130f8 100644
+--- a/libkern/crypto/corecrypto_sha1.c
++++ b/libkern/crypto/corecrypto_sha1.c
+@@ -16,6 +16,63 @@ setCount(SHA1_CTX *ctx, uint64_t count)
+ 	ctx->c.b64[0] = count;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++/*
++ * The HUSKY bring-up crypto table (register_crypto.c) has no ccsha1_di.
++ * SHA-1 uses BearSSL's portable implementation (libkern/crypto/husky_sha1.c),
++ * with SHA1_CTX carrying exactly its state: chaining value, byte count and
++ * the partial block, converted around each call like the corecrypto path
++ * does (ported from ios-sweet 0032).
++ */
++#include "bearssl_hash.h"
++
++static void
++SHA1ToBr(SHA1_CTX *sha1_ctx, br_sha1_context *br_ctx)
++{
++	br_sha1_init(br_ctx);
++	memcpy(br_ctx->val, sha1_ctx->h.b32, sizeof(br_ctx->val));
++	br_ctx->count = getCount(sha1_ctx);
++	memcpy(br_ctx->buf, sha1_ctx->m.b8, sizeof(br_ctx->buf));
++}
++
++static void
++BrToSHA1(const br_sha1_context *br_ctx, SHA1_CTX *sha1_ctx)
++{
++	memcpy(sha1_ctx->h.b32, br_ctx->val, sizeof(sha1_ctx->h.b32));
++	setCount(sha1_ctx, br_ctx->count);
++	memcpy(sha1_ctx->m.b8, br_ctx->buf, sizeof(sha1_ctx->m.b8));
++}
++
++void
++SHA1Init(SHA1_CTX *ctx)
++{
++	br_sha1_context br_ctx;
++
++	br_sha1_init(&br_ctx);
++	BrToSHA1(&br_ctx, ctx);
++}
++
++void
++SHA1Update(SHA1_CTX *ctx, const void *data, size_t len)
++{
++	br_sha1_context br_ctx;
++
++	SHA1ToBr(ctx, &br_ctx);
++	br_sha1_update(&br_ctx, data, len);
++	BrToSHA1(&br_ctx, ctx);
++}
++
++void
++SHA1Final(void *digest, SHA1_CTX *ctx)
++{
++	br_sha1_context br_ctx;
++
++	SHA1ToBr(ctx, &br_ctx);
++	br_sha1_out(&br_ctx, digest);
++}
++
++#else /* !ARM64_BOARD_CONFIG_HUSKY */
++
+ /* Copy a ccdigest ctx into a legacy SHA1 context */
+ static void
+ DiToSHA1(const struct ccdigest_info *di, struct ccdigest_ctx *di_ctx, SHA1_CTX *sha1_ctx)
+@@ -69,6 +126,8 @@ SHA1Final(void *digest, SHA1_CTX *ctx)
+ 	ccdigest_final(di, di_ctx, digest);
+ }
+ 
++#endif /* !ARM64_BOARD_CONFIG_HUSKY */
++
+ /* This is not publicised in header, but exported in libkern.exports */
+ void SHA1Final_r(SHA1_CTX *context, void *digest);
+ void
+diff --git a/libkern/crypto/husky_dec32be.c b/libkern/crypto/husky_dec32be.c
+new file mode 100644
+index 0000000..4a7a549
+--- /dev/null
++++ b/libkern/crypto/husky_dec32be.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0044-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_bearssl/src/codec/dec32be.c"
++#endif
+diff --git a/libkern/crypto/husky_dec32le.c b/libkern/crypto/husky_dec32le.c
+new file mode 100644
+index 0000000..d7a6c5d
+--- /dev/null
++++ b/libkern/crypto/husky_dec32le.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0044-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_bearssl/src/codec/dec32le.c"
++#endif
+diff --git a/libkern/crypto/husky_enc32be.c b/libkern/crypto/husky_enc32be.c
+new file mode 100644
+index 0000000..6d43d54
+--- /dev/null
++++ b/libkern/crypto/husky_enc32be.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0044-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_bearssl/src/codec/enc32be.c"
++#endif
+diff --git a/libkern/crypto/husky_enc32le.c b/libkern/crypto/husky_enc32le.c
+new file mode 100644
+index 0000000..09f2b86
+--- /dev/null
++++ b/libkern/crypto/husky_enc32le.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0044-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_bearssl/src/codec/enc32le.c"
++#endif
+diff --git a/libkern/crypto/husky_md5.c b/libkern/crypto/husky_md5.c
+new file mode 100644
+index 0000000..0d6a8ea
+--- /dev/null
++++ b/libkern/crypto/husky_md5.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0044-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_bearssl/src/hash/md5.c"
++#endif
+diff --git a/libkern/crypto/husky_sha1.c b/libkern/crypto/husky_sha1.c
+new file mode 100644
+index 0000000..4e237c9
+--- /dev/null
++++ b/libkern/crypto/husky_sha1.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0044-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_bearssl/src/hash/sha1.c"
++#endif
