@@ -1,0 +1,165 @@
+diff --git a/bsd/dev/husky_ufs.c b/bsd/dev/husky_ufs.c
+index ce76eec..5f6802f 100644
+--- a/bsd/dev/husky_ufs.c
++++ b/bsd/dev/husky_ufs.c
+@@ -46,10 +46,15 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
++#include <machine/atomic.h>
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++static void husky_log_start(void);
+ 
+ /* Console (panel) and kprintf (pmsg, readable from Android after the reset). */
+ #define HU_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
+@@ -649,9 +654,122 @@ husky_ufs_init(void)
+ 	HU_LOG("HUSKY UFS: \"%s\" +%llu MiB on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, root_off >> 20, hu.lun, hu.first_block, hu.nblocks * UFS_BLOCK >> 20,
+ 	    hu.writable ? "read-write" : "read-only", hu.dma_pa);
++	husky_log_start();
+ 	return 0;
+ }
+ 
++/*
++ * Persistent console log ("huskylog", ported from ios-sweet 0047). Every
++ * character that reaches the console (kernel printf and /dev/console writes
++ * of daemons, both through _cnputs) is also kept in a 4 MiB ring, and once
++ * the window is known and writable (ufsrw=1) a thread copies new ring blocks
++ * into the reserved tail of the partition (log-size, past the root window)
++ * every ufslogsecs seconds (default 5). Device block 0 of that area is a
++ * header:
++ *   "HUSKYLOG" | u32 version 1 | u32 ring size | u64 total bytes written
++ *   | u64 flush sequence
++ * ring offset of byte n = n % ring size; the ring follows in blocks 1...
++ * Read it back from Android with tools/husky-log-pull.sh. Off with ufslog=0.
++ */
++#define HUSKY_LOG_SIZE          (4u << 20)
++#define HUSKY_LOG_BLOCKS        (1 + HUSKY_LOG_SIZE / UFS_BLOCK)
++#define HUSKY_LOG_SECS          5u
++
++static char husky_log_ring[HUSKY_LOG_SIZE];
++static uint64_t _Atomic husky_log_total;
++static int husky_log_chan;
++static uint32_t husky_log_secs = HUSKY_LOG_SECS;
++
++/* Called for all console output, any context: never blocks. */
++void husky_log_append(const char *c, int size);
++
++void
++husky_log_append(const char *c, int size)
++{
++	if (size <= 0) {
++		return;
++	}
++	uint64_t at = os_atomic_add_orig(&husky_log_total, (uint64_t)size, relaxed);
++	for (int i = 0; i < size; i++) {
++		husky_log_ring[(at + (uint64_t)i) % HUSKY_LOG_SIZE] = c[i];
++	}
++}
++
++struct husky_log_header {
++	char magic[8];
++	uint32_t version, size;
++	uint64_t total, seq;
++};
++
++static void
++husky_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t base = hu.log_block;
++	uint64_t flushed = 0, seq = 0;
++	void *bounce = (void *)(hu.dma + DMA_BOUNCE);
++
++	HU_LOG("HUSKY LOG: console log to the partition tail (block 0x%llx, %u KiB) every %us\n",
++	    base, HUSKY_LOG_BLOCKS * UFS_BLOCK >> 10, husky_log_secs);
++	for (;;) {
++		(void)tsleep(&husky_log_chan, PZERO, "huskylog", hz * (int)husky_log_secs);
++		uint64_t total = os_atomic_load(&husky_log_total, relaxed);
++		if (total == flushed) {
++			continue;
++		}
++		uint64_t pos = total - flushed >= HUSKY_LOG_SIZE ? total - HUSKY_LOG_SIZE : flushed;
++		int error = 0;
++
++		lck_mtx_lock(&husky_ufs_lock);
++		while (pos < total && !error) {
++			uint32_t off = (uint32_t)(pos % HUSKY_LOG_SIZE);
++			uint32_t blk = off / UFS_BLOCK;
++			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(HUSKY_LOG_SIZE / UFS_BLOCK - blk)),
++			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++			memcpy(bounce, husky_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++			error = ufs_write_blocks(base + 1 + blk, n, true);
++			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++		}
++		if (!error) {
++			struct husky_log_header h = {
++				.magic = { 'H', 'U', 'S', 'K', 'Y', 'L', 'O', 'G' },
++				.version = 1, .size = HUSKY_LOG_SIZE, .total = total, .seq = ++seq,
++			};
++			bzero(bounce, UFS_BLOCK);
++			memcpy(bounce, &h, sizeof(h));
++			error = ufs_write_blocks(base, 1, true);
++		}
++		if (!error) {
++			error = ufs_sync_cache();
++		}
++		lck_mtx_unlock(&husky_ufs_lock);
++		if (error) {
++			HU_LOG("HUSKY LOG: write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = total;
++	}
++}
++
++static void
++husky_log_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("ufslog", &on, sizeof(on));
++	if (!on || !hu.writable || hu.log_blocks < HUSKY_LOG_BLOCKS) {
++		return;
++	}
++	PE_parse_boot_argn("ufslogsecs", &husky_log_secs, sizeof(husky_log_secs));
++	if (husky_log_secs == 0 || husky_log_secs > 60) {
++		husky_log_secs = HUSKY_LOG_SECS;
++	}
++	if (kernel_thread_start(husky_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int husky_ufs_rootdev(dev_t *dev);
+ 
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 7784e72..f15235c 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -275,9 +275,17 @@ _cnputc(char c, bool poll)
+  *             waiting for an interrupt when the hardware device isn't ready
+  * @param size The number of characters to print to the console.
+  */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++extern void husky_log_append(const char *c, int size);  /* bsd/dev/husky_ufs.c */
++#endif
++
+ static inline void
+ _cnputs(char *c, int size, bool poll)
+ {
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	husky_log_append(c, size);
++#endif
++
+ 	if (disableConsoleOutput) {
+ 		return;
+ 	}
