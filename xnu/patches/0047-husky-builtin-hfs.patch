@@ -115,10 +115,10 @@ index 0000000..4edcd85
 +#endif
 diff --git a/bsd/husky_hfs/husky_hfs_iokit.c b/bsd/husky_hfs/husky_hfs_iokit.c
 new file mode 100644
-index 0000000..e2d6a2b
+index 0000000..e93f0d6
 --- /dev/null
 +++ b/bsd/husky_hfs/husky_hfs_iokit.c
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,133 @@
 +/*
 + * Built-in replacement for HFS's IOKit glue (core/hfs_iokit.cpp and
 + * hfs_encodings/hfs_encodings_kext.cpp) on HUSKY, ported from ios-sweet 0026.
@@ -220,6 +220,7 @@ index 0000000..e2d6a2b
 +	}
 +
 +	printf("HUSKY HFS: hfs-715.120.4 registered\n");
++	kprintf("HUSKY HFS: hfs-715.120.4 registered\n");
 +}
 +
 +/* Built in, not a loadable kext: there is no kext to retain per mount. */

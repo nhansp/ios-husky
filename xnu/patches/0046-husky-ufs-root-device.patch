@@ -12,10 +12,10 @@ index f176775..9af2659 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/husky_ufs.c b/bsd/dev/husky_ufs.c
 new file mode 100644
-index 0000000..470e160
+index 0000000..ce76eec
 --- /dev/null
 +++ b/bsd/dev/husky_ufs.c
-@@ -0,0 +1,667 @@
+@@ -0,0 +1,670 @@
 +/*
 + * HUSKY internal UFS root device.
 + *
@@ -68,6 +68,9 @@ index 0000000..470e160
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/* Console (panel) and kprintf (pmsg, readable from Android after the reset). */
++#define HU_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
 +
 +#define REG_CAP         0x00
 +#define REG_IS          0x20
@@ -205,7 +208,7 @@ index 0000000..470e160
 +	while (ufs_rd(REG_UTRLDBR) & 1) {
 +		if (mach_absolute_time() > deadline) {
 +			ufs_wr(REG_UTRLCLR, ~1u);       /* Exynos: write 0 to clear the slot */
-+			printf("HUSKY UFS: command 0x%02x timed out\n", cdb[0]);
++			HU_LOG("HUSKY UFS: command 0x%02x timed out\n", cdb[0]);
 +			return ETIMEDOUT;
 +		}
 +		delay(1);
@@ -221,7 +224,7 @@ index 0000000..470e160
 +
 +	uint32_t ocs = utrd->dw2 & 0xff;
 +	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
-+		printf("HUSKY UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
++		HU_LOG("HUSKY UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
 +		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
 +		return EIO;
 +	}
@@ -256,7 +259,7 @@ index 0000000..470e160
 +	if (!hu.writable || !n || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
 +	    lba < first || lba - first >= n || count > n - (lba - first) ||
 +	    lba + count - 1 > UINT32_MAX) {
-+		printf("HUSKY UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
++		HU_LOG("HUSKY UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
 +		return EPERM;
 +	}
 +	uint8_t cdb[10] = {
@@ -284,7 +287,7 @@ index 0000000..470e160
 +		return error;
 +	}
 +	if (memcmp(b, "EFI PART", 8) != 0) {
-+		printf("HUSKY UFS: LUN %u has no GPT\n", hu.lun);
++		HU_LOG("HUSKY UFS: LUN %u has no GPT\n", hu.lun);
 +		return ENXIO;
 +	}
 +	uint64_t entry_lba;
@@ -293,7 +296,7 @@ index 0000000..470e160
 +	memcpy(&nent, b + 80, 4);
 +	memcpy(&esz, b + 84, 4);
 +	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
-+		printf("HUSKY UFS: unsupported GPT entries %u x %u\n", nent, esz);
++		HU_LOG("HUSKY UFS: unsupported GPT entries %u x %u\n", nent, esz);
 +		return ENXIO;
 +	}
 +	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
@@ -325,7 +328,7 @@ index 0000000..470e160
 +		*countp = last - first + 1;
 +		return 0;
 +	}
-+	printf("HUSKY UFS: no GPT partition named \"%s\"\n", want);
++	HU_LOG("HUSKY UFS: no GPT partition named \"%s\"\n", want);
 +	return ENOENT;
 +}
 +
@@ -334,15 +337,15 @@ index 0000000..470e160
 +{
 +	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
 +	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
-+		printf("HUSKY UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
++		HU_LOG("HUSKY UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
 +		return ENXIO;
 +	}
 +	if (ufs_rd(REG_UTRLDBR)) {
-+		printf("HUSKY UFS: requests outstanding from the shim\n");
++		HU_LOG("HUSKY UFS: requests outstanding from the shim\n");
 +		return EBUSY;
 +	}
 +	if (((hu.dma_pa + DMA_SIZE - 1) >> 32) && !(ufs_rd(REG_CAP) & CAP_64AS)) {
-+		printf("HUSKY UFS: DMA memory at 0x%llx but the host has no 64-bit addressing\n",
++		HU_LOG("HUSKY UFS: DMA memory at 0x%llx but the host has no 64-bit addressing\n",
 +		    hu.dma_pa);
 +		return ENXIO;
 +	}
@@ -357,7 +360,7 @@ index 0000000..470e160
 +	/* Never ring a doorbell unless the host uses our list. */
 +	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
 +	    !(ufs_rd(REG_UTRLRSR) & 1)) {
-+		printf("HUSKY UFS: host did not take our request list\n");
++		HU_LOG("HUSKY UFS: host did not take our request list\n");
 +		return EIO;
 +	}
 +	return 0;
@@ -584,11 +587,11 @@ index 0000000..470e160
 +	if (SecureDTLookupEntry(NULL, "/husky-ufs", &node) != kSuccess ||
 +	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
 +	    size < 2 * sizeof(uintptr_t)) {
-+		printf("HUSKY UFS: no /husky-ufs node in the device tree\n");
++		HU_LOG("HUSKY UFS: no /husky-ufs node in the device tree\n");
 +		return ENXIO;
 +	}
 +	if (!dt_u64(node, "husky,link-ready", &link_ready) || !link_ready) {
-+		printf("HUSKY UFS: the shim did not bring the UFS link up\n");
++		HU_LOG("HUSKY UFS: the shim did not bring the UFS link up\n");
 +		return ENXIO;
 +	}
 +	if (SecureDTGetProperty(node, "root-partition", (void const **)&part, &size) == kSuccess && size) {
@@ -598,7 +601,7 @@ index 0000000..470e160
 +	(void)dt_u64(node, "root-offset", &root_off);
 +	(void)dt_u64(node, "log-size", &log_size);
 +	if ((root_off | log_size) % UFS_BLOCK) {
-+		printf("HUSKY UFS: root-offset/log-size not 4 KiB aligned\n");
++		HU_LOG("HUSKY UFS: root-offset/log-size not 4 KiB aligned\n");
 +		return EINVAL;
 +	}
 +	uint32_t rw = 0;
@@ -609,7 +612,7 @@ index 0000000..470e160
 +	if (kmem_alloc_contig(kernel_map, &hu.dma, DMA_SIZE, PAGE_MASK,
 +	    (ppnum_t)atop_64(1ULL << 32) - 1, 0,
 +	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-+		printf("HUSKY UFS: no contiguous DMA memory\n");
++		HU_LOG("HUSKY UFS: no contiguous DMA memory\n");
 +		return ENOMEM;
 +	}
 +	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)hu.dma);
@@ -638,7 +641,7 @@ index 0000000..470e160
 +	}
 +	uint64_t off_blocks = root_off / UFS_BLOCK, log_blocks = log_size / UFS_BLOCK;
 +	if (off_blocks + log_blocks >= count) {
-+		printf("HUSKY UFS: \"%s\" (%llu MiB) too small for offset %llu MiB + log %llu MiB\n",
++		HU_LOG("HUSKY UFS: \"%s\" (%llu MiB) too small for offset %llu MiB + log %llu MiB\n",
 +		    want, count * UFS_BLOCK >> 20, root_off >> 20, log_size >> 20);
 +		return ENOSPC;
 +	}
@@ -661,7 +664,7 @@ index 0000000..470e160
 +	/* Only now, with the window bounds known, can writes be allowed. */
 +	hu.writable = (rw != 0);
 +	hu.ready = true;
-+	printf("HUSKY UFS: \"%s\" +%llu MiB on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
++	HU_LOG("HUSKY UFS: \"%s\" +%llu MiB on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
 +	    want, root_off >> 20, hu.lun, hu.first_block, hu.nblocks * UFS_BLOCK >> 20,
 +	    hu.writable ? "read-write" : "read-only", hu.dma_pa);
 +	return 0;
@@ -684,7 +687,7 @@ index 0000000..470e160
 +}
 +#endif /* ARM64_BOARD_CONFIG_HUSKY */
 diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
-index 6824ed8..beff02f 100644
+index 6824ed8..30705d7 100644
 --- a/iokit/Kernel/IOService.cpp
 +++ b/iokit/Kernel/IOService.cpp
 @@ -5396,7 +5396,9 @@ IOService::publishHiddenMedia(IOService * parent)
@@ -711,6 +714,21 @@ index 6824ed8..beff02f 100644
  	FindRootMediaContext ctx = { .services = NULL, .parent = parent };
  
  	if (wasHiding) {
+@@ -5449,7 +5458,14 @@ IOService::setRootMedia(IOService * root)
+ 	bool unhide;
+ 
+ 	ioblockstoragedriverClass = OSMetaClass::getMetaClassWithName(gIOBlockStorageDriverKey);
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	/* HUSKY has no IOStorageFamily: its root disk (husky_ufs) has no block storage driver. */
++	if (!ioblockstoragedriverClass) {
++		root = NULL;
++	}
++#else
+ 	assert(ioblockstoragedriverClass);
++#endif
+ 
+ 	while (root) {
+ 		if (root->metaCast(ioblockstoragedriverClass)) {
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 index 2bbd161..64d7671 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
