@@ -1,0 +1,56 @@
+diff --git a/osfmk/prng/prng_random.c b/osfmk/prng/prng_random.c
+index 99bc75c..80f13c6 100644
+--- a/osfmk/prng/prng_random.c
++++ b/osfmk/prng/prng_random.c
+@@ -36,6 +36,9 @@
+ #include <sys/random.h>
+ #include <prng/random.h>
+ #include <prng/entropy.h>
++#if defined(HUSKY)
++#include <machine/atomic.h>      /* bring-up PRNG state */
++#endif
+ #include <corecrypto/ccdigest.h>
+ #include <corecrypto/ccdigest_priv.h>
+ #include <corecrypto/ccdrbg.h>
+@@ -271,14 +274,16 @@ __static_testable void read_erandom(void * buf, size_t nbytes);
+  * randomness. NOT cryptographically secure - a bring-up stand-in until a real
+  * HMAC PRNG (sweet 0014-style) is ported.
+  */
++static uint64_t husky_prng_state;
++
+ static uint64_t
+ husky_prng64(void)
+ {
+-	static uint64_t s;
++	uint64_t s = os_atomic_load(&husky_prng_state, relaxed);
+ 	if (__improbable(s == 0)) {
+-		s = ml_get_timebase() | 1;
++		os_atomic_cmpxchg(&husky_prng_state, 0, ml_get_timebase() | 1, relaxed);
+ 	}
+-	uint64_t z = (s += 0x9e3779b97f4a7c15ULL);
++	uint64_t z = os_atomic_add(&husky_prng_state, 0x9e3779b97f4a7c15ULL, relaxed);
+ 	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+ 	z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+ 	return z ^ (z >> 31);
+@@ -474,6 +479,21 @@ write_random(void * buffer, u_int numbytes)
+ 	 */
+ 	uint8_t seed[SHA512_DIGEST_LENGTH] = {0};
+ 
++#if defined(HUSKY)
++	/*
++	 * No corecrypto DRBG to reseed (prng_funcs.reseed is NULL): userland
++	 * seeding (prng_seedctl writing /dev/random) is folded into the bring-up
++	 * PRNG state instead.
++	 */
++	uint64_t mix = 0;
++	for (u_int i = 0; i < numbytes; i++) {
++		mix = (mix << 8 | mix >> 56) ^ ((const uint8_t *)buffer)[i];
++	}
++	os_atomic_xor(&husky_prng_state, mix | 1, relaxed);
++	(void)seed;
++	return 0;
++#endif
++
+ 	if (numbytes > SHA512_DIGEST_LENGTH) {
+ 		/* hash the input to minimize the time we need to hold the lock */
+ 		SHA512_CTX ctx;
