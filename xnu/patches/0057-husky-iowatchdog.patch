@@ -1,0 +1,139 @@
+diff --git a/iokit/Kernel/arm/HuskyWatchdog.cpp b/iokit/Kernel/arm/HuskyWatchdog.cpp
+new file mode 100644
+index 0000000..4dc6cdf
+--- /dev/null
++++ b/iokit/Kernel/arm/HuskyWatchdog.cpp
+@@ -0,0 +1,108 @@
++/*
++ * Built-in IOWatchdog for HUSKY (ported from ios-sweet 0040/0045).
++ *
++ * watchdogd (launchd job with _PanicOnCrash) opens IOServiceMatching(
++ * "IOWatchdog") with type 1 and exits when it is missing, which panics the
++ * system. On Apple hardware the kext arms a SoC watchdog that resets the
++ * device unless watchdogd keeps checking in. This service arms nothing
++ * (the Tensor watchdog ABL leaves running is a separate matter); it accepts
++ * every call (check-in 1, enable/disable userspace
++ * monitoring 3/4, 0/5, struct calls 2 and 9) and does nothing; each
++ * selector is logged the first time it is used.
++ *
++ * watchdogd also writes the device boot stage to the PMU: it looks up
++ * the IOService with IOPMUPrimary = 1 and crashes when there is none
++ * (customer builds ignore -wdt_no_pmu). HUSKY has no Apple PMU, so this
++ * service carries IOPMUPrimary and accepts property writes.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(HUSKY)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <sys/proc.h>
++
++class IOWatchdog : public IOService {
++	OSDeclareDefaultStructors(IOWatchdog);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOWatchdog, IOService);
++
++IOReturn
++IOWatchdog::setProperties(__unused OSObject *properties)
++{
++	return kIOReturnSuccess;
++}
++
++bool
++IOWatchdog::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "IOWatchdogUserClient");
++	setProperty("IOPMUPrimary", 1ULL, 32);
++	registerService();
++	IOLog("HUSKY WDT: IOWatchdog registered (accepts check-ins, never fires)\n");
++	return true;
++}
++
++class IOWatchdogUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IOWatchdogUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOWatchdogUserClient, IOUserClient);
++
++IOReturn
++IOWatchdogUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++static uint64_t husky_wdt_logged;       /* selectors already logged (< 64) */
++
++IOReturn
++IOWatchdogUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutputDescriptor != NULL) {
++		IOByteCount len = args->structureOutputDescriptor->getLength();
++		for (IOByteCount off = 0; off < len; off += 8) {
++			static const uint64_t zero = 0;
++			args->structureOutputDescriptor->writeBytes(off, &zero, len - off < 8 ? len - off : 8);
++		}
++	} else if (args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++
++	if (selector >= 64 || !(husky_wdt_logged & (1ULL << selector))) {
++		if (selector < 64) {
++			husky_wdt_logged |= 1ULL << selector;
++		}
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("HUSKY WDT: %s sel %u in %u/%u out %u/%u -> ok\n", name, selector,
++		    args->scalarInputCount, args->structureInputSize,
++		    args->scalarOutputCount, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++#endif /* HUSKY */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index fa6ddb9..d832c25 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -52,6 +52,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = AppleKeyStore;"
+     "   },"
++    "   {"
++    "     'IOClass'         = IOWatchdog;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOWatchdog;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 95e7a63..1ad153e 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -11,3 +11,4 @@ iokit/Kernel/arm/HuskyPlatformExpert.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskyCPU.cpp							optional iokitcpp
+ iokit/Kernel/arm/HuskyEntitlements.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskyKeyStore.cpp						optional iokitcpp
++iokit/Kernel/arm/HuskyWatchdog.cpp						optional iokitcpp
