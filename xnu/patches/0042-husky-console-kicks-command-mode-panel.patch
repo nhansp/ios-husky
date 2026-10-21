@@ -1,0 +1,63 @@
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index 648cb70..88a5177 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -1236,6 +1236,13 @@ vcputc_options(char c, __unused bool poll)
+ 			gc_hide_cursor(gc_x, gc_y);
+ 			gc_putchar(c);
+ 			gc_show_cursor(gc_x, gc_y);
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++			/* Command-mode panel: push the new lines to the display. */
++			if (c == '\n') {
++				extern void husky_fb_kick(void);
++				husky_fb_kick();
++			}
++#endif
+ 		}
+ #if SCHED_HYGIENE_DEBUG
+ 		abandon_preemption_disable_measurement();
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index e9699f4..8418c87 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -21,6 +21,7 @@
+ #include <machine/atomic.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <kern/startup.h>
+ #include <pexpert/protos.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm/consistent_debug.h>
+@@ -881,6 +882,32 @@ husky_early_bc(const char *s)
+ 	}
+ }
+ 
++/*
++ * husky's panel runs in DSI command mode: it keeps showing its last frame and
++ * the DECON sends a new one only per shadow-update request (the shim leaves
++ * the TE-driven trigger enabled and unmasked). The console calls this after
++ * drawing a line so the boot framebuffer reaches the panel on the next TE.
++ * zuma DECON0: GLOBAL_CON 0x20 (bit1/0 enable), SHD_REG_UP_REQ 0x50
++ * (bit31 global, [13:0] windows).
++ */
++#define HUSKY_DECON0_PHYS	0x19470000ULL
++static volatile uint32_t *husky_decon;
++void husky_fb_kick(void);
++void
++husky_fb_kick(void)
++{
++	if (husky_decon == NULL) {
++		/* ml_io_map allocates: fine during early boot, else only with IRQs on. */
++		if (startup_phase >= STARTUP_SUB_EARLY_BOOT && !ml_get_interrupts_enabled()) {
++			return;
++		}
++		husky_decon = (volatile uint32_t *)ml_io_map(HUSKY_DECON0_PHYS, PAGE_SIZE);
++	}
++	__builtin_arm_dsb(DSB_SY);	/* drain the write-combined framebuffer first */
++	husky_decon[0x20 / 4] |= 3;
++	husky_decon[0x50 / 4] |= (1u << 31) | 0x3fff;
++}
++
+ static void
+ husky_pmsg_init(void)
+ {

@@ -20,6 +20,7 @@
 #include "fdt.h"
 #include "loader.h"
 #include "ufs.h"
+#include "fb.h"
 
 #define PSCI_VERSION		0x84000000UL
 #define PSCI_SYSTEM_RESET	0x84000009UL
@@ -210,6 +211,9 @@ void shim_main(uint64_t dtb, uint64_t entry_el)
 	stage = "load";
 #ifdef UFSPROBE
 	test_ufs();
+#endif
+#ifdef FBPROBE
+	test_fb();
 #endif
 	con_str("HUSKY", "loading xnu");
 	con_str("LOADER", loader_boot(dtb));

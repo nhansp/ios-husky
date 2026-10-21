@@ -18,6 +18,7 @@
 #include "console.h"
 #include "fdt.h"
 #include "loader.h"
+#include "fb.h"
 
 #define BOOT_LINE_LENGTH	1024
 #define PAGE_16K		0x4000UL
@@ -271,14 +272,25 @@ const char *loader_boot(uintptr_t dtb)
 	ba->physBase = p->phys_base;
 	ba->memSize = p->mem_size;
 	ba->topOfKernelData = top;
-	/* Headless for first boot: no confirmed linear framebuffer from ABL, so
-	 * leave Video zero (v_display 0). XNU comes up without a video console;
-	 * the shim's pmsg log is the bring-up channel. */
 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
 	ba->memSizeActual = p->mem_size;
+	/* Boot framebuffer: the panel buffer ABL's splash is scanned out from. */
+	uint64_t fb_base;
+	uint32_t fb_w, fb_h, fb_pitch;
+	if (fb_handoff(&fb_base, &fb_w, &fb_h, &fb_pitch)) {
+		ba->Video.v_baseAddr = fb_base;
+		ba->Video.v_display = 1;
+		ba->Video.v_rowBytes = fb_pitch;
+		ba->Video.v_width = fb_w;
+		ba->Video.v_height = fb_h;
+		ba->Video.v_depth = 32 | (1u << 16);	/* 32 bpp, 2x scale (kBootVideoDepthScaleShift) */
+		con_hex2("FB", "base=", (uint32_t)fb_base, "pitch=", fb_pitch);
+	} else {
+		con_str("FB", "no boot framebuffer");
+	}
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
