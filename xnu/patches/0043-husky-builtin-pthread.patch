@@ -34,10 +34,10 @@ index 60d8aa6..f176775 100644
  
 diff --git a/bsd/pthread/husky_pthread_compat.h b/bsd/pthread/husky_pthread_compat.h
 new file mode 100644
-index 0000000..4d3113d
+index 0000000..2aa778d
 --- /dev/null
 +++ b/bsd/pthread/husky_pthread_compat.h
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,29 @@
 +/*
 + * Compile the matching libpthread provider with its kext view of BSD headers
 + * (ported from ios-sweet 0019). It owns its full ksyn_waitq_element layout;
@@ -51,6 +51,16 @@ index 0000000..4d3113d
 +#define __PTHREAD_EXPOSE_INTERNALS__ 1
 +#define NEEDS_SCHED_CALL_T 1
 +
++/*
++ * HUSKY is VMAPPLE-class with CONFIG_PV_TICKET, so kern/locks.h declares
++ * lck_init_pv() __startup_func; that macro comes from kern/startup.h's
++ * XNU_KERNEL_PRIVATE view, which this kext view does not have.
++ */
++#ifndef __startup_func
++#define __startup_func
++#define HUSKY_PTHREAD_STARTUP_FUNC_STUB 1
++#endif
++
 +/* Avoid collisions with the kernel side of the callback interface. */
 +#define pthread_kern husky_pthread_kern
 +#define current_uthread husky_pthread_current_uthread
@@ -59,10 +69,10 @@ index 0000000..4d3113d
 +#endif
 diff --git a/bsd/pthread/husky_pthread_init.c b/bsd/pthread/husky_pthread_init.c
 new file mode 100644
-index 0000000..65d734b
+index 0000000..b96f946
 --- /dev/null
 +++ b/bsd/pthread/husky_pthread_init.c
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,30 @@
 +/* Built-in provider: Apple libpthread-539.100.4, paired with xnu-12377.121.6. */
 +#if defined(ARM64_BOARD_CONFIG_HUSKY)
 +#include "husky_pthread_compat.h"
@@ -73,6 +83,9 @@ index 0000000..65d734b
 +    "update HUSKY ksyn storage in sys/pthread_internal.h");
 +
 +/* Restore the startup interface after compiling the provider's kext code. */
++#ifdef HUSKY_PTHREAD_STARTUP_FUNC_STUB
++#undef __startup_func
++#endif
 +#define XNU_KERNEL_PRIVATE 1
 +#include <kern/startup.h>
 +#include <pexpert/pexpert.h>
