@@ -1,0 +1,131 @@
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index c4cbbe9..fab9506 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -44,6 +44,15 @@ CFLAGS+= -include meta_features.h -DDRIVER_PRIVATE \
+         -Warray-bounds-pointer-arithmetic
+ SFLAGS+= -include meta_features.h
+ 
++# libpthread is built into HUSKY (no kext loading); other boards use the kext.
++ifeq ($(CURRENT_MACHINE_CONFIG),HUSKY)
++HUSKY_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/husky_libpthread
++HUSKY_PTHREAD_INC = -I$(HUSKY_PTHREAD_ROOT) -I$(HUSKY_PTHREAD_ROOT)/private -I$(HUSKY_PTHREAD_ROOT)/include
++husky_pthread_init.o_INCFLAGS = $(HUSKY_PTHREAD_INC)
++husky_pthread_support.o_INCFLAGS = $(HUSKY_PTHREAD_INC)
++husky_pthread_synch.o_INCFLAGS = $(HUSKY_PTHREAD_INC)
++endif
++
+ #
+ # Directories for mig generated files
+ #
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 60d8aa6..f176775 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -380,6 +380,9 @@ bsd/security/audit/audit_syscalls.c		standard
+ bsd/security/audit/audit_worker.c		optional config_audit
+ 
+ bsd/pthread/pthread_shims.c		standard
++bsd/pthread/husky_pthread_init.c	standard
++bsd/pthread/husky_pthread_support.c	standard
++bsd/pthread/husky_pthread_synch.c	standard
+ bsd/pthread/pthread_priority.c		standard
+ bsd/pthread/pthread_workqueue.c		standard
+ 
+diff --git a/bsd/pthread/husky_pthread_compat.h b/bsd/pthread/husky_pthread_compat.h
+new file mode 100644
+index 0000000..4d3113d
+--- /dev/null
++++ b/bsd/pthread/husky_pthread_compat.h
+@@ -0,0 +1,19 @@
++/*
++ * Compile the matching libpthread provider with its kext view of BSD headers
++ * (ported from ios-sweet 0019). It owns its full ksyn_waitq_element layout;
++ * the kernel's opaque counterpart reserves that much. All communication with
++ * private BSD state goes through the pthread callbacks.
++ */
++#ifndef HUSKY_PTHREAD_COMPAT_H
++#define HUSKY_PTHREAD_COMPAT_H
++#undef BSD_KERNEL_PRIVATE
++#undef XNU_KERNEL_PRIVATE
++#define __PTHREAD_EXPOSE_INTERNALS__ 1
++#define NEEDS_SCHED_CALL_T 1
++
++/* Avoid collisions with the kernel side of the callback interface. */
++#define pthread_kern husky_pthread_kern
++#define current_uthread husky_pthread_current_uthread
++#define pthread_start husky_pthread_start
++#define pthread_stop husky_pthread_stop
++#endif
+diff --git a/bsd/pthread/husky_pthread_init.c b/bsd/pthread/husky_pthread_init.c
+new file mode 100644
+index 0000000..65d734b
+--- /dev/null
++++ b/bsd/pthread/husky_pthread_init.c
+@@ -0,0 +1,27 @@
++/* Built-in provider: Apple libpthread-539.100.4, paired with xnu-12377.121.6. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_pthread_compat.h"
++#include "husky_libpthread/kern/kern_init.c"
++
++/* Keep the provider's full layout within the kernel's reserved storage. */
++_Static_assert(sizeof(struct ksyn_waitq_element) == 56,
++    "update HUSKY ksyn storage in sys/pthread_internal.h");
++
++/* Restore the startup interface after compiling the provider's kext code. */
++#define XNU_KERNEL_PRIVATE 1
++#include <kern/startup.h>
++#include <pexpert/pexpert.h>
++
++/* What kext loading would do: register the provider's function table. */
++__startup_func
++static void
++husky_pthread_register(void)
++{
++	kern_return_t kr = husky_pthread_start(NULL, NULL);
++	if (kr != KERN_SUCCESS || husky_pthread_kern == NULL) {
++		panic("HUSKY: pthread provider registration failed: %d", kr);
++	}
++	kprintf("HUSKY pthread: libpthread-539.100.4 registered\n");
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_SECOND, husky_pthread_register);
++#endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/bsd/pthread/husky_pthread_support.c b/bsd/pthread/husky_pthread_support.c
+new file mode 100644
+index 0000000..1193681
+--- /dev/null
++++ b/bsd/pthread/husky_pthread_support.c
+@@ -0,0 +1,5 @@
++/* Built-in provider: Apple libpthread-539.100.4, paired with xnu-12377.121.6. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_pthread_compat.h"
++#include "husky_libpthread/kern/kern_support.c"
++#endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/bsd/pthread/husky_pthread_synch.c b/bsd/pthread/husky_pthread_synch.c
+new file mode 100644
+index 0000000..1293eb8
+--- /dev/null
++++ b/bsd/pthread/husky_pthread_synch.c
+@@ -0,0 +1,5 @@
++/* Built-in provider: Apple libpthread-539.100.4, paired with xnu-12377.121.6. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_pthread_compat.h"
++#include "husky_libpthread/kern/kern_synch.c"
++#endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/bsd/sys/pthread_internal.h b/bsd/sys/pthread_internal.h
+index 42e23d8..753b292 100644
+--- a/bsd/sys/pthread_internal.h
++++ b/bsd/sys/pthread_internal.h
+@@ -34,7 +34,12 @@
+ 
+ struct ksyn_waitq_element {
+ #if __LP64__
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	/* The built-in libpthread-539.100.4 adds a trailing kwe_uth pointer. */
++	char opaque[56];
++#else
+ 	char opaque[48];
++#endif
+ #else
+ 	char opaque[32];
+ #endif
