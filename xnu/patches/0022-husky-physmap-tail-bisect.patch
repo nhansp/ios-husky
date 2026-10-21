@@ -1,0 +1,27 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index afcb2e0..810fbdf 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1660,13 +1660,22 @@ arm_vm_physmap_init(boot_args *args)
+ 	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi2: slide2 ok\n"); }
+ #endif
+ 
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi2: pre assert\n"); }
++#endif
+ 	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi2: post assert\n"); }
++#endif
+ 
+ 	// Sort in descending order of segment length.  LUT traversal is linear, so largest (most likely used)
+ 	// segments should be placed earliest in the table to optimize lookup performance.
+ 	qsort(temp_ptov_table, PTOV_TABLE_SIZE, sizeof(temp_ptov_table[0]), cmp_ptov_entries);
+ 
+ 	memcpy(ptov_table, temp_ptov_table, sizeof(ptov_table));
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pmi2: sorted/copied (return)\n"); }
++#endif
+ }
+ 
+ #endif // XNU_MONITOR
