@@ -108,6 +108,9 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
+        # iBoot reports whether CTRR (kernel text lockdown) will be enabled;
+        # xnu asserts it was told (ml_unsafe_kernel_text). husky has no CTRR.
+        ('kernel-ctrr-to-be-enabled', u32(0)),
         ('firmware-version', cstr('husky-shim')),
         ('system-firmware-version', cstr('husky-shim')),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 needs it.
