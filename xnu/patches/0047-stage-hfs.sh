@@ -72,6 +72,27 @@ replace('core/hfs_vfsutils.c',
 		}
 		return (EINVAL);
 		}''')
+
+# Hard links made by Linux tools lack kHFSHasLinkChainBit; every lookup
+# repairs it in memory and prints again, flooding the console and slowing
+# boot. Report the first 8 only (ios-sweet 0041).
+replace('core/hfs_catalog.c', """/*
+ * cat_lookupbykey - lookup a catalog node using a cnode key
+ */""", """/* HUSKY: the link-repair messages below, the first few only. */
+static int
+husky_hfs_link_note(void)
+{
+	static volatile SInt32 notes;
+	return OSIncrementAtomic(&notes) < 8;
+}
+
+/*
+ * cat_lookupbykey - lookup a catalog node using a cnode key
+ */""")
+for msg in ('printf ("hfs: set hardlink bit on vol=%s cnid=%u inoid=%u\\n", hfsmp->vcbVN, cnid, ilink);',
+            'printf ("hfs: clear hardlink bit on vol=%s cnid=%u\\n", hfsmp->vcbVN, cnid);',
+            'printf ("hfs: set linkcount=1 on vol=%s cnid=%u old=%u\\n", hfsmp->vcbVN, cnid, attrp->ca_linkcount);'):
+    replace('core/hfs_catalog.c', msg, 'if (husky_hfs_link_note()) ' + msg)
 PY
 
 # Kernel builds use -nostdinc; HFS's kext-config.h needs the SDK's target macros.
