@@ -282,7 +282,7 @@ const char *loader_boot(uintptr_t dtb)
 	uint32_t fb_w, fb_h, fb_pitch;
 	if (fb_handoff(&fb_base, &fb_w, &fb_h, &fb_pitch)) {
 		ba->Video.v_baseAddr = fb_base;
-		ba->Video.v_display = 1;
+		ba->Video.v_display = 0;	/* text mode: vcattach shows the verbose console */
 		ba->Video.v_rowBytes = fb_pitch;
 		ba->Video.v_width = fb_w;
 		ba->Video.v_height = fb_h;
