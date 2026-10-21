@@ -150,7 +150,7 @@ jobs:
             git -C dxb/xnu clean -fdqx -e compile_commands.json
             # Never let a stale kernel be collected, or satisfy build_xnu's
             # "already built" check.
-            rm -f dxb/build/xnu.obj/kernel.* dxb/fakeroot/System/Library/Kernels/kernel.*
+            rm -rf dxb/build/xnu.obj/kernel.* dxb/fakeroot/System/Library/Kernels/kernel.*
           fi
           # After patching, age unchanged sources so make only rebuilds real changes.
           sed -i '' 's|^    patches$|    patches; bash "'"$GITHUB_WORKSPACE"'/.github/scripts/xnu-mtime-sync.sh" "${WORK_DIR}/xnu" "${BUILD_DIR}/xnu-src.manifest"|' dxb/build.sh

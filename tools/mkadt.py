@@ -21,15 +21,18 @@ import hashlib, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
 
-# Kernel-managed RAM. The 4GB-mark high bank (0x100000000) is not EL1-NS
-# executable on husky — jumping xnu there faults with a synchronous external
-# abort on instruction fetch (the shim itself runs fine from the low bank at
-# 0x80000000). So the kernel lives in the low DDR bank, in a 640MB window
-# (32MB-block aligned) above the shim+payload image (which ends ~0x81600000)
-# and below the ABL ramdisk (which lands at 0xb0000000).
+# Kernel-managed RAM. husky's DDR is banked: a low bank at 0x80000000 and high
+# banks at 0x880000000+ (0x100000000 is an unbacked GAP - jumping xnu there
+# fault-fetches). The low bank holds firewall-protected coprocessor carve-outs
+# (from /proc/device-tree/reserved-memory): gsa@90200000 (GSA - EL1-NS access
+# faults), gxp_*@91xxxxxx, tpu_fw@93000000, aoc@94000000, i.e. a protected
+# block ~0x90200000-0x95000000, plus the log/ramoops/abl region at 0xf8800000+.
+# So the kernel window sits BELOW the coprocessor block: 0x82000000 (above the
+# shim+payload image, which ends ~0x81600000) up to just under gsa, 32MB-block
+# aligned.
 PHYS_BASE = 0x82000000
-MEM_SIZE = 0x28000000
-# --highmem: the 4GB-mark bank, kept for experiments (currently faults).
+MEM_SIZE = 0x0d000000	# -> ends 0x8f000000, ~2MB clear of gsa@90200000
+# --highmem: the 4GB-mark bank, an unbacked gap (faults); kept for experiments.
 LOW_PHYS_BASE = 0x100000000
 LOW_MEM_SIZE = 0x80000000
 
