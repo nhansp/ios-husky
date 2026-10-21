@@ -1,0 +1,40 @@
+diff --git a/libkern/crypto/register_crypto.c b/libkern/crypto/register_crypto.c
+index 26e7eac..c94e26e 100644
+--- a/libkern/crypto/register_crypto.c
++++ b/libkern/crypto/register_crypto.c
+@@ -103,6 +103,27 @@ husky_random_kmem_init(crypto_random_ctx_t ctx __unused)
+ {
+ }
+ 
++/* corecrypto RNG (cc_rand_generate, ccrng users) over the bring-up PRNG. */
++static int
++husky_ccrng_generate(struct ccrng_state *rng __unused, size_t outlen, void *out)
++{
++	read_random(out, (u_int)outlen);
++	return 0;
++}
++
++static struct ccrng_state husky_ccrng_state = {
++	.generate = husky_ccrng_generate,
++};
++
++static struct ccrng_state *
++husky_ccrng(int *error)
++{
++	if (error != NULL) {
++		*error = 0;
++	}
++	return &husky_ccrng_state;
++}
++
+ extern const struct ccmode_cbc husky_aes_cbc_encrypt;
+ extern const struct ccmode_cbc husky_aes_cbc_decrypt;
+ 
+@@ -125,6 +146,7 @@ husky_register_bringup_crypto(void)
+ 	/* AES (legacy aes_encrypt/decrypt API): BearSSL constant-time, husky_aes.c */
+ 	husky_crypto_funcs.ccaes_cbc_encrypt = &husky_aes_cbc_encrypt;
+ 	husky_crypto_funcs.ccaes_cbc_decrypt = &husky_aes_cbc_decrypt;
++	husky_crypto_funcs.ccrng_fn = husky_ccrng;
+ 	husky_crypto_funcs.random_generate_fn = husky_random_generate;
+ 	husky_crypto_funcs.random_uniform_fn = husky_random_uniform;
+ 	husky_crypto_funcs.random_kmem_ctx_size_fn = husky_random_kmem_ctx_size;
