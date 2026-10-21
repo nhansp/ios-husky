@@ -1,0 +1,24 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index d983281..e9699f4 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -863,7 +863,18 @@ husky_early_bc(const char *s)
+ 		return;
+ 	}
+ 	if (husky_bc_prz == NULL) {
+-		husky_bc_prz = (volatile struct husky_prz *)ml_io_map(HUSKY_PMSG_PHYS, HUSKY_PMSG_SIZE);
++		/*
++		 * Reuse the console's mapping (serial_init) when it exists: secondary
++		 * CPUs log here from early init with interrupts disabled, where
++		 * ml_io_map's allocation would panic.
++		 */
++		if (husky_prz != NULL) {
++			husky_bc_prz = husky_prz;
++		} else if (ml_get_interrupts_enabled()) {
++			husky_bc_prz = (volatile struct husky_prz *)ml_io_map(HUSKY_PMSG_PHYS, HUSKY_PMSG_SIZE);
++		} else {
++			return;
++		}
+ 	}
+ 	while (*s) {
+ 		husky_ring_putc(husky_bc_prz, (uint8_t)*s++);
