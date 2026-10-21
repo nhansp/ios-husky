@@ -1,0 +1,101 @@
+diff --git a/libkern/crypto/register_crypto.c b/libkern/crypto/register_crypto.c
+index 7d3a56d..816f9c7 100644
+--- a/libkern/crypto/register_crypto.c
++++ b/libkern/crypto/register_crypto.c
+@@ -46,3 +46,82 @@ register_crypto_functions(const crypto_functions_t funcs)
+ 
+ 	return 0;
+ }
++
++#if defined(HUSKY)
++/*
++ * husky bring-up: the standalone kernel has no corecrypto kext, so nothing
++ * registers g_crypto_funcs and the first crypto_* / SHA* caller faults on it.
++ * Register what xnu's in-tree corecrypto provides (SHA-256/512, HMAC)
++ * plus the random hooks over the bring-up PRNG. Everything else stays NULL
++ * until the real corecrypto (kernelcache) replaces this table.
++ */
++#include <sys/random.h>
++
++static void
++husky_ccdigest_final(const struct ccdigest_info *di, ccdigest_ctx_t ctx, void *digest)
++{
++	di->final(di, ctx, digest);
++}
++
++static void
++husky_ccdigest(const struct ccdigest_info *di, unsigned long len, const void *data, void *digest)
++{
++	ccdigest_di_decl(di, ctx);
++	ccdigest_init(di, ctx);
++	ccdigest_update(di, ctx, len, data);
++	di->final(di, ctx, digest);
++	ccdigest_di_clear(di, ctx);
++}
++
++static void
++husky_random_generate(crypto_random_ctx_t ctx __unused, void *random, size_t random_size)
++{
++	read_random(random, (u_int)random_size);
++}
++
++static void
++husky_random_uniform(crypto_random_ctx_t ctx __unused, uint64_t bound, uint64_t *random)
++{
++	/* Rejection sampling: drop the biased tail of the 64-bit range. */
++	uint64_t limit = UINT64_MAX - (UINT64_MAX % bound);
++	uint64_t r;
++	do {
++		read_random(&r, sizeof(r));
++	} while (r >= limit);
++	*random = r % bound;
++}
++
++static size_t
++husky_random_kmem_ctx_size(void)
++{
++	return sizeof(uint64_t);
++}
++
++static void
++husky_random_kmem_init(crypto_random_ctx_t ctx __unused)
++{
++}
++
++static struct crypto_functions husky_crypto_funcs;
++
++void husky_register_bringup_crypto(void);
++void
++husky_register_bringup_crypto(void)
++{
++	husky_crypto_funcs.ccdigest_init_fn = ccdigest_init;
++	husky_crypto_funcs.ccdigest_update_fn = ccdigest_update;
++	husky_crypto_funcs.ccdigest_final_fn = husky_ccdigest_final;
++	husky_crypto_funcs.ccdigest_fn = husky_ccdigest;
++	husky_crypto_funcs.ccsha256_di = ccsha256_di();
++	husky_crypto_funcs.ccsha512_di = ccsha512_di();
++	husky_crypto_funcs.cchmac_init_fn = cchmac_init;
++	husky_crypto_funcs.cchmac_update_fn = cchmac_update;
++	husky_crypto_funcs.cchmac_final_fn = cchmac_final;
++	husky_crypto_funcs.cchmac_fn = cchmac;
++	husky_crypto_funcs.random_generate_fn = husky_random_generate;
++	husky_crypto_funcs.random_uniform_fn = husky_random_uniform;
++	husky_crypto_funcs.random_kmem_ctx_size_fn = husky_random_kmem_ctx_size;
++	husky_crypto_funcs.random_kmem_init_fn = husky_random_kmem_init;
++	register_crypto_functions(&husky_crypto_funcs);
++}
++#endif /* HUSKY */
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 193f37e..9e56170 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -872,6 +872,9 @@ arm_init(
+ 	__stack_chk_guard &= ~(0xFFULL << 8);
+ #if defined(HUSKY)
+ 	husky_early_bc("arm_init: machine_startup\n");
++	/* No corecrypto kext in the standalone kernel; see register_crypto.c. */
++	extern void husky_register_bringup_crypto(void);
++	husky_register_bringup_crypto();
+ #endif
+ 	machine_startup(args);
+ }

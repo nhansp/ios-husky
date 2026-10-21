@@ -30,6 +30,9 @@ import adt  # noqa: E402
 # So the kernel window sits BELOW the coprocessor block: 0x82000000 (above the
 # shim+payload image, which ends ~0x81600000) up to just under gsa, 32MB-block
 # aligned.
+# Publish /chosen/unique-chip-id (see the /chosen node); needs corecrypto.
+PLATFORM_UUID_FROM_ECID = False
+
 PHYS_BASE = 0x82000000
 MEM_SIZE = 0x0d000000	# -> ends 0x8f000000, ~2MB clear of gsa@90200000
 # --highmem: the 4GB-mark bank, an unbacked gap (faults); kept for experiments.
@@ -115,7 +118,10 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
         ('display-scale', u32(3)),
         # IOPlatformUUID (gethostuuid) derives from these; synthetic ECID (not
         # the phone's), chip-id of the A13 the iPhone 11 userland expects.
-        ('unique-chip-id', struct.pack('<Q', HUSKY_ECID)),
+        # The derivation is a SHA-1 through corecrypto's g_crypto_funcs, which
+        # the standalone kernel (no corecrypto kext) lacks: it faults in
+        # generatePlatformUUID. Held back until corecrypto is registered.
+        *([('unique-chip-id', struct.pack('<Q', HUSKY_ECID))] if PLATFORM_UUID_FROM_ECID else []),
         ('chip-id', u32(0x8030)),
         # Dev-fused, undemoted board (0,0,1,1): mobileactivationd takes its
         # native Hactivation branch (no SEP, no baseband here).
