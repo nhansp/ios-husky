@@ -1,0 +1,416 @@
+diff --git a/iokit/Kernel/arm/HuskyCPU.cpp b/iokit/Kernel/arm/HuskyCPU.cpp
+index 501d500..45985e8 100644
+--- a/iokit/Kernel/arm/HuskyCPU.cpp
++++ b/iokit/Kernel/arm/HuskyCPU.cpp
+@@ -1,10 +1,19 @@
+ /*
+- * Single-CPU bring-up for husky using XNU's legacy IOCPU interface, ported
+- * from ios-sweet's SweetCPU. A kernelcache registers processors from a CPU
+- * driver kext; without one, nothing calls ml_set_max_cpus() and
++ * SMP bring-up for husky using XNU's legacy IOCPU interface and PSCI, ported
++ * from ios-sweet's SweetCPU (0018 + 0065). A kernelcache registers processors
++ * from a CPU driver kext; without one, nothing calls ml_set_max_cpus() and
+  * kperf_init_early() blocks in ml_wait_max_cpus() forever. The architected
+- * timer and the IPI SGI already enter through pe_init_fiq/sleh_irq.
+- * Secondary CPU startup and system suspend need separate platform work.
++ * timer and the IPI SGI enter through pe_init_fiq/sleh_irq. In this XNU
++ * ml_processor_register() boots each processor itself (processor_start is
++ * a no-op), so cores come up as their nubs register; startAll verifies each
++ * one's SGI self-test and publishes completion.
++ *
++ * All nine Tensor G3 cores (4x A510, 4x A715, 1x X3; one DynamIQ cluster,
++ * MPIDR Aff1 = core) run as one homogeneous SMP cluster; cpus=N selects a
++ * prefix. Secondaries start with PSCI CPU_ON into the boot shim's EL2
++ * trampoline (published in the ADT), which keeps the shim's HVC emulation
++ * live on every core and drops to EL1 at husky_secondary_entry.
++ * CPU_OFF, suspend and AMP (E/P clusters) are not implemented.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -15,13 +24,58 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <arm64/proc_reg.h>
+ #include <machine/atomic.h>
++#include <kern/clock.h>
+ #include <kern/processor.h>
++#include <kern/thread.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern "C" void husky_secondary_entry(void);
++extern "C" boolean_t husky_cpu_signal_is_enabled(unsigned int cpu);
++
++#define HUSKY_MAX_CORES 9 /* MPIDR Aff1 0..8 */
++
++class HuskyCPU;
++static HuskyCPU *husky_cpus[MAX_CPUS];
++static uint32_t husky_cpus_registered;
++
++/* SMCCC 1.0: x0 is the signed PSCI result; do not assume x1-x17 survive. */
++static int32_t
++husky_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
++{
++	register uint64_t x0 __asm__("x0") = 0xC4000003ULL;
++	register uint64_t x1 __asm__("x1") = target;
++	register uint64_t x2 __asm__("x2") = entry;
++	register uint64_t x3 __asm__("x3") = context;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++                 "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++                 "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++/* The boot shim's PSCI trampoline, filled in by its loader at boot. */
++static uint64_t
++husky_shim_secondary_entry(void)
++{
++	DTEntry cpus;
++	void const *prop;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/cpus", &cpus) != kSuccess ||
++	    SecureDTGetProperty(cpus, "husky,secondary-entry", &prop, &size) != kSuccess ||
++	    size != sizeof(uint64_t)) {
++		return 0;
++	}
++	return *(const uint64_t *)prop;
++}
+ 
+ class HuskyCPU : public IOCPU {
+ 	OSDeclareDefaultStructors(HuskyCPU);
+ 	const OSSymbol *cpuName = NULL;
++	uint32_t initialized = 0; /* release/acquire publication after initCPU sends SGI */
+ 
+ public:
++	static void startAll(void *arg, wait_result_t result);
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void free(void) APPLE_KEXT_OVERRIDE;
+ 	void initCPU(bool boot) APPLE_KEXT_OVERRIDE;
+@@ -38,23 +92,36 @@ bool
+ HuskyCPU::start(IOService *provider)
+ {
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+-	const ml_topology_cpu_t *cpu = topology->boot_cpu;
+ 	OSNumber *logical = OSDynamicCast(OSNumber, provider->getProperty("logical-cpu-id"));
+ 	OSData *reg = OSDynamicCast(OSData, provider->getProperty("reg"));
+ 
+-	/* Only the boot CPU's nub is ours; decline the others. */
++	/* Decline nubs for CPUs outside the cpus=N selection. */
+ 	if (logical == NULL || reg == NULL || reg->getLength() != sizeof(uint32_t) ||
+-	    logical->unsigned32BitValue() != cpu->cpu_id ||
+-	    *(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
++	    logical->unsigned32BitValue() >= topology->num_cpus) {
++		return false;
++	}
++	const ml_topology_cpu_t *cpu = &topology->cpus[logical->unsigned32BitValue()];
++	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	if (topology->num_cpus != 1) {
+-		panic("HUSKY CPU: only single-CPU bring-up is supported (boot with cpus=1)");
++	if ((cpu->phys_id & 0xff) != 0 || (cpu->phys_id >> 8) >= HUSKY_MAX_CORES) {
++		panic("HUSKY CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
++		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Cortex-A510");
++	const char *name = "Cortex-A510";
++	OSData *compat = OSDynamicCast(OSData, provider->getProperty("compatible"));
++	if (compat != NULL && compat->getLength() > 0) {
++		const char *c = (const char *)compat->getBytesNoCopy();
++		if (strncmp(c, "arm,cortex-a715", compat->getLength()) == 0) {
++			name = "Cortex-A715";
++		} else if (strncmp(c, "arm,cortex-x3", compat->getLength()) == 0) {
++			name = "Cortex-X3";
++		}
++	}
++	cpuName = OSSymbol::withCStringNoCopy(name);
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+@@ -73,27 +140,80 @@ HuskyCPU::start(IOService *provider)
+ 	perfmon_interrupt_handler_func pmi_handler = NULL;
+ 	kern_return_t result = ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler);
+ 	if (result != KERN_SUCCESS) {
+-		panic("HUSKY CPU: ml_processor_register failed: %d", result);
++		panic("HUSKY CPU: cpu=%u ml_processor_register failed: %d", cpu->cpu_id, result);
+ 	}
+ 	if (pmi_handler != NULL) {
+ 		panic("HUSKY CPU: PMI routing is not implemented");
+ 	}
+ 
+-	/* Re-enter the boot CPU through cpu_machine_init -> PE_cpu_machine_init. */
+-	result = processor_start(machProcessor);
+-	if (result != KERN_SUCCESS || getCPUState() != kIOCPUStateRunning) {
+-		panic("HUSKY CPU: processor_start failed: %d", result);
++	registerService();
++	__atomic_store_n(&husky_cpus[cpu->cpu_id], this, __ATOMIC_RELEASE);
++	__atomic_add_fetch(&husky_cpus_registered, 1, __ATOMIC_ACQ_REL);
++	if (cpu == topology->boot_cpu) {
++		thread_t thread;
++		result = kernel_thread_start(&HuskyCPU::startAll, NULL, &thread);
++		if (result != KERN_SUCCESS) {
++			panic("HUSKY CPU: cannot create startup thread: %d", result);
++		}
++		thread_deallocate(thread);
+ 	}
++	return true;
++}
++
++/* Do not wait in a nub's start(): matching can be asynchronous or serialized. */
++void
++HuskyCPU::startAll(void *arg __unused, wait_result_t result __unused)
++{
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	uint32_t requested = 1;
++	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
++	IOLog("HUSKY CPU: requested=%u selected=%u\n", requested, topology->num_cpus);
++
++	uint64_t deadline;
++	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
++	while (__atomic_load_n(&husky_cpus_registered, __ATOMIC_ACQUIRE) != topology->num_cpus) {
++		if (mach_absolute_time() > deadline) {
++			for (unsigned int i = 0; i < topology->num_cpus; i++) {
++				if (__atomic_load_n(&husky_cpus[i], __ATOMIC_ACQUIRE) == NULL) {
++					IOLog("HUSKY CPU: cpu=%u NOT registered (IOKit matching timeout)\n", i);
++				}
++			}
++			panic("HUSKY CPU: CPU registration timeout");
++		}
++		IOSleep(1);
++	}
++	/* The ADT has cpu0 as the boot CPU and ascending cores after it. */
++	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
++		panic("HUSKY CPU: expected boot MPIDR 0 and logical CPU 0");
++	}
++	for (unsigned int i = 0; i < topology->num_cpus; i++) {
++		HuskyCPU *cpu = __atomic_load_n(&husky_cpus[i], __ATOMIC_ACQUIRE);
++		kern_return_t kr = processor_start(cpu->machProcessor);
++		if (kr != KERN_SUCCESS) {
++			panic("HUSKY CPU: cpu=%u processor_start failed: %d", i, kr);
++		}
++		/* processor_start() is asynchronous for secondaries. */
++		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
++		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
++		    !husky_cpu_signal_is_enabled(i)) {
++			if (mach_absolute_time() > deadline) {
++				IOLog("HUSKY CPU: cpu=%u mpidr=0x%x NOT alive after 5s (initialized=%u)\n",
++				    i, topology->cpus[i].phys_id, __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE));
++				panic("HUSKY CPU: cpu=%u startup timeout (PSCI/reset/MMU/GIC/SGI)", i);
++			}
++			IOSleep(1);
++		}
++		IOLog("HUSKY CPU: cpu=%u mpidr=0x%x (%s) came alive; SGI%u OK\n",
++		    i, topology->cpus[i].phys_id, cpu->cpuName->getCStringNoCopy(), HUSKY_IPI_SGI);
++	}
++	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
+-	cpusRunning();
+-	registerService();
++	__atomic_load_n(&husky_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+-
+-	/* Announce completion only after registration, startup and SGI validation. */
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+-	IOLog("HUSKY CPU: boot CPU %u registered, SGI%u verified, initialization complete\n",
+-	    getCPUNumber(), HUSKY_IPI_SGI);
+-	return true;
++	IOLog("HUSKY CPU: %u/%u CPUs initialized, SGI%u verified\n",
++	    topology->num_cpus, topology->num_cpus, HUSKY_IPI_SGI);
++	thread_terminate(current_thread());
+ }
+ 
+ void
+@@ -107,27 +227,34 @@ void
+ HuskyCPU::initCPU(bool boot)
+ {
+ 	if (!boot) {
+-		panic("HUSKY CPU: resume is not implemented");
++		panic("HUSKY CPU: cpu=%u resume is not implemented", getCPUNumber());
+ 	}
+ 	assert(cpu_number() == (int)getCPUNumber());
+-	assert(ml_get_interrupts_enabled());
+ 	ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
+ 
+-	/* A real GIC interrupt clears SIGPdisabled in cpu_signal_handler. */
+-	IOLog("HUSKY CPU: SGI%u self-test\n", HUSKY_IPI_SGI);
++	/*
++	 * Secondary startup runs at splsched: queue the self-IPI and return.
++	 * startAll waits for its delivery once IRQs unmask; waiting here with
++	 * DAIF.I set would deadlock every secondary.
++	 */
+ 	signalCPU(this);
+-	ml_wait_for_cpu_signal_to_enable();
+ 	setCPUState(kIOCPUStateRunning);
++	kprintf("HUSKY CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu\n",
++	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
++	    __builtin_arm_rsr64("CurrentEL") >> 2);
++	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+ }
+ 
+ void
+ HuskyCPU::signalCPU(IOCPU *target)
+ {
+-	/* Only the boot CPU is registered by this driver. */
+-	if (target != this || cpu_number() != (int)getCPUNumber()) {
+-		panic("HUSKY CPU: secondary CPU signalling is not implemented");
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	unsigned int logical = target->getCPUNumber();
++	if (logical >= topology->num_cpus) {
++		panic("HUSKY CPU: invalid SGI target %u", logical);
+ 	}
+-	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++	/* Use the TARGET's affinity, never the sender's MPIDR. */
++	uint64_t mpidr = topology->cpus[logical].phys_id;
+ 	unsigned int aff0 = mpidr & 0xff;
+ 	if (aff0 >= 16) {
+ 		panic("HUSKY CPU: SGI target requires unsupported range selector");
+@@ -142,9 +269,29 @@ HuskyCPU::signalCPU(IOCPU *target)
+ }
+ 
+ kern_return_t
+-HuskyCPU::startCPU(vm_offset_t start_paddr __unused, vm_offset_t arg_paddr __unused)
++HuskyCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+-	return KERN_NOT_SUPPORTED;
++	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
++	/* cpu_start() passes NULL,NULL: the reset vector picks CPU data by MPIDR. */
++	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
++	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
++		panic("HUSKY CPU: cpu=%u unsupported restart", getCPUNumber());
++	}
++	uint64_t trampoline = husky_shim_secondary_entry();
++	if (trampoline == 0) {
++		panic("HUSKY CPU: no /cpus husky,secondary-entry (shim too old?)");
++	}
++	vm_offset_t entry = ml_static_vtop((vm_offset_t)&husky_secondary_entry);
++	IOLog("HUSKY CPU: cpu=%u CPU_ON target=0x%x shim=0x%llx xnu_entry=0x%llx\n",
++	    getCPUNumber(), cpu->phys_id, trampoline, (uint64_t)entry);
++	__builtin_arm_dsb(DSB_SY);
++	int32_t rc = husky_psci_cpu_on(cpu->phys_id, trampoline, entry);
++	IOLog("HUSKY CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
++	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
++	if (rc != 0) {
++		panic("HUSKY CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
++	}
++	return KERN_SUCCESS;
+ }
+ 
+ void
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 53f9ce5..8a580ee 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -934,6 +934,22 @@ cpu_start(int cpu)
+ 
+ 		flush_dcache((vm_offset_t)&CpuDataEntries[cpu], sizeof(cpu_data_entry_t), FALSE);
+ 		flush_dcache((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t), FALSE);
++#if defined(HUSKY)
++		/*
++		 * The secondary reset path (start.s) reads these through physical
++		 * addresses with caches off: clean them to PoC by VA range, as sweet
++		 * does, rather than rely on flush_dcache's coherent-I/O shortcut.
++		 */
++		extern uint8_t bootstrap_pagetables[];
++		extern boot_args const_boot_args;
++		CleanPoC_DcacheRegion_Force((vm_offset_t)CpuDataEntries, sizeof(CpuDataEntries));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)&const_boot_args, sizeof(const_boot_args));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)bootstrap_pagetables, BOOTSTRAP_TABLE_SIZE);
++		__builtin_arm_dsb(DSB_SY);
++#endif
+ #if CONFIG_SPTM
+ 		/**
+ 		 * On SPTM devices, CTRR is configured entirely by the SPTM. Due to this, this logic
+@@ -971,6 +987,20 @@ cpu_start(int cpu)
+ }
+ 
+ 
++#if defined(HUSKY)
++/* Bring-up observer for HuskyCPU: a CPU's self-SGI has cleared SIGPdisabled. */
++boolean_t husky_cpu_signal_is_enabled(unsigned int cpu);
++boolean_t
++husky_cpu_signal_is_enabled(unsigned int cpu)
++{
++	if (cpu >= MAX_CPUS) {
++		return FALSE;
++	}
++	cpu_data_t *cdp = CpuDataEntries[cpu].cpu_data_vaddr;
++	return cdp != NULL && !(os_atomic_load(&cdp->cpu_signal, acquire) & SIGPdisabled);
++}
++#endif /* HUSKY */
++
+ void
+ cpu_timebase_init(boolean_t from_boot)
+ {
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 00f7cde..22d30f6 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -143,8 +143,8 @@ LEXT(reset_vector)
+ 	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
+ 	add		x19, x19, EXT(ResetHandlerData)@pageoff
+ 	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
+-#if HAS_CLUSTER
+-	and		x0, x15, #0xFFFF					// CPU number in Affinity0, cluster ID in Affinity1
++#if HAS_CLUSTER || defined(HUSKY)
++	and		x0, x15, #0xFFFF					// CPU number in Affinity0, cluster ID in Affinity1 (HUSKY: core in Aff1, Aff0 = 0)
+ #else
+ 	and		x0, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
+ #endif
+@@ -289,6 +289,21 @@ LEXT(LowExceptionVectorBase)
+ LEXT(bootstrap_instructions)
+ 
+ #endif /* defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR) */
++#if defined(HUSKY)
++/*
++ * Secondary CPU entry (physical, MMU/caches off, EL1, no stack). PSCI CPU_ON
++ * lands in the boot shim's EL2 trampoline, which installs its VBAR_EL2 and a
++ * per-core EL2 stack for the paravirt HVC emulation, drops to EL1 and
++ * branches here (HuskyCPU::startCPU passes this address as the context).
++ * reset_vector finds this CPU's data by MPIDR.
++ */
++	.align 2
++	.globl EXT(husky_secondary_entry)
++LEXT(husky_secondary_entry)
++	msr		DAIFSet, #0xf
++	msr		SPSel, #1
++	b		EXT(LowResetVectorBase)
++#endif /* HUSKY */
+ 	.align 2
+ 	.globl EXT(resume_idle_cpu)
+ LEXT(resume_idle_cpu)
+@@ -768,6 +783,12 @@ common_start:
+ 	ic		iallu
+ #endif
+ 
++#if defined(HUSKY)
++	/* Complete local TLB/I-cache invalidation before enabling the MMU. */
++	dsb		sy
++	isb
++#endif
++
+ 	/* If x21 is not 0, then this is either the start_cpu path or
+ 	 * the resume_idle_cpu path.  cpu_ttep should already be
+ 	 * populated, so just switch to the kernel_pmap now.
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index d1c0962..abf625e 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -326,7 +326,11 @@
+ #define MAX_CPUS                       16
+ #define MAX_CPU_CLUSTERS               1
+ 
+-#define USE_APPLEARMSMP                1
++/*
++ * No USE_APPLEARMSMP (unlike VMAPPLE): its CPU path needs a PMGR/AIC driver
++ * kext and disables the legacy IOCPU class, which HuskyCPU (built in, PSCI)
++ * uses instead. With it off, ml_processor_register boots each processor.
++ */
+ 
+ #define NO_XNU_PLATFORM_ERROR_HANDLER  1
+ 
