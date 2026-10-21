@@ -12,7 +12,7 @@ index f176775..9af2659 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/husky_ufs.c b/bsd/dev/husky_ufs.c
 new file mode 100644
-index 0000000..b527788
+index 0000000..470e160
 --- /dev/null
 +++ b/bsd/dev/husky_ufs.c
 @@ -0,0 +1,667 @@
@@ -60,7 +60,7 @@ index 0000000..b527788
 +#include <machine/machine_routines.h>
 +#include <arm/caches_internal.h>
 +#include <vm/pmap.h>
-+#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <libkern/libkern.h>
