@@ -17,7 +17,7 @@ ROOT_OFFSET=$((40 << 30))	# ADT /husky-ufs root-offset
 LOG_SIZE=$((64 << 20))		# ADT /husky-ufs log-size
 DEV=/dev/block/by-name/userdata
 
-sig=$(dd if="$IMG" bs=1 skip=1024 count=2 2>/dev/null)
+sig=$(dd if="$IMG" bs=1 skip=1024 count=2 2>/dev/null | tr -d '\0')
 [[ "$sig" == "H+" || "$sig" == "HX" ]] || { echo "$IMG: not an HFS+ image (signature '$sig')" >&2; exit 1; }
 img_size=$(stat -c %s "$IMG")
 (( img_size % 4096 == 0 )) || { echo "$IMG: size not a multiple of 4096" >&2; exit 1; }

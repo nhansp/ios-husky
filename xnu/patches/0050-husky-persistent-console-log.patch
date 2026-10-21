@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/husky_ufs.c b/bsd/dev/husky_ufs.c
-index ce76eec..5f6802f 100644
+index ce76eec..7e6a3cb 100644
 --- a/bsd/dev/husky_ufs.c
 +++ b/bsd/dev/husky_ufs.c
 @@ -46,10 +46,15 @@
@@ -18,7 +18,7 @@ index ce76eec..5f6802f 100644
  
  /* Console (panel) and kprintf (pmsg, readable from Android after the reset). */
  #define HU_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
-@@ -649,9 +654,122 @@ husky_ufs_init(void)
+@@ -649,9 +654,125 @@ husky_ufs_init(void)
  	HU_LOG("HUSKY UFS: \"%s\" +%llu MiB on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
  	    want, root_off >> 20, hu.lun, hu.first_block, hu.nblocks * UFS_BLOCK >> 20,
  	    hu.writable ? "read-write" : "read-only", hu.dma_pa);
@@ -78,8 +78,11 @@ index ce76eec..5f6802f 100644
 +
 +	HU_LOG("HUSKY LOG: console log to the partition tail (block 0x%llx, %u KiB) every %us\n",
 +	    base, HUSKY_LOG_BLOCKS * UFS_BLOCK >> 10, husky_log_secs);
-+	for (;;) {
-+		(void)tsleep(&husky_log_chan, PZERO, "huskylog", hz * (int)husky_log_secs);
++	/* First flush right away (boot output so far), then every husky_log_secs. */
++	for (bool first = true;; first = false) {
++		if (!first) {
++			(void)tsleep(&husky_log_chan, PZERO, "huskylog", hz * (int)husky_log_secs);
++		}
 +		uint64_t total = os_atomic_load(&husky_log_total, relaxed);
 +		if (total == flushed) {
 +			continue;
