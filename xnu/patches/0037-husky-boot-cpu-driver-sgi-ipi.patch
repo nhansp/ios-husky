@@ -1,0 +1,301 @@
+diff --git a/iokit/Kernel/arm/HuskyCPU.cpp b/iokit/Kernel/arm/HuskyCPU.cpp
+new file mode 100644
+index 0000000..704d9c3
+--- /dev/null
++++ b/iokit/Kernel/arm/HuskyCPU.cpp
+@@ -0,0 +1,166 @@
++/*
++ * Single-CPU bring-up for husky using XNU's legacy IOCPU interface, ported
++ * from ios-sweet's SweetCPU. A kernelcache registers processors from a CPU
++ * driver kext; without one, nothing calls ml_set_max_cpus() and
++ * kperf_init_early() blocks in ml_wait_max_cpus() forever. The architected
++ * timer and the IPI SGI already enter through pe_init_fiq/sleh_irq.
++ * Secondary CPU startup and system suspend need separate platform work.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(HUSKY)
++#include <IOKit/IOCPU.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <arm64/proc_reg.h>
++#include <kern/processor.h>
++
++class HuskyCPU : public IOCPU {
++	OSDeclareDefaultStructors(HuskyCPU);
++	const OSSymbol *cpuName = NULL;
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	void initCPU(bool boot) APPLE_KEXT_OVERRIDE;
++	void quiesceCPU(void) APPLE_KEXT_OVERRIDE;
++	kern_return_t startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr) APPLE_KEXT_OVERRIDE;
++	void haltCPU(void) APPLE_KEXT_OVERRIDE;
++	void signalCPU(IOCPU *target) APPLE_KEXT_OVERRIDE;
++	const OSSymbol *getCPUName(void) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(HuskyCPU, IOCPU);
++
++bool
++HuskyCPU::start(IOService *provider)
++{
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	const ml_topology_cpu_t *cpu = topology->boot_cpu;
++	OSNumber *logical = OSDynamicCast(OSNumber, provider->getProperty("logical-cpu-id"));
++	OSData *reg = OSDynamicCast(OSData, provider->getProperty("reg"));
++
++	/* Only the boot CPU's nub is ours; decline the others. */
++	if (logical == NULL || reg == NULL || reg->getLength() != sizeof(uint32_t) ||
++	    logical->unsigned32BitValue() != cpu->cpu_id ||
++	    *(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
++		return false;
++	}
++	if (topology->num_cpus != 1) {
++		panic("HUSKY CPU: only single-CPU bring-up is supported (boot with cpus=1)");
++	}
++	if (!IOCPU::start(provider)) {
++		return false;
++	}
++	cpuName = OSSymbol::withCStringNoCopy("Cortex-A510");
++	if (cpuName == NULL) {
++		return false;
++	}
++	setCPUNumber(cpu->cpu_id);
++
++	ml_processor_info_t info = {};
++	info.cpu_id = reinterpret_cast<cpu_id_t>(this);
++	info.phys_id = cpu->phys_id;
++	info.log_id = cpu->cpu_id;
++	info.cluster_id = cpu->cluster_id;
++	info.cluster_type = cpu->cluster_type;
++	info.l2_cache_id = cpu->l2_cache_id;
++	info.l2_cache_size = cpu->l2_cache_size;
++	info.l3_cache_id = cpu->l3_cache_id;
++	info.l3_cache_size = cpu->l3_cache_size;
++	perfmon_interrupt_handler_func pmi_handler = NULL;
++	kern_return_t result = ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler);
++	if (result != KERN_SUCCESS) {
++		panic("HUSKY CPU: ml_processor_register failed: %d", result);
++	}
++	if (pmi_handler != NULL) {
++		panic("HUSKY CPU: PMI routing is not implemented");
++	}
++
++	/* Re-enter the boot CPU through cpu_machine_init -> PE_cpu_machine_init. */
++	result = processor_start(machProcessor);
++	if (result != KERN_SUCCESS || getCPUState() != kIOCPUStateRunning) {
++		panic("HUSKY CPU: processor_start failed: %d", result);
++	}
++	ml_cpu_init_completed();
++	cpusRunning();
++	registerService();
++	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
++
++	/* Announce completion only after registration, startup and SGI validation. */
++	ml_set_max_cpus(topology->max_cpu_id + 1);
++	IOLog("HUSKY CPU: boot CPU %u registered, SGI%u verified, initialization complete\n",
++	    getCPUNumber(), HUSKY_IPI_SGI);
++	return true;
++}
++
++void
++HuskyCPU::free(void)
++{
++	OSSafeReleaseNULL(cpuName);
++	IOCPU::free();
++}
++
++void
++HuskyCPU::initCPU(bool boot)
++{
++	if (!boot) {
++		panic("HUSKY CPU: resume is not implemented");
++	}
++	assert(cpu_number() == (int)getCPUNumber());
++	assert(ml_get_interrupts_enabled());
++	ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
++
++	/* A real GIC interrupt clears SIGPdisabled in cpu_signal_handler. */
++	IOLog("HUSKY CPU: SGI%u self-test\n", HUSKY_IPI_SGI);
++	signalCPU(this);
++	ml_wait_for_cpu_signal_to_enable();
++	setCPUState(kIOCPUStateRunning);
++}
++
++void
++HuskyCPU::signalCPU(IOCPU *target)
++{
++	/* Only the boot CPU is registered by this driver. */
++	if (target != this || cpu_number() != (int)getCPUNumber()) {
++		panic("HUSKY CPU: secondary CPU signalling is not implemented");
++	}
++	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++	unsigned int aff0 = mpidr & 0xff;
++	if (aff0 >= 16) {
++		panic("HUSKY CPU: SGI target requires unsupported range selector");
++	}
++	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
++	    (((mpidr >> 16) & 0xff) << 32) |
++	    (((mpidr >> 8) & 0xff) << 16) |
++	    ((uint64_t)HUSKY_IPI_SGI << 24) | (1ULL << aff0);
++	__builtin_arm_dsb(DSB_ISHST);
++	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
++	__builtin_arm_isb(ISB_SY);
++}
++
++kern_return_t
++HuskyCPU::startCPU(vm_offset_t start_paddr __unused, vm_offset_t arg_paddr __unused)
++{
++	return KERN_NOT_SUPPORTED;
++}
++
++void
++HuskyCPU::quiesceCPU(void)
++{
++	panic("HUSKY CPU: CPU quiesce is not implemented");
++}
++
++void
++HuskyCPU::haltCPU(void)
++{
++	panic("HUSKY CPU: CPU halt/suspend is not implemented");
++}
++
++const OSSymbol *
++HuskyCPU::getCPUName(void)
++{
++	return cpuName;
++}
++#endif /* HUSKY */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 1f7a3fa..5520678 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -41,6 +41,12 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'google,husky';"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
++    "   {"
++    "     'IOClass'         = HuskyCPU;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'ARM,v8';"
++    "     'IOProbeScore'    = 10000:32;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 66056f4..e620c4d 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -8,3 +8,4 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+ 
+ # HUSKY device-tree platform (empty translation unit on other boards)
+ iokit/Kernel/arm/HuskyPlatformExpert.cpp						optional iokitcpp
++iokit/Kernel/arm/HuskyCPU.cpp							optional iokitcpp
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 0e10660..d5c1db3 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3010,16 +3010,16 @@ sleh_irq(arm_saved_state_t *state)
+ 
+ #if defined(HUSKY)
+ 	/*
+-	 * GIC Group 1 NS (see pe_init_fiq): the vtimer PPI arrives here rather
+-	 * than at sleh_fiq. Ack it and run the timer path sleh_fiq would.
++	 * GIC Group 1 NS (see pe_init_fiq): the vtimer and the cross-CPU signal
++	 * SGI arrive here rather than at sleh_fiq.
+ 	 */
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xffffff);
+ 	if (intid >= 1020) {
+ 		return; /* spurious / special */
+ 	}
+-	sleh_interrupt_handler_prologue(state, intid == 27 ? DBG_INTR_TYPE_TIMER : DBG_INTR_TYPE_OTHER);
+-	if (intid == 27) {
++	if (intid == HUSKY_VTIMER_INTID) {
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		/* Bring-up: prove the vtimer IRQ path is live. */
+ 		static uint64_t husky_ticks;
+ 		if ((husky_ticks++ & 1023) == 0) {
+@@ -3029,10 +3029,25 @@ sleh_irq(arm_saved_state_t *state)
+ 		ml_interrupt_masked_debug_start(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		ml_interrupt_masked_debug_end();
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++	} else if (intid < 16) {
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
++		/* Ack before handling so an IPI raised meanwhile is not lost. */
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		__builtin_arm_isb(ISB_SY);
++		cpu_signal_handler();
+ 	} else {
+-		kprintf("husky: unhandled IRQ %u\n", intid);
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++		if (cdp->interrupt_handler) {
++			cdp->interrupt_handler(cdp->interrupt_target,
++			    cdp->interrupt_refCon,
++			    cdp->interrupt_nub,
++			    intid);
++		} else {
++			kprintf("husky: unhandled IRQ %u\n", intid);
++		}
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 	}
+-	__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ #else
+ 	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index c7ca3d5..d055336 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -178,8 +178,13 @@ pe_init_fiq()
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+ #endif
+ 
++#if defined(HUSKY)
++	// Enable the vtimer PPI and the cross-CPU signal SGI
++	gicr_write32(GICR_ISENABLER0, (1U << HUSKY_VTIMER_INTID) | (1U << HUSKY_IPI_SGI));
++#else
+ 	// Enable PPI 27
+ 	gicr_write32(GICR_ISENABLER0, (1 << 27));
++#endif
+ 
+ #if defined(HUSKY)
+ 	husky_early_bc("  fiq: igroupr/isenabler done\n");
+@@ -216,10 +221,11 @@ pe_init_fiq()
+ 	 * Nothing has enabled Group 1 NS forwarding yet: on Android, Linux's
+ 	 * gic_dist_init sets GICD_CTLR.EnableGrp1A itself, and the firmware
+ 	 * leaves it clear (measured GICD_CTLR=0x10, ARE_NS only). Without it the
+-	 * distributor never delivers the vtimer. Also give PPI 27 Linux's default
+-	 * priority rather than the reset value.
++	 * distributor never delivers the vtimer. Also give the vtimer and IPI
++	 * Linux's default priority rather than the reset value.
+ 	 */
+-	*(volatile uint8_t *)(gicr_pe_base + HUSKY_GICR_IPRIORITYR + 27) = 0xa0;
++	*(volatile uint8_t *)(gicr_pe_base + HUSKY_GICR_IPRIORITYR + HUSKY_VTIMER_INTID) = 0xa0;
++	*(volatile uint8_t *)(gicr_pe_base + HUSKY_GICR_IPRIORITYR + HUSKY_IPI_SGI) = 0xa0;
+ 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+ 	gicd_write32(GICD_CTLR, gicd_ctlr | HUSKY_GICD_CTLR_ENABLEGRP1A);
+ 	while (gicd_read32(GICD_CTLR) & HUSKY_GICD_CTLR_RWP) {
+diff --git a/pexpert/pexpert/arm64/HUSKY.h b/pexpert/pexpert/arm64/HUSKY.h
+index 69df859..2367377 100644
+--- a/pexpert/pexpert/arm64/HUSKY.h
++++ b/pexpert/pexpert/arm64/HUSKY.h
+@@ -22,6 +22,12 @@
+ #define HUSKY 1
+ /* Tensor cores have no Apple CPU_OVRD power-management SPR. */
+ #define NO_CPU_OVRD 1
++/*
++ * GIC Group 1 NS interrupts XNU takes in sleh_irq (EL3 owns Group 0): the
++ * architected virtual timer PPI, and the SGI used for cross-CPU signals.
++ */
++#define HUSKY_VTIMER_INTID 27
++#define HUSKY_IPI_SGI      1
+ #include <pexpert/arm64/VMAPPLE.h>
+ 
+ #endif /* _PEXPERT_ARM64_HUSKY_H */
