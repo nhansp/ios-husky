@@ -227,6 +227,21 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
+    # Internal UFS (bsd/dev/husky_ufs.c): UFSHCI + vendor HCI window (absolute
+    # physical, no arm-io translation). The shim brings the link up and fills
+    # husky,link-ready. The iOS root is the tail of the userdata partition:
+    # Android's f2fs keeps its first root-offset bytes (tools/f2fs_shrink.c),
+    # and the last log-size bytes are kept for a persistent console log.
+    ufs = node('husky-ufs', [
+        ph(),
+        ('compatible', cstr('husky,ufs')),
+        ('reg', u64(0x13200000, 0x2000)),
+        ('husky,link-ready', u64(0)),
+        ('root-partition', cstr('userdata')),
+        ('root-offset', u64(40 << 30)),
+        ('log-size', u64(64 << 20)),
+    ])
+
     product_props = d431ap_product()
     product = [node('product', [ph()] + product_props)] if product_props else []
 
@@ -242,7 +257,7 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, buttons] + product)
+    ], [chosen, defaults, cpus, arm_io, buttons, ufs] + product)
 
 
 if __name__ == '__main__':

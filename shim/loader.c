@@ -18,6 +18,7 @@
 #include "console.h"
 #include "fdt.h"
 #include "loader.h"
+#include "ufs.h"
 #include "fb.h"
 
 #define BOOT_LINE_LENGTH	1024
@@ -261,6 +262,9 @@ const char *loader_boot(uintptr_t dtb)
 		con_hex("SMPENTRY", (uintptr_t)secondary_entry);
 	else
 		con_str("SMP", "no husky,secondary-entry in ADT");
+	/* UFS: tell xnu's husky_ufs whether ufs_bringup left the host operational. */
+	if (!adt_set_u64(adt_pa, p->adt_size, "husky,link-ready", (uint64_t)ufs_ready))
+		con_str("UFS", "no husky,link-ready in ADT");
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 

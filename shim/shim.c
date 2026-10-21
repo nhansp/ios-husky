@@ -209,9 +209,7 @@ void shim_main(uint64_t dtb, uint64_t entry_el)
 	 * returns on error; log it and reset so Android comes back up.
 	 */
 	stage = "load";
-#ifdef UFSPROBE
-	test_ufs();
-#endif
+	ufs_bringup();
 #ifdef FBPROBE
 	test_fb();
 #endif

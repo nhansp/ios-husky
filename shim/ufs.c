@@ -1,19 +1,21 @@
 /*
- * UFS probe (UFSPROBE=1 builds only): can we talk to the internal UFS that
- * ABL booted from, without any PHY/UniPro bring-up? Ported from ios-sweet's
- * shim/ufs.c (Qualcomm), retargeted at Tensor G3's Exynos UFSHCI.
+ * Internal UFS bring-up for xnu. ABL powers the UFS down (VCC off, REF_CLK
+ * and RST_n parked) before the handoff, so the shim brings host, link and
+ * device back up the way Linux's ufshcd + ufs-exynos do, with Samsung's zuma
+ * CAL (shim/ufscal, GPL) for the PHY/UniPro tables, switches the link to
+ * HS-G4 and leaves it operational. xnu's bsd/dev/husky_ufs.c then takes over
+ * the transfer request list; the CAL never has to live in the kernel.
  *
  * Runs with the MMU off (all memory Device, so DMA is coherent with no cache
- * maintenance). Dumps the UFSHCI registers ABL left behind and, if the host
- * is enabled and the link is up, points the transfer request list at our own
- * buffers and issues READ-ONLY SCSI commands on LUN 0. Nothing is ever
- * written to the device: there is no SCSI WRITE in this file.
+ * maintenance). Nothing is ever written to the device: there is no SCSI WRITE
+ * in this file. UFSPROBE=1 builds also log capacity, the GPT and a read
+ * throughput sample.
  *
  * Register layout and descriptor formats: JEDEC UFSHCI (JESD223). Exynos
  * hosts (Linux ufs-exynos.c) cap each PRDT entry at 4 KiB
  * (HCI_{TX,RX}PRDT_ENTRY_SIZE = 12) and want HCI_UTRL_NEXUS_TYPE set for SCSI
- * slots; older ones take UTRD offsets in bytes, but zuma (and ABL) use
- * DWORDs. Addresses from zuma-ufs.dtsi, vendor regs from ufs-vs-regs.h.
+ * slots; zuma (and ABL) take UTRD offsets in DWORDs. Addresses from
+ * zuma-ufs.dtsi, vendor regs from ufs-vs-regs.h.
  */
 #include <stdint.h>
 #include "console.h"
@@ -48,11 +50,19 @@
 #define IS_UCCS		(1u << 10)	/* UIC command completion status */
 
 #define UIC_DME_GET		0x01
+#define UIC_DME_SET		0x02
 #define UIC_DME_LINKSTARTUP	0x16
 #define UIC_DME_ENDPOINTRESET	0x15
 #define UIC_DME_HIBER_EXIT	0x18
-#define PA_PWRMODE		0x1571
+#define PA_ACTIVETXDATALANES	0x1560
 #define PA_CONNECTEDTXLANES	0x1561
+#define PA_TXGEAR		0x1568
+#define PA_TXTERMINATION	0x1569
+#define PA_HSSERIES		0x156A
+#define PA_PWRMODE		0x1571
+#define PA_ACTIVERXDATALANES	0x1580
+#define PA_RXGEAR		0x1583
+#define PA_RXTERMINATION	0x1584
 
 #define HCS_DP		(1u << 0)
 #define HCS_UTRLRDY	(1u << 1)
@@ -61,6 +71,7 @@
 #define BLOCK		4096u
 #define PRDT_MAX	4096u	/* bytes per PRDT entry on Exynos */
 #define NPRDT		8	/* up to 32 KiB per command */
+#define CMD_MAX		(NPRDT * PRDT_MAX)
 #define TICKS_1S	24576000u	/* CNTFRQ on husky */
 
 static inline uint32_t ufs_rd(uint32_t off) { return *(volatile uint32_t *)(UFS_BASE + off); }
@@ -97,42 +108,6 @@ static inline void ufs_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(UFS
 
 #define SYSREG_UFS_IOCC		0x13020710UL	/* sysreg_ufs + 0x710, mask 0x3 */
 
-/* Clock tree (zuma cmucal-sfr.c). Gate: bit20 MANUAL, bit21 CG_VAL, bit28
- * hardware auto-gating. QCH: bit0 ENABLE, bit1 CLOCK_REQ, bit2 IGNORE_FORCE_PM. */
-#define CMU_HSI2		0x13000000UL
-#define CMU_TOP			0x26040000UL
-/* kind 0: dump only, 1: gate (force on), 2: Q-channel (request the clock). */
-static void cmu_one(const char *name, uintptr_t addr, int kind)
-{
-	volatile uint32_t *r = (volatile uint32_t *)addr;
-	uint32_t v = *r, nv = v;
-	if (kind == 1)
-		nv = v | (1u << 20) | (1u << 21);	/* manual, clock on */
-	else if (kind == 2)
-		nv = v | (1u << 1);			/* CLOCK_REQ */
-	if (nv != v)
-		*r = nv;
-	con_hex2(name, "was=", v, "now=", *r);
-}
-
-/* Calls, not a table: pointer tables would need relocation (build.sh). */
-static void cmu_dump_and_open(void)
-{
-	cmu_one("TOP mux", CMU_TOP + 0x10b8, 0);
-	cmu_one("TOP div", CMU_TOP + 0x18b0, 0);
-	cmu_one("TOP gate", CMU_TOP + 0x20e0, 1);
-	cmu_one("noc user", CMU_HSI2 + 0x610, 0);
-	cmu_one("ufs user", CMU_HSI2 + 0x630, 0);
-	cmu_one("ufs user1", CMU_HSI2 + 0x634, 0);
-	cmu_one("qe aclk", CMU_HSI2 + 0x20cc, 1);
-	cmu_one("qe pclk", CMU_HSI2 + 0x20d0, 1);
-	cmu_one("ufs aclk", CMU_HSI2 + 0x210c, 1);
-	cmu_one("ufs unipro", CMU_HSI2 + 0x2110, 1);
-	cmu_one("ufs fmp", CMU_HSI2 + 0x2114, 1);
-	cmu_one("qch qe", CMU_HSI2 + 0x3090, 2);
-	cmu_one("qch ufs", CMU_HSI2 + 0x30c4, 2);
-	cmu_one("qch fmp", CMU_HSI2 + 0x30c8, 2);
-}
 static inline uint32_t vs_rd(uint32_t off) { return *(volatile uint32_t *)(VS_BASE + off); }
 static inline void vs_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(VS_BASE + off) = v; }
 
@@ -159,7 +134,9 @@ struct ucd {
 
 static struct utrd utrl[32] __attribute__((aligned(1024)));
 static struct ucd ucd __attribute__((aligned(128)));
-static uint8_t data[2 * BLOCK] __attribute__((aligned(4096)));
+#ifdef UFSPROBE
+static uint8_t data[CMD_MAX] __attribute__((aligned(4096)));
+#endif
 /* 1: offsets in bytes (older Exynos), 0: in DWORDs (JEDEC; ABL uses these). */
 static int byte_gran;
 
@@ -177,10 +154,12 @@ static void zero(void *p, unsigned n)
 		b[i] = 0;
 }
 
+#ifdef UFSPROBE
 static uint32_t be32(const uint8_t *p)
 {
 	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
+#endif
 
 static void dump_engine(const char *why)
 {
@@ -293,6 +272,7 @@ static uint64_t le64(const uint8_t *p)
 	return v;
 }
 
+#ifdef UFSPROBE
 /* One line per GPT entry of at least 64 MiB: name, first LBA, size in MiB (4K blocks). */
 static void list_partitions(uint32_t entry_lba, uint32_t nent)
 {
@@ -321,13 +301,14 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 		con_hex2(name, "lba=", (uint32_t)first, "MiB=", (uint32_t)((last - first + 1) >> 8));
 	}
 }
+#endif
 
 /*
  * One UIC command. Returns the config result code (ARG2[7:0], 0 = success)
- * or 0x100 on timeout; *val gets ARG3 (DME_GET's value). IS bits it raised
- * are returned in *is.
+ * or 0x100 on timeout; arg3 is DME_SET's value, *val gets ARG3 back (DME_GET's
+ * value). IS bits it raised are returned in *is.
  */
-static uint32_t uic_cmd(uint32_t op, uint32_t arg1, uint32_t *val, uint32_t *is)
+static uint32_t uic_cmd(uint32_t op, uint32_t arg1, uint32_t arg3, uint32_t *val, uint32_t *is)
 {
 	uint64_t start = ticks();
 	while (!(ufs_rd(REG_HCS) & HCS_UCRDY))
@@ -336,7 +317,7 @@ static uint32_t uic_cmd(uint32_t op, uint32_t arg1, uint32_t *val, uint32_t *is)
 	ufs_wr(REG_IS, IS_UCCS | IS_UHXS | IS_UHES | IS_UPMS);
 	ufs_wr(REG_UCMDARG1, arg1);
 	ufs_wr(REG_UCMDARG2, 0);
-	ufs_wr(REG_UCMDARG3, 0);
+	ufs_wr(REG_UCMDARG3, arg3);
 	ufs_wr(REG_UICCMD, op);
 	start = ticks();
 	uint32_t want = op == UIC_DME_HIBER_EXIT ? IS_UHXS : IS_UCCS;
@@ -355,7 +336,7 @@ static uint32_t uic_cmd(uint32_t op, uint32_t arg1, uint32_t *val, uint32_t *is)
 static void dme_get_log(const char *name, uint32_t attr)
 {
 	uint32_t val = 0, is = 0;
-	uint32_t rc = uic_cmd(UIC_DME_GET, attr << 16, &val, &is);
+	uint32_t rc = uic_cmd(UIC_DME_GET, attr << 16, 0, &val, &is);
 	con_hex2(name, "rc=", rc, "val=", val);
 }
 
@@ -470,7 +451,7 @@ static uint32_t cal_call(uint32_t (*fn)(struct ufs_cal_param *))
 static uint32_t dme_get(uint32_t attr)
 {
 	uint32_t val = 0, is = 0;
-	return uic_cmd(UIC_DME_GET, attr << 16, &val, &is) ? 0xffffffffu : val;
+	return uic_cmd(UIC_DME_GET, attr << 16, 0, &val, &is) ? 0xffffffffu : val;
 }
 
 /*
@@ -545,7 +526,7 @@ static int host_reset_and_link(void)
 	}
 	{
 		uint32_t is = 0;
-		uint32_t rc0 = uic_cmd(UIC_DME_ENDPOINTRESET, 0, 0, &is);
+		uint32_t rc0 = uic_cmd(UIC_DME_ENDPOINTRESET, 0, 0, 0, &is);
 		con_hex2("UFS EPRESET", "rc=", rc0, "is=", is);
 		delay_us(50000);
 	}
@@ -613,7 +594,7 @@ static int host_reset_and_link(void)
 
 	uint32_t rc = 0x100, is = 0;
 	for (int i = 0; i < 3 && rc; i++) {
-		rc = uic_cmd(UIC_DME_LINKSTARTUP, 0, 0, &is);
+		rc = uic_cmd(UIC_DME_LINKSTARTUP, 0, 0, 0, &is);
 		con_hex2("UFS LINKUP", "rc=", rc, "is=", is);
 		con_hex2("UFS LINKUP", "hcs=", ufs_rd(REG_HCS), "dp=", ufs_rd(REG_HCS) & HCS_DP);
 		/* UIC error codes: which layer failed (UFSHCI UECPA..UECDME). */
@@ -707,202 +688,142 @@ static void phy_iso_release(void)
 	}
 }
 
-void test_ufs(void)
+static uint32_t dme_set(uint32_t attr, uint32_t val)
 {
-	con_str("UFS", "probe v17: VCC + pinmux + CAL bring-up (read-only)");
-	phy_iso_release();
-	abl_mclk_rate();
-	uint32_t cap = ufs_rd(REG_CAP), hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE);
-	con_hex2("UFS", "ver=", ufs_rd(REG_VER), "cap=", cap);
-	con_hex2("UFS", "hce=", hce, "hcs=", hcs);
-	con_hex2("UFS", "is=", ufs_rd(REG_IS), "rsr=", ufs_rd(REG_UTRLRSR));
-	uint32_t abl_lo = ufs_rd(REG_UTRLBA), abl_hi = ufs_rd(REG_UTRLBAU);
-	con_hex2("UFS", "utrlba=", abl_lo, "hi=", abl_hi);
-	con_hex2("UFS", "dbr=", ufs_rd(REG_UTRLDBR), "nutrs=", (cap & 0x1f) + 1);
-	con_hex2("UFS VS", "txprdt=", vs_rd(VS_TXPRDT_ENTRY_SIZE), "rxprdt=", vs_rd(VS_RXPRDT_ENTRY_SIZE));
-	con_hex2("UFS VS", "nexus=", vs_rd(VS_UTRL_NEXUS_TYPE), "1us=", vs_rd(VS_1US_TO_CNT_VAL));
-	con_hex2("UFS VS", "hold=", vs_rd(VS_REQ_HOLD_EN), "clkstop=", vs_rd(VS_CLKSTOP_CTRL));
-	con_hex2("UFS VS", "reorder=", vs_rd(VS_DATA_REORDER), "burst=", vs_rd(VS_AXIDMA_BURST));
-	con_hex2("UFS VS", "swrst=", vs_rd(VS_SW_RST), "vis=", vs_rd(VS_VENDOR_IS));
-	/* ABL's own slot 0 shows which descriptor layout this host expects. */
-	volatile struct utrd *abl = 0;
-	uint8_t *abl_ucd = 0;
-	if (abl_lo && !abl_hi) {
-		abl = (volatile struct utrd *)(uintptr_t)abl_lo;
-		con_hex2("UFS ABL", "dw0=", abl->dw0, "dw2=", abl->dw2);
-		con_hex2("UFS ABL", "ucdba=", abl->ucdba, "hi=", abl->ucdbau);
-		con_hex2("UFS ABL", "resp=", abl->resp, "prdt=", abl->prdt);
-		if (abl->ucdba && !abl->ucdbau) {
-			abl_ucd = (uint8_t *)(uintptr_t)abl->ucdba;
-			volatile const uint32_t *u = (volatile const uint32_t *)abl_ucd;
-			con_hex2("UFS ABL cmd", "w0=", u[0], "w1=", u[1]);
-			con_hex2("UFS ABL cmd", "w2=", u[2], "w4=", u[4]);
+	uint32_t is = 0;
+	return uic_cmd(UIC_DME_SET, attr << 16, val, 0, &is);
+}
+
+/*
+ * Power mode change to HS-G4 rate B, both lanes, FAST (ufshcd_change_power_mode
+ * with exynos_ufs_pwr_change_notify around it). The Exynos host has
+ * UFSHCD_QUIRK_SKIP_DEF_UNIPRO_TIMEOUT_SETTING: no PA_PWRMODEUSERDATA writes.
+ * Returns 0 once the host reports the local change done (UPMCRS = PWR_LOCAL).
+ */
+static int ufs_hs_mode(void)
+{
+	uint8_t lanes = cal_param.connected_rx_lane, gear = cal_param.max_gear;
+	if (!lanes || lanes != cal_param.connected_tx_lane || gear < 1)
+		return 1;
+	cal_pmd.lane = lanes;
+	cal_pmd.gear = gear;
+	uint32_t cal = cal_call((uint32_t (*)(struct ufs_cal_param *))ufs_cal_pre_pmc);
+	con_hex("UFS CAL pre_pmc", cal);
+	if (cal)
+		return 2;
+	uint32_t err = dme_set(PA_RXGEAR, gear) | dme_set(PA_ACTIVERXDATALANES, lanes) |
+	    dme_set(PA_RXTERMINATION, 1) | dme_set(PA_TXGEAR, gear) |
+	    dme_set(PA_ACTIVETXDATALANES, lanes) | dme_set(PA_TXTERMINATION, 1) |
+	    dme_set(PA_HSSERIES, cal_pmd.hs_series);
+	if (err) {
+		con_hex("UFS PMC set", err);
+		return 3;
+	}
+	/* PA_PWRMODE = FAST rx << 4 | FAST tx; completion is IS.UPMS. */
+	uint32_t is = 0;
+	uint32_t rc = uic_cmd(UIC_DME_SET, PA_PWRMODE << 16, 0x11, 0, &is);
+	uint64_t start = ticks();
+	while (!rc && !(is & IS_UPMS)) {
+		is |= ufs_rd(REG_IS);
+		if (ticks() - start > TICKS_1S) {
+			rc = 0x100;
+			break;
 		}
 	}
-
-	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
-		con_str("UFS", "host not enabled/ready: stop");
-		return;
-	}
-	if (ufs_rd(REG_UTRLDBR)) {
-		con_str("UFS", "requests outstanding: stop");
-		return;
-	}
-	/* Requests held or host clocks stopped would leave a doorbell pending forever. */
-	if (vs_rd(VS_REQ_HOLD_EN)) {
-		vs_wr(VS_REQ_HOLD_EN, 0);
-		con_hex("UFS hold clr", vs_rd(VS_REQ_HOLD_EN));
-	}
-	if (vs_rd(VS_CLKSTOP_CTRL) & 0x1f) {
-		vs_wr(VS_CLKSTOP_CTRL, vs_rd(VS_CLKSTOP_CTRL) & ~0x1fu);
-		con_hex("UFS clkstop clr", vs_rd(VS_CLKSTOP_CTRL));
-	}
-	ufs_wr(REG_IS, ufs_rd(REG_IS));		/* ack stale status (write 1 to clear) */
-
-	/* Link state ABL left: power mode, lanes. Then leave hibern8 if it is in it. */
+	ufs_wr(REG_IS, IS_UPMS);
+	uint32_t upmcrs = (ufs_rd(REG_HCS) >> 8) & 7;
+	con_hex2("UFS PMC", "rc=", rc, "upmcrs=", upmcrs);
+	if (rc || upmcrs != 1)
+		return 4;
+	cal_param.active_tx_lane = (uint8_t)*(volatile uint32_t *)(UNIPRO_BASE + 0x3180);
+	cal_param.active_rx_lane = (uint8_t)*(volatile uint32_t *)(UNIPRO_BASE + 0x3200);
+	cal = cal_call((uint32_t (*)(struct ufs_cal_param *))ufs_cal_post_pmc);
+	con_hex("UFS CAL post_pmc", cal);
 	dme_get_log("UFS PWRMODE", PA_PWRMODE);
-	dme_get_log("UFS TXLANES", PA_CONNECTEDTXLANES);
-	/* Clock/DMA plumbing ABL left, then Linux's settings for an active host:
-	 * core clock never auto-stopped, no clock-stop control, IOP auto clock
-	 * gating enabled (exynos_ufs_ctrl_auto_hci_clk/ctrl_clk(false)). */
-	con_hex2("UFS VS", "force_hcs=", vs_rd(VS_FORCE_HCS), "axi_if=", vs_rd(VS_AXI_DMA_IF_CTRL));
-	con_hex2("UFS VS", "ufs_acg=", vs_rd(VS_UFS_ACG_DISABLE), "iop_acg=", vs_rd(VS_IOP_ACG_DISABLE));
-	dump_engine("UFS IDLE");
-	vs_wr(VS_FORCE_HCS, vs_rd(VS_FORCE_HCS) & ~(FORCE_HCS_CORECLK_STOP_EN | FORCE_HCS_CLK_STOP_CTRL_ALL));
-	vs_wr(VS_IOP_ACG_DISABLE, vs_rd(VS_IOP_ACG_DISABLE) & ~1u);
-	con_hex2("UFS VS", "force_hcs'=", vs_rd(VS_FORCE_HCS), "iop_acg'=", vs_rd(VS_IOP_ACG_DISABLE));
+	dme_get_log("UFS TXGEAR", PA_TXGEAR);
+	return cal ? 5 : 0;
+}
 
-	uint32_t ocs = 0, st = 0, rc = 1;
+/* TUR until the device stops reporting a unit attention; 0 when ready. */
+static uint32_t ufs_tur(void)
+{
 	static const uint8_t tur[6] = { 0x00 };
-
-	/*
-	 * Clocks were checked (v6: all UFS gates on, Q-channels requested).
-	 * Pixel runs the host's own auto-hibern8 (10 ms): if ABL left that FSM
-	 * hibernating or in error, requests wait forever. PA_PWRMODE still
-	 * reads FAST in hibern8, so ask the host, not UniPro.
-	 */
-	con_hex2("UFS AH8", "ahit=", ufs_rd(REG_AHIT), "state=", vs_rd(VS_AH8_STATE));
-	ufs_wr(REG_AHIT, 0);
-	con_hex2("UFS AH8", "ahit'=", ufs_rd(REG_AHIT), "state'=", vs_rd(VS_AH8_STATE));
-	if (vs_rd(VS_AH8_STATE) & (1u << 8)) {
-		uint32_t is = 0;
-		uint32_t rc8 = uic_cmd(UIC_DME_HIBER_EXIT, 0, 0, &is);
-		con_hex2("UFS H8EXIT", "rc=", rc8, "is=", is);
-		con_hex2("UFS H8EXIT", "upmcrs=", (ufs_rd(REG_HCS) >> 8) & 7, "state=", vs_rd(VS_AH8_STATE));
-	}
-
-	/*
-	 * First, no takeover at all: ABL's list stays installed and running; our
-	 * TUR goes in its slot 1 (ABL used slot 0) with a command descriptor in
-	 * ABL's memory, doorbell bit 1. Isolates the list stop/rebase from
-	 * everything else.
-	 */
-	if (abl && abl_ucd) {
-		volatile struct utrd *s1 = abl + 1;
-		uint8_t *u1 = (uint8_t *)(((uintptr_t)abl_ucd + 0x800) & ~(uintptr_t)0x7f);
-		con_hex2("UFS NOTAKE", "slot1=", (uint32_t)(uintptr_t)s1, "ucd=", (uint32_t)(uintptr_t)u1);
-		for (int i = 0; i < 3; i++) {
-			rc = scsi_at(1, s1, u1, 32, 32, 64, 0, tur, sizeof(tur), 0, 0, &ocs, &st);
-			con_hex2("UFS TUR slot1", "rc=", rc, "ocs/st=", ocs << 8 | st);
-			if (!rc || rc == 4)
-				break;
-		}
-		if (!rc || rc == 4) {
-			con_str("UFS", "ABL list works untouched: the takeover breaks it");
-			return;
-		}
-	}
-
-	/* Take over the transfer request list: stop, point at ours, run. */
-	ufs_wr(REG_UTRLRSR, 0);
-	uintptr_t list = (uintptr_t)utrl;
-	ufs_wr(REG_UTRLBA, (uint32_t)list);
-	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
-	ufs_wr(REG_UTRLRSR, 1);
-	con_hex2("UFS", "ours=", (uint32_t)list, "rsr=", ufs_rd(REG_UTRLRSR));
-	/*
-	 * Never ring a doorbell unless the host really uses our list: otherwise
-	 * it would execute whatever ABL left in its own slot 0 (maybe a write).
-	 */
-	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
-	    !(ufs_rd(REG_UTRLRSR) & 1)) {
-		con_str("UFS", "list base not taken: stop");
-		return;
-	}
-	/* A first command may report a unit attention (CHECK CONDITION): retry. */
-	for (int i = 0; i < 3; i++) {
+	uint32_t ocs = 0, st = 0, rc = 1;
+	for (int i = 0; i < 5; i++) {
 		rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
-		con_hex2("UFS TUR ours", "rc=", rc, "ocs/st=", ocs << 8 | st);
-		if (!rc || rc == 4)
+		con_hex2("UFS TUR", "rc=", rc, "ocs/st=", ocs << 8 | st);
+		if (!rc)
 			break;
 	}
+	return rc == 4 ? 0 : rc;	/* a CHECK CONDITION still means it answers */
+}
 
-	/* Last: sysreg / protector blocks may be secure-only and fault. */
-	if ((rc == 1 || rc == 2) && abl && abl_ucd) {
-		/*
-		 * Not even a no-data command completes from our buffers: retry from
-		 * ABL's list and command descriptor, which the host's DMA demonstrably
-		 * reaches. Same layout ABL used (response UPIU right after the 32-byte
-		 * command UPIU). If this works where ours failed, DMA to our memory is
-		 * being blocked (S2MPU).
-		 */
-		ufs_wr(REG_UTRLRSR, 0);
-		ufs_wr(REG_UTRLBA, abl_lo);
-		ufs_wr(REG_UTRLBAU, 0);
-		ufs_wr(REG_UTRLRSR, 1);
-		con_hex2("UFS", "abl list=", ufs_rd(REG_UTRLBA), "rsr=", ufs_rd(REG_UTRLRSR));
-		for (int i = 0; i < 3; i++) {
-			rc = scsi_at(0, abl, abl_ucd, 32, 32, 64, 0, tur, sizeof(tur), 0, 0, &ocs, &st);
-			con_hex2("UFS TUR abl", "rc=", rc, "ocs/st=", ocs << 8 | st);
-			if (!rc || rc == 4)
-				break;
-		}
-		con_str("UFS", rc == 0 || rc == 4 ? "ABL memory works, ours does not: DMA blocked?"
-		    : "fails in ABL memory too: not (only) DMA");
-		if (rc == 0 || rc == 4)
-			return;
-		/* Do what Linux always does: reset everything and start the link. */
-		int r = host_reset_and_link();
-		con_hex("UFS RESET result", (uint32_t)r);
-		if (r)
-			return;
-		for (int i = 0; i < 3; i++) {
-			rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
-			con_hex2("UFS TUR reset", "rc=", rc, "ocs/st=", ocs << 8 | st);
-			if (!rc || rc == 4)
-				break;
-		}
-	}
-	if (rc == 4)
-		rc = 0;
-	if (rc) {
-		con_str("UFS", "no TUR response: stop");
-		return;
-	}
-
+#ifdef UFSPROBE
+/* Capacity, the big GPT partitions, and a read throughput sample. */
+static void ufs_report(void)
+{
+	uint32_t ocs = 0, st = 0, rc;
 	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */
 	rc = scsi(0, cap10, sizeof(cap10), data, 8, &ocs, &st);
-	con_hex2("UFS CAP", "rc=", rc, "ocs/st=", ocs << 8 | st);
 	if (!rc)
 		con_hex2("UFS LUN0", "lastlba=", be32(data), "blk=", be32(data + 4));
-
-	/* READ(10) LBA 0, 2 blocks: protective MBR and the GPT header. */
-	static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0 };
-	rc = scsi(0, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st);
-	con_hex2("UFS READ", "rc=", rc, "ocs/st=", ocs << 8 | st);
-	if (rc)
+	if (read_blocks(1, 1, data))
 		return;
-	con_hex2("UFS MBR", "sig=", data[510] | data[511] << 8, "type=", data[450]);
-	const uint8_t *gpt = data + BLOCK;
-	char sig[9];
-	for (int i = 0; i < 8; i++)
-		sig[i] = (gpt[i] >= 32 && gpt[i] < 127) ? gpt[i] : '.';
-	sig[8] = 0;
-	con_str("UFS GPT", sig);
-	uint32_t nent = gpt[80] | gpt[81] << 8 | gpt[82] << 16, esz = gpt[84] | gpt[85] << 8;
-	uint32_t elba = gpt[72] | gpt[73] << 8;
+	uint32_t nent = data[80] | data[81] << 8 | data[82] << 16, esz = data[84] | data[85] << 8;
+	uint32_t elba = data[72] | data[73] << 8;
 	con_hex2("UFS GPT", "entries=", nent, "lba=", elba);
-	if (esz != 128 || nent > 128)
+	if (esz == 128 && nent <= 128)
+		list_partitions(elba, nent);
+	/* 16 MiB from the start of LUN0 in 32 KiB commands. */
+	uint64_t t0 = ticks();
+	for (uint32_t lba = 0; lba < 4096; lba += NPRDT)
+		if (read_blocks(lba, NPRDT, data)) {
+			con_str("UFS SPEED", "read error");
+			return;
+		}
+	uint64_t us = (ticks() - t0) / (TICKS_1S / 1000000u);
+	con_hex2("UFS SPEED", "16MiB_us=", (uint32_t)us, "KiB/s=", (uint32_t)(16384ULL * 1000000u / (us ? us : 1)));
+}
+#endif
+
+int ufs_ready;
+
+/*
+ * ABL powers the UFS down before handing over; bring it back up the way
+ * Linux does and leave it operational for xnu (bsd/dev/husky_ufs.c), which
+ * takes over the transfer request list: host enabled, link in HS-G4 (PWM if
+ * the power mode change fails), device initialised, auto-hibern8 off,
+ * no request outstanding. Read-only: no SCSI WRITE exists in this file.
+ */
+void ufs_bringup(void)
+{
+	con_str("UFS", "bring-up v18: CAL link + HS-G4 for xnu");
+	phy_iso_release();
+	abl_mclk_rate();
+	/* Requests held or host clocks stopped would leave a doorbell pending forever. */
+	vs_wr(VS_REQ_HOLD_EN, 0);
+	vs_wr(VS_CLKSTOP_CTRL, vs_rd(VS_CLKSTOP_CTRL) & ~0x1fu);
+	ufs_wr(REG_IS, ufs_rd(REG_IS));
+	int r = host_reset_and_link();
+	con_hex("UFS LINK result", (uint32_t)r);
+	if (r)
 		return;
-	list_partitions(elba, nent);
+	r = ufs_hs_mode();
+	con_hex("UFS HS result", (uint32_t)r);
+	if (r) {
+		/* A failed power mode change can leave the link unusable: start over in PWM. */
+		r = host_reset_and_link();
+		con_hex("UFS PWM relink", (uint32_t)r);
+		if (r)
+			return;
+	}
+	ufs_wr(REG_AHIT, 0);
+	if (ufs_tur())
+		return;
+#ifdef UFSPROBE
+	ufs_report();
+#endif
+	ufs_wr(REG_IS, ufs_rd(REG_IS));
+	ufs_ready = 1;
+	con_str("UFS", "ready for xnu");
 }
