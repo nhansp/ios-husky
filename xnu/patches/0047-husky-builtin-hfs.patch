@@ -1,0 +1,349 @@
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index fab9506..dbe3e23 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -51,6 +51,15 @@ HUSKY_PTHREAD_INC = -I$(HUSKY_PTHREAD_ROOT) -I$(HUSKY_PTHREAD_ROOT)/private -I$(
+ husky_pthread_init.o_INCFLAGS = $(HUSKY_PTHREAD_INC)
+ husky_pthread_support.o_INCFLAGS = $(HUSKY_PTHREAD_INC)
+ husky_pthread_synch.o_INCFLAGS = $(HUSKY_PTHREAD_INC)
++
++# Apple OSS HFS built in (bsd/husky_hfs): compiled like the kext, see husky_hfs_compat.h.
++# The compat header must come after the kernel's -D options, hence _CFLAGS_ADD.
++HUSKY_HFS_ROOT = $(SRCROOT)/bsd/husky_hfs
++HUSKY_HFS_OBJS = BTree.o BTreeAllocate.o BTreeMiscOps.o BTreeNodeOps.o BTreeNodeReserve.o BTreeScanner.o BTreeTreeOps.o BTreeWrapper.o CatalogUtilities.o FileExtentMapping.o FileIDsServices.o MacOSStubs.o UnicodeWrappers.o VolumeAllocation.o hfs_attrlist.o hfs_btreeio.o hfs_catalog.o hfs_chash.o hfs_cnode.o hfs_cprotect.o hfs_endian.o hfs_extents.o hfs_fsinfo.o hfs_hotfiles.o hfs_journal.o hfs_link.o hfs_lookup.o hfs_notification.o hfs_quota.o hfs_readwrite.o hfs_resize.o hfs_search.o hfs_vfsops.o hfs_vfsutils.o hfs_vnops.o hfs_xattr.o rangelist.o hfs_encodinghint.o hfs_encodings.o husky_hfs_iokit.o
++$(foreach o,$(HUSKY_HFS_OBJS),$(eval $(o)_CFLAGS_ADD += -include $(HUSKY_HFS_ROOT)/husky_hfs_compat.h -I$(HUSKY_HFS_ROOT) -I$(HUSKY_HFS_ROOT)/core))
++# HFSEncodings is a separate kext on Apple with its own allocation counter.
++hfs_encodings.o_CFLAGS_ADD += -Dhfs_allocated=hfs_encodings_allocated
++hfs_encodinghint.o_CFLAGS_ADD += -Dhfs_allocated=hfs_encodings_allocated
+ endif
+ 
+ #
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9af2659..f79c27c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -387,6 +387,48 @@ bsd/pthread/husky_pthread_synch.c	standard
+ bsd/pthread/pthread_priority.c		standard
+ bsd/pthread/pthread_workqueue.c		standard
+ 
++# Apple OSS hfs-715.120.4, staged by xnu/patches/0047-stage-hfs.sh
++bsd/husky_hfs/core/BTree.c		optional husky_hfs
++bsd/husky_hfs/core/BTreeAllocate.c		optional husky_hfs
++bsd/husky_hfs/core/BTreeMiscOps.c		optional husky_hfs
++bsd/husky_hfs/core/BTreeNodeOps.c		optional husky_hfs
++bsd/husky_hfs/core/BTreeNodeReserve.c		optional husky_hfs
++bsd/husky_hfs/core/BTreeScanner.c		optional husky_hfs
++bsd/husky_hfs/core/BTreeTreeOps.c		optional husky_hfs
++bsd/husky_hfs/core/BTreeWrapper.c		optional husky_hfs
++bsd/husky_hfs/core/CatalogUtilities.c		optional husky_hfs
++bsd/husky_hfs/core/FileExtentMapping.c		optional husky_hfs
++bsd/husky_hfs/core/FileIDsServices.c		optional husky_hfs
++bsd/husky_hfs/core/MacOSStubs.c		optional husky_hfs
++bsd/husky_hfs/core/UnicodeWrappers.c		optional husky_hfs
++bsd/husky_hfs/core/VolumeAllocation.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_attrlist.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_btreeio.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_catalog.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_chash.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_cnode.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_cprotect.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_endian.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_extents.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_fsinfo.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_hotfiles.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_journal.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_link.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_lookup.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_notification.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_quota.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_readwrite.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_resize.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_search.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_vfsops.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_vfsutils.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_vnops.c		optional husky_hfs
++bsd/husky_hfs/core/hfs_xattr.c		optional husky_hfs
++bsd/husky_hfs/core/rangelist.c		optional husky_hfs
++bsd/husky_hfs/hfs_encodings/hfs_encodinghint.c		optional husky_hfs
++bsd/husky_hfs/hfs_encodings/hfs_encodings.c		optional husky_hfs
++bsd/husky_hfs/husky_hfs_iokit.c		optional husky_hfs
++
+ bsd/kern/bsd_init.c			standard
+ ./init_sysent.c				standard
+ bsd/kern/kdebug_common.c		standard
+diff --git a/bsd/husky_hfs/husky_hfs_compat.h b/bsd/husky_hfs/husky_hfs_compat.h
+new file mode 100644
+index 0000000..4edcd85
+--- /dev/null
++++ b/bsd/husky_hfs/husky_hfs_compat.h
+@@ -0,0 +1,36 @@
++/*
++ * Compile Apple's HFS kext sources inside HUSKY the way the kext is built
++ * (ported from ios-sweet 0026): with the kext (KPI) view of the kernel
++ * headers, and with only HFS's own kext-config.h deciding features. The
++ * kernel's -DCONFIG_* options are not visible to a kext build, so the ones
++ * HFS tests are cleared first. HUSKY has no AppleKeyStore, so content
++ * protection stays off.
++ */
++#ifndef HUSKY_HFS_COMPAT_H
++#define HUSKY_HFS_COMPAT_H
++#undef BSD_KERNEL_PRIVATE
++#undef XNU_KERNEL_PRIVATE
++#undef CONFIG_PROTECT
++#undef CONFIG_SEARCHFS
++#undef CONFIG_HFS_DIRLINK
++#undef CONFIG_SECLUDED_RENAME
++#undef CONFIG_MACF
++#undef CONFIG_HFS_RBTREE
++#undef QUOTA
++#undef NAMEDSTREAMS
++#undef FIFO
++#undef HFS_COMPRESSION
++#include "core/kext-config.h"
++
++/*
++ * HUSKY is VMAPPLE-class with CONFIG_PV_TICKET, so kern/locks.h declares
++ * lck_init_pv() __startup_func; that macro comes from kern/startup.h's
++ * XNU_KERNEL_PRIVATE view, which this kext view does not have (as 0043).
++ */
++#ifndef __startup_func
++#define __startup_func
++#endif
++
++/* Built in, not a loadable kext (see husky_hfs_iokit.c). */
++#define OSKextGetCurrentLoadTag husky_hfs_current_load_tag
++#endif
+diff --git a/bsd/husky_hfs/husky_hfs_iokit.c b/bsd/husky_hfs/husky_hfs_iokit.c
+new file mode 100644
+index 0000000..e2d6a2b
+--- /dev/null
++++ b/bsd/husky_hfs/husky_hfs_iokit.c
+@@ -0,0 +1,132 @@
++/*
++ * Built-in replacement for HFS's IOKit glue (core/hfs_iokit.cpp and
++ * hfs_encodings/hfs_encodings_kext.cpp) on HUSKY, ported from ios-sweet 0026.
++ *
++ * On Apple platforms HFS is a kext: IOKit matches its IOService on
++ * IOResources and start() registers the filesystem. HUSKY links HFS into
++ * the kernel instead, so bsd_init calls husky_hfs_register() right after
++ * vfsinit(), before the root filesystem is mounted. The registration is the
++ * kext's start() sequence.
++ *
++ * The helpers that query IOKit storage keep their answers for HUSKY, which
++ * has no IOStorageFamily and therefore no IOMedia objects: nothing is
++ * ejectable and no media carries an external journal. The platform expert
++ * publishes no serial number. Content protection (AppleKeyStore) is not
++ * built (husky_hfs_compat.h).
++ */
++#include <libkern/OSKextLib.h>
++#include <pexpert/pexpert.h>
++#include <sys/sysctl.h>
++
++#include "hfs.h"
++#include "hfs_cnode.h"
++#include "hfs_dbg.h"
++#include "hfs_iokit.h"
++#include "hfs_encodings/hfs_encodings_internal.h"
++
++#ifndef panic_on_assert
++bool panic_on_assert;
++#endif
++
++#if DEBUG
++bool hfs_corruption_panics = true;
++#endif
++
++extern struct vnodeopv_desc hfs_vnodeop_opv_desc;
++extern struct vnodeopv_desc hfs_specop_opv_desc;
++extern struct vnodeopv_desc hfs_fifoop_opv_desc;
++extern struct vfsops hfs_vfsops;
++
++void husky_hfs_register(void);
++
++static vfstable_t husky_hfs_vfs_handle;
++
++void
++husky_hfs_register(void)
++{
++#ifndef panic_on_assert
++	panic_on_assert = PE_i_can_has_kernel_configuration() & kPEICanHasAssertions;
++#endif
++
++#if DEBUG
++	PE_parse_boot_argn("hfs_corruption_panics", &hfs_corruption_panics, sizeof(hfs_corruption_panics));
++#endif
++
++	/* The HFSEncodings kext's start(): its converters must exist before any mount. */
++	hfs_converterinit();
++
++	struct vnodeopv_desc *op_descs[] = {
++		&hfs_vnodeop_opv_desc,
++		&hfs_specop_opv_desc,
++#if FIFO
++		&hfs_fifoop_opv_desc,
++#endif
++	};
++
++#ifndef VFS_TBLVNOP_SECLUDE_RENAME
++#define VFS_TBLVNOP_SECLUDE_RENAME 0
++#endif
++
++	struct vfs_fsentry vfe = {
++		.vfe_vfsops = &hfs_vfsops,
++		.vfe_vopcnt = sizeof(op_descs) / sizeof(op_descs[0]),
++		.vfe_opvdescs = op_descs,
++		.vfe_fsname = "hfs",
++		.vfe_flags = (VFS_TBLNOTYPENUM | VFS_TBLLOCALVOL | VFS_TBLREADDIR_EXTENDED
++		    | VFS_TBL64BITREADY | VFS_TBLVNOP_PAGEOUTV2 | VFS_TBLVNOP_PAGEINV2
++		    | VFS_TBLTHREADSAFE | VFS_TBLCANMOUNTROOT | VFS_TBLVNOP_SECLUDE_RENAME
++		    | VFS_TBLNATIVEXATTR)
++	};
++
++	int ret = vfs_fsadd(&vfe, &husky_hfs_vfs_handle);
++	if (ret) {
++		panic("HUSKY HFS: vfs_fsadd failed: %d", ret);
++	}
++
++	hfs_init_zones();
++	hfs_sysctl_register();
++
++	uint32_t num_cpus;
++	size_t sz = sizeof(num_cpus);
++
++	if (sysctlbyname("hw.physicalcpu", &num_cpus, &sz, NULL, 0) == 0) {
++		if ((2 * num_cpus) > MAX_CACHED_ORIGINS_DEFAULT) {
++			_hfs_max_origins = 2 * num_cpus;
++			_hfs_max_file_origins = 2 * num_cpus;
++		} else if ((2 * num_cpus) > MAX_CACHED_FILE_ORIGINS_DEFAULT) {
++			_hfs_max_file_origins = 2 * num_cpus;
++		}
++	}
++
++	printf("HUSKY HFS: hfs-715.120.4 registered\n");
++}
++
++/* Built in, not a loadable kext: there is no kext to retain per mount. */
++OSKextLoadTag
++husky_hfs_current_load_tag(void)
++{
++	return kOSKextInvalidLoadTag;
++}
++
++int
++hfs_is_ejectable(__unused const char *cdev_name)
++{
++	return 0;
++}
++
++void
++hfs_iterate_media_with_content(__unused const char *content_uuid_cstring,
++    __unused int (*func)(const char *bsd_name, const char *uuid_str, void *arg),
++    __unused void *arg)
++{
++}
++
++kern_return_t
++hfs_get_platform_serial_number(char *serial_number_str, uint32_t len)
++{
++	if (len < 1) {
++		return 0;
++	}
++	serial_number_str[0] = '\0';
++	return KERN_NOT_SUPPORTED;
++}
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 0823297..c138ca4 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -705,6 +705,12 @@ bsd_init(void)
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
+ 
++#if HUSKY_HFS
++	/* HFS is built in on HUSKY: register it like its kext would, before mounting root. */
++	extern void husky_hfs_register(void);
++	husky_hfs_register();
++#endif
++
+ #if CONFIG_PROC_UUID_POLICY
+ 	/* Initial proc_uuid_policy subsystem */
+ 	bsd_init_kprintf("calling proc_uuid_policy_init()\n");
+@@ -951,9 +957,20 @@ bsd_init(void)
+ 		if (require_rootauth) {
+ 			/* enforce sealedness */
+ 			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++			/*
++			 * HUSKY has no chain of trust to extend: the kernel itself is
++			 * booted unsigned with no Image4, and its HFS root cannot be a
++			 * sealed volume. Report it instead of panicking.
++			 */
++			if (autherr) {
++				printf("HUSKY: root volume is not authenticated (error %d); continuing unsealed\n", autherr);
++			}
++#else
+ 			if (autherr) {
+ 				panic("rootvp not authenticated after mounting");
+ 			}
++#endif
+ 		}
+ 	}
+ 
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+index 5b038ca..994d08a 100644
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -137,6 +137,9 @@
+ #include <os/atomic_private.h>
+ #if defined(XNU_TARGET_OS_OSX)
+ #include <console/video_console.h>
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include <pexpert/pexpert.h>         /* PE_parse_boot_argn() for rootrw */
++#endif
+ #endif
+ 
+ #ifdef CONFIG_IOCOUNT_TRACE
+@@ -1250,6 +1253,18 @@ vfs_mountroot(void)
+ 
+ 		mp = vfs_rootmountalloc_internal(vfsp, "root_device");
+ 		mp->mnt_devvp = rootvp;
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++		/*
++		 * HUSKY has no data volume: /private/var lives on the root, so
++		 * boot-arg rootrw=1 mounts it read-write from the start.
++		 */
++		{
++			uint32_t rootrw = 0;
++			if (PE_parse_boot_argn("rootrw", &rootrw, sizeof(rootrw)) && rootrw) {
++				mp->mnt_flag &= ~MNT_RDONLY;
++			}
++		}
++#endif
+ 
+ 		if (vfsp->vfc_mountroot) {
+ 			error = (*vfsp->vfc_mountroot)(mp, rootvp, ctx);
+diff --git a/config/MASTER b/config/MASTER
+index 1b97480..b8177ae 100644
+--- a/config/MASTER
++++ b/config/MASTER
+@@ -112,6 +112,7 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
+ #	4.4 filesystems
+ #
+ options		MOCKFS		# Boot from an executable	# <mockfs>
++options		HUSKY_HFS	# Built-in Apple OSS HFS (HUSKY)	# <husky_hfs>
+ options		FIFO		# fifo support			# <fifo>
+ options		FDESC		# fdesc_fs support		# <fdesc>
+ options		DEVFS		# devfs support			# <devfs>
+diff --git a/config/MASTER.arm64.husky b/config/MASTER.arm64.husky
+index 67c74a5..e0f05c0 100644
+--- a/config/MASTER.arm64.husky
++++ b/config/MASTER.arm64.husky
+@@ -31,7 +31,7 @@
+ #  BSD_RELEASE =    [ BSD_BASE ]
+ #  BSD_DEV =        [ BSD_BASE config_vnguard ]
+ #  BSD_DEBUG =      [ BSD_BASE config_vnguard ]
+-#  FILESYS_BASE =   [ devfs fdesc fifo fs_compression config_protect config_mnt_rootsnap config_rosv_startup config_mount_vm config_mount_prebootrecovery config_basesystemroot config_fse quota namedstreams config_imgsrc_access config_triggers config_ext_resolver config_searchfs config_volfs config_appledouble nullfs config_mnt_suid config_firmlinks config_dataless_files config_union_mounts config_file_leases ]
++#  FILESYS_BASE =   [ devfs fdesc fifo husky_hfs fs_compression config_protect config_mnt_rootsnap config_rosv_startup config_mount_vm config_mount_prebootrecovery config_basesystemroot config_fse quota namedstreams config_imgsrc_access config_triggers config_ext_resolver config_searchfs config_volfs config_appledouble nullfs config_mnt_suid config_firmlinks config_dataless_files config_union_mounts config_file_leases ]
+ #  FILESYS_RELEASE= [ FILESYS_BASE ]
+ #  FILESYS_DEV =    [ FILESYS_BASE config_iocount_trace ]
+ #  FILESYS_DEBUG =  [ FILESYS_BASE config_iocount_trace ]

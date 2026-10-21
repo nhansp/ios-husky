@@ -1,0 +1,742 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index f176775..9af2659 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -103,6 +103,7 @@ bsd/dev/dtrace/fasttrap.c		optional config_dtrace
+ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
++bsd/dev/husky_ufs.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/husky_ufs.c b/bsd/dev/husky_ufs.c
+new file mode 100644
+index 0000000..b527788
+--- /dev/null
++++ b/bsd/dev/husky_ufs.c
+@@ -0,0 +1,667 @@
++/*
++ * HUSKY internal UFS root device.
++ *
++ * ABL powers the UFS down before the handoff; the shim (shim/ufs.c) brings
++ * the zuma UFSHCI back up with Samsung's CAL, switches the link to HS-G4,
++ * initialises the device and reports it in the device tree (/husky-ufs
++ * husky,link-ready). This driver takes over that live host: it points the
++ * transfer request list at its own memory (verifying the host took it before
++ * ringing any doorbell) and issues polled SCSI commands, one at a time, to
++ * LUN 0.
++ *
++ * The disk is a window of one GPT partition (/husky-ufs root-partition,
++ * boot-arg ufsroot= overrides): Android's f2fs keeps the partition's first
++ * root-offset bytes and the last log-size bytes are reserved for a persistent
++ * console log, so the window starts at root-offset and ends log-size before
++ * the partition does. It is exposed as the BSD disk ufsroot0 (rufsroot0),
++ * with 512-byte logical sectors over the device's 4 KiB blocks. Root on it
++ * with rd=ufsroot0.
++ *
++ * All DMA goes through one physically contiguous allocation below 4 GiB
++ * (descriptors and a 1 MiB bounce buffer), with caches cleaned/invalidated
++ * around each command. Exynos hosts cap a PRDT entry at 4 KiB (the shim sets
++ * HCI_{TX,RX}PRDT_ENTRY_SIZE = 12) and want HCI_UTRL_NEXUS_TYPE set for SCSI
++ * slots.
++ *
++ * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
++ * against the window again right before it is issued, so nothing outside it
++ * (Android's data, the rest of the disk) can be written.
++ */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define REG_CAP         0x00
++#define REG_IS          0x20
++#define REG_IE          0x24
++#define REG_HCS         0x30
++#define REG_HCE         0x34
++#define REG_UTRLBA      0x50
++#define REG_UTRLBAU     0x54
++#define REG_UTRLDBR     0x58
++#define REG_UTRLCLR     0x5c
++#define REG_UTRLRSR     0x60
++#define VS_UTRL_NEXUS_TYPE      (0x1100 + 0x40)         /* Exynos vendor HCI */
++
++#define HCS_DP          (1u << 0)
++#define HCS_UTRLRDY     (1u << 1)
++#define CAP_64AS        (1u << 24)              /* 64-bit DMA addressing */
++
++#define UFS_BLOCK       4096u
++#define BOUNCE_SIZE     (1u << 20)
++#define PRDT_CHUNK      4096u                   /* Exynos: 4 KiB per PRDT entry */
++#define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
++#define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
++
++struct utrd {
++	uint32_t dw0, dw1, dw2, dw3;
++	uint32_t ucdba, ucdbau;
++	uint32_t resp;          /* [31:16] response UPIU offset, [15:0] length, DWORDs */
++	uint32_t prdt;          /* [31:16] PRDT offset (DWORDs), [15:0] entries */
++};
++
++struct ucd {
++	uint8_t cmd[512];
++	uint8_t resp[512];
++	struct {
++		uint32_t addr_lo, addr_hi, rsvd, dbc;
++	} prdt[PRDT_MAX];
++};
++
++/* Layout of the contiguous DMA allocation. */
++#define DMA_UTRL        0x0000                  /* 1 KiB aligned */
++#define DMA_UCD         0x1000                  /* 128 byte aligned, 5 KiB */
++#define DMA_BOUNCE      0x4000
++#define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
++
++static struct {
++	vm_offset_t regs;
++	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
++	uint64_t dma_pa;
++	uint8_t lun;
++	uint8_t tag;
++	uint64_t first_block, nblocks;          /* window, in 4 KiB device blocks */
++	uint64_t log_block, log_blocks;         /* reserved tail of the partition */
++	uint32_t secsize;                       /* logical sector size for the BSD layer */
++	bool writable;                          /* boot-arg ufsrw=1 */
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready;
++} hu;
++
++static LCK_GRP_DECLARE(husky_ufs_grp, "husky_ufs");
++static LCK_MTX_DECLARE(husky_ufs_lock, &husky_ufs_grp);
++
++static inline uint32_t
++ufs_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(hu.regs + off);
++}
++
++static inline void
++ufs_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(hu.regs + off) = v;
++}
++
++static void
++dma_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(hu.dma_pa + off), len, TRUE);
++}
++
++/*
++ * One SCSI command in slot 0, data (if any) to/from the bounce buffer
++ * (to the device when write is set). Returns 0 or an errno.
++ */
++static int
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	struct utrd *utrd = (struct utrd *)(hu.dma + DMA_UTRL);
++	struct ucd *ucd = (struct ucd *)(hu.dma + DMA_UCD);
++	uint64_t ucd_pa = hu.dma_pa + DMA_UCD, bounce_pa = hu.dma_pa + DMA_BOUNCE;
++	uint32_t nprdt = 0;
++
++	assert(len <= BOUNCE_SIZE);
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, offsetof(struct ucd, prdt));
++
++	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
++	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
++	ucd->cmd[2] = hu.lun;
++	ucd->cmd[3] = ++hu.tag;
++	ucd->cmd[12] = (uint8_t)(len >> 24);
++	ucd->cmd[13] = (uint8_t)(len >> 16);
++	ucd->cmd[14] = (uint8_t)(len >> 8);
++	ucd->cmd[15] = (uint8_t)len;
++	memcpy(&ucd->cmd[16], cdb, cdb_len);
++
++	/* DD: 1 = memory to device, 2 = device to memory. */
++	utrd->dw0 = (1u << 28) | ((len ? (write ? 1u : 2u) : 0u) << 25) | (1u << 24);
++	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	if (len) {
++		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, nprdt++) {
++			uint32_t chunk = MIN(PRDT_CHUNK, len - done);
++			ucd->prdt[nprdt].addr_lo = (uint32_t)(bounce_pa + done);
++			ucd->prdt[nprdt].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
++			ucd->prdt[nprdt].rsvd = 0;
++			ucd->prdt[nprdt].dbc = chunk - 1;
++		}
++		utrd->prdt = (1024u / 4) << 16 | nprdt;
++	}
++
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, (uint32_t)offsetof(struct ucd, prdt) + nprdt * (uint32_t)sizeof(ucd->prdt[0]));
++	if (len) {
++		dma_sync(DMA_BOUNCE, len);
++	}
++	__builtin_arm_dsb(0xf);
++
++	ufs_wr(REG_UTRLDBR, 1);
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (ufs_rd(REG_UTRLDBR) & 1) {
++		if (mach_absolute_time() > deadline) {
++			ufs_wr(REG_UTRLCLR, ~1u);       /* Exynos: write 0 to clear the slot */
++			printf("HUSKY UFS: command 0x%02x timed out\n", cdb[0]);
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
++
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, (uint32_t)offsetof(struct ucd, prdt));
++	if (len && !write) {
++		dma_sync(DMA_BOUNCE, len);
++	}
++
++	uint32_t ocs = utrd->dw2 & 0xff;
++	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
++		printf("HUSKY UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
++		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		return EIO;
++	}
++	return 0;
++}
++
++/* READ(10) of count device blocks at lba into the bounce buffer. */
++static int
++ufs_read_blocks(uint64_t lba, uint32_t count)
++{
++	if (count == 0 || lba + count - 1 > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
++		return EINVAL;
++	}
++	uint8_t cdb[10] = {
++		0x28, 0,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
++}
++
++/*
++ * WRITE(10) of count device blocks from the bounce buffer to lba. The range
++ * must lie inside the window (or, for the log, inside the reserved tail):
++ * this is the only place data goes out.
++ */
++static int
++ufs_write_blocks(uint64_t lba, uint32_t count, bool log)
++{
++	uint64_t first = log ? hu.log_block : hu.first_block;
++	uint64_t n = log ? hu.log_blocks : hu.nblocks;
++	if (!hu.writable || !n || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
++	    lba < first || lba - first >= n || count > n - (lba - first) ||
++	    lba + count - 1 > UINT32_MAX) {
++		printf("HUSKY UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
++		return EPERM;
++	}
++	uint8_t cdb[10] = {
++		0x2a, 0,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
++}
++
++static int
++ufs_sync_cache(void)
++{
++	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
++	return ufs_scsi(cdb, sizeof(cdb), 0, false);
++}
++
++/* Partition bounds (4 KiB blocks) of the GPT entry named want on LUN 0. */
++static int
++ufs_find_partition(const char *want, uint64_t *firstp, uint64_t *countp)
++{
++	const uint8_t *b = (const uint8_t *)(hu.dma + DMA_BOUNCE);
++	int error = ufs_read_blocks(1, 1);
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("HUSKY UFS: LUN %u has no GPT\n", hu.lun);
++		return ENXIO;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++		printf("HUSKY UFS: unsupported GPT entries %u x %u\n", nent, esz);
++		return ENXIO;
++	}
++	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	if (error) {
++		return error;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t first, last;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		if (last < first) {
++			return ENXIO;
++		}
++		*firstp = first;
++		*countp = last - first + 1;
++		return 0;
++	}
++	printf("HUSKY UFS: no GPT partition named \"%s\"\n", want);
++	return ENOENT;
++}
++
++static int
++ufs_take_over_host(void)
++{
++	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
++	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
++		printf("HUSKY UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
++		return ENXIO;
++	}
++	if (ufs_rd(REG_UTRLDBR)) {
++		printf("HUSKY UFS: requests outstanding from the shim\n");
++		return EBUSY;
++	}
++	if (((hu.dma_pa + DMA_SIZE - 1) >> 32) && !(ufs_rd(REG_CAP) & CAP_64AS)) {
++		printf("HUSKY UFS: DMA memory at 0x%llx but the host has no 64-bit addressing\n",
++		    hu.dma_pa);
++		return ENXIO;
++	}
++	ufs_wr(REG_IE, 0);                      /* polled operation */
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	ufs_wr(REG_UTRLRSR, 0);
++	uint64_t list = hu.dma_pa + DMA_UTRL;
++	ufs_wr(REG_UTRLBA, (uint32_t)list);
++	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
++	ufs_wr(REG_UTRLRSR, 1);
++	ufs_wr(VS_UTRL_NEXUS_TYPE, ufs_rd(VS_UTRL_NEXUS_TYPE) | 1u);   /* slot 0: SCSI */
++	/* Never ring a doorbell unless the host uses our list. */
++	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
++	    !(ufs_rd(REG_UTRLRSR) & 1)) {
++		printf("HUSKY UFS: host did not take our request list\n");
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++husky_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!hu.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !hu.writable) ? EROFS : 0;
++}
++
++static int
++husky_ufs_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++husky_ufs_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * hu.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t win_bytes = hu.nblocks * UFS_BLOCK;
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (!rd && !hu.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > win_bytes || count > win_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&husky_ufs_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / UFS_BLOCK;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++		void *bounce = (void *)(hu.dma + DMA_BOUNCE);
++		if (rd) {
++			error = ufs_read_blocks(hu.first_block + lba, blocks);
++			if (!error) {
++				memcpy(vaddr + done, (const char *)bounce + skip, want);
++			}
++		} else {
++			/* Partial device blocks at either end: read, merge, write back. */
++			if (skip || ((skip + want) % UFS_BLOCK)) {
++				error = ufs_read_blocks(hu.first_block + lba, blocks);
++			}
++			if (!error) {
++				memcpy((char *)bounce + skip, vaddr + done, want);
++				error = ufs_write_blocks(hu.first_block + lba, blocks, false);
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&husky_ufs_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++husky_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = hu.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > UFS_BLOCK || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		hu.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = UFS_BLOCK;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = hu.nblocks * UFS_BLOCK / hu.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = hu.writable;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE: {
++		if (!hu.writable) {
++			return 0;
++		}
++		lck_mtx_lock(&husky_ufs_lock);
++		int error = ufs_sync_cache();
++		lck_mtx_unlock(&husky_ufs_lock);
++		return error;
++	}
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = BOUNCE_SIZE / hu.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = hu.writable ? BOUNCE_SIZE / hu.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++husky_ufs_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return husky_ufs_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++husky_ufs_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return husky_ufs_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++husky_ufs_psize(__unused dev_t dev)
++{
++	return hu.ready ? (int)MIN(hu.nblocks * UFS_BLOCK / hu.secsize, INT_MAX) : -1;
++}
++
++static int
++husky_ufs_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(husky_ufs_strategy, NULL, dev, B_READ, minphys, uio, (int)hu.secsize);
++}
++
++static int
++husky_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!hu.writable) {
++		return EROFS;
++	}
++	return physio(husky_ufs_strategy, NULL, dev, B_WRITE, minphys, uio, (int)hu.secsize);
++}
++
++static const struct bdevsw husky_ufs_bdevsw = {
++	.d_open     = husky_ufs_open,
++	.d_close    = husky_ufs_close,
++	.d_strategy = husky_ufs_strategy,
++	.d_ioctl    = husky_ufs_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = husky_ufs_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw husky_ufs_cdevsw = {
++	.d_open       = husky_ufs_open,
++	.d_close      = husky_ufs_close,
++	.d_read       = husky_ufs_read,
++	.d_write      = husky_ufs_write,
++	.d_ioctl      = husky_ufs_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static bool
++dt_u64(DTEntry node, const char *name, uint64_t *val)
++{
++	void const *prop;
++	unsigned int size;
++	if (SecureDTGetProperty(node, name, &prop, &size) != kSuccess || size != sizeof(uint64_t)) {
++		return false;
++	}
++	memcpy(val, prop, sizeof(*val));
++	return true;
++}
++
++static int
++husky_ufs_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	char const *part = NULL;
++	unsigned int size = 0;
++	char want[64] = "userdata";
++	uint64_t link_ready = 0, root_off = 0, log_size = 0;
++	int error;
++
++	if (SecureDTLookupEntry(NULL, "/husky-ufs", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("HUSKY UFS: no /husky-ufs node in the device tree\n");
++		return ENXIO;
++	}
++	if (!dt_u64(node, "husky,link-ready", &link_ready) || !link_ready) {
++		printf("HUSKY UFS: the shim did not bring the UFS link up\n");
++		return ENXIO;
++	}
++	if (SecureDTGetProperty(node, "root-partition", (void const **)&part, &size) == kSuccess && size) {
++		strlcpy(want, part, MIN(sizeof(want), size));
++	}
++	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	(void)dt_u64(node, "root-offset", &root_off);
++	(void)dt_u64(node, "log-size", &log_size);
++	if ((root_off | log_size) % UFS_BLOCK) {
++		printf("HUSKY UFS: root-offset/log-size not 4 KiB aligned\n");
++		return EINVAL;
++	}
++	uint32_t rw = 0;
++	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
++
++	hu.regs = ml_io_map(reg[0], reg[1]);
++	/* Below 4 GiB, so the host never needs 64-bit addressing. */
++	if (kmem_alloc_contig(kernel_map, &hu.dma, DMA_SIZE, PAGE_MASK,
++	    (ppnum_t)atop_64(1ULL << 32) - 1, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("HUSKY UFS: no contiguous DMA memory\n");
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)hu.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	hu.dma_pa = ptoa_64(pn);
++	hu.lun = 0;
++	hu.secsize = DEV_BSIZE;
++
++	uint64_t first = 0, count = 0;
++	lck_mtx_lock(&husky_ufs_lock);
++	error = ufs_take_over_host();
++	if (!error) {
++		static const uint8_t tur[6] = { 0x00 };
++		/* The first command after the shim may report a unit attention. */
++		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		}
++	}
++	if (!error) {
++		error = ufs_find_partition(want, &first, &count);
++	}
++	lck_mtx_unlock(&husky_ufs_lock);
++	if (error) {
++		return error;
++	}
++	uint64_t off_blocks = root_off / UFS_BLOCK, log_blocks = log_size / UFS_BLOCK;
++	if (off_blocks + log_blocks >= count) {
++		printf("HUSKY UFS: \"%s\" (%llu MiB) too small for offset %llu MiB + log %llu MiB\n",
++		    want, count * UFS_BLOCK >> 20, root_off >> 20, log_size >> 20);
++		return ENOSPC;
++	}
++	hu.first_block = first + off_blocks;
++	hu.nblocks = count - off_blocks - log_blocks;
++	hu.log_block = first + count - log_blocks;
++	hu.log_blocks = log_blocks;
++
++	hu.bmajor = bdevsw_add(-1, &husky_ufs_bdevsw);
++	if (hu.bmajor < 0) {
++		return ENXIO;
++	}
++	hu.cmajor = cdevsw_add_with_bdev(-1, &husky_ufs_cdevsw, hu.bmajor);
++	if (hu.cmajor < 0) {
++		return ENXIO;
++	}
++	hu.bdev = makedev(hu.bmajor, 0);
++	devfs_make_node(hu.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
++	devfs_make_node(makedev(hu.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
++	/* Only now, with the window bounds known, can writes be allowed. */
++	hu.writable = (rw != 0);
++	hu.ready = true;
++	printf("HUSKY UFS: \"%s\" +%llu MiB on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
++	    want, root_off >> 20, hu.lun, hu.first_block, hu.nblocks * UFS_BLOCK >> 20,
++	    hu.writable ? "read-write" : "read-only", hu.dma_pa);
++	return 0;
++}
++
++/* Root device for rd=ufsroot0 (IOFindBSDRoot). */
++int husky_ufs_rootdev(dev_t *dev);
++
++int
++husky_ufs_rootdev(dev_t *dev)
++{
++	if (!hu.ready) {
++		int error = husky_ufs_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = hu.bdev;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index 6824ed8..beff02f 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -5396,7 +5396,9 @@ IOService::publishHiddenMedia(IOService * parent)
+ 	bool                wasHiding;
+ 
+ 	iomediaClass = OSMetaClass::getMetaClassWithName(gIOMediaKey);
++#if !defined(ARM64_BOARD_CONFIG_HUSKY)
+ 	assert(iomediaClass);
++#endif
+ 
+ 	LOCKWRITENOTIFY();
+ 	wasHiding = gIOServiceHideIOMedia;
+@@ -5405,6 +5407,13 @@ IOService::publishHiddenMedia(IOService * parent)
+ 	}
+ 	UNLOCKNOTIFY();
+ 
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	/* HUSKY has no IOStorageFamily: without the IOMedia class no media exists to unhide. */
++	if (!iomediaClass) {
++		wasHiding = false;
++	}
++#endif
++
+ 	FindRootMediaContext ctx = { .services = NULL, .parent = parent };
+ 
+ 	if (wasHiding) {
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 2bbd161..64d7671 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -795,6 +795,24 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++//
++//	HUSKY: root on a window of a GPT partition of the internal UFS (bsd/dev/husky_ufs.c)
++//
++	if (strcmp(rdBootVar, "ufsroot0") == 0) {
++		extern int husky_ufs_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int ufs_error = husky_ufs_rootdev(root);
++		if (ufs_error) {
++			panic("IOFindBSDRoot: HUSKY UFS root %s unavailable: %d", rdBootVar, ufs_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
++
+ //
+ //	Now check if we are trying to root on a memory device
+ //
