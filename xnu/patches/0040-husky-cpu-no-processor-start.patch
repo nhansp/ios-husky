@@ -1,0 +1,21 @@
+diff --git a/iokit/Kernel/arm/HuskyCPU.cpp b/iokit/Kernel/arm/HuskyCPU.cpp
+index 45985e8..c635262 100644
+--- a/iokit/Kernel/arm/HuskyCPU.cpp
++++ b/iokit/Kernel/arm/HuskyCPU.cpp
+@@ -188,11 +188,11 @@ HuskyCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		HuskyCPU *cpu = __atomic_load_n(&husky_cpus[i], __ATOMIC_ACQUIRE);
+-		kern_return_t kr = processor_start(cpu->machProcessor);
+-		if (kr != KERN_SUCCESS) {
+-			panic("HUSKY CPU: cpu=%u processor_start failed: %d", i, kr);
+-		}
+-		/* processor_start() is asynchronous for secondaries. */
++		/*
++		 * No processor_start(): ml_processor_register() already booted
++		 * this processor (it fails with KERN_FAILURE for a running one).
++		 * Secondaries come up asynchronously; wait for their self-SGI.
++		 */
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !husky_cpu_signal_is_enabled(i)) {
