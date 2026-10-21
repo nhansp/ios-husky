@@ -19,6 +19,7 @@
 #include "console.h"
 #include "fdt.h"
 #include "loader.h"
+#include "ufs.h"
 
 #define PSCI_VERSION		0x84000000UL
 #define PSCI_SYSTEM_RESET	0x84000009UL
@@ -207,6 +208,9 @@ void shim_main(uint64_t dtb, uint64_t entry_el)
 	 * returns on error; log it and reset so Android comes back up.
 	 */
 	stage = "load";
+#ifdef UFSPROBE
+	test_ufs();
+#endif
 	con_str("HUSKY", "loading xnu");
 	con_str("LOADER", loader_boot(dtb));
 	reset(5);

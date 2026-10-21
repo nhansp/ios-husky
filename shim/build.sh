@@ -15,9 +15,12 @@ CPPFLAGS=""
 # NOSIGN=1: loader leaves arm64e auth fixups unsigned (pairs with the kernel's
 # HUSKY PAC-off bring-up build).
 [ "${NOSIGN:-}" = 1 ] && CPPFLAGS="$CPPFLAGS -DHUSKY_NO_PAC_SIGN"
+# UFSPROBE=1: read-only probe of the UFS host ABL left running (shim/ufs.c),
+# logged to pmsg before the xnu handoff.
+[ "${UFSPROBE:-}" = 1 ] && CPPFLAGS="$CPPFLAGS -DUFSPROBE"
 # -march=armv8.3-a: loader.c signs arm64e auth pointers with pacia/pacib/pacda/pacdb.
 CFLAGS="$CPPFLAGS -O2 -ffreestanding -nostdlib -fno-pic -march=armv8.3-a -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
-SRCS="start.S shim.c console.c fdt.c pac.S loader.c"
+SRCS="start.S shim.c console.c fdt.c pac.S loader.c ufs.c"
 mkdir -p out
 objs=()
 for f in $SRCS; do
