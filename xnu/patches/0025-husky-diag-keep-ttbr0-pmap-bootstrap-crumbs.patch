@@ -1,0 +1,120 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 032626e..07a88f1 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2245,6 +2245,9 @@ pmap_bootstrap(
+ {
+ 	vm_map_offset_t maxoffset;
+ 
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pb: enter\n"); }
++#endif
+ 	lck_grp_init(&pmap_lck_grp, "pmap", LCK_GRP_ATTR_NULL);
+ 	lck_attr_setdefault(&pmap_lck_rw_attr);
+ 	pmap_lck_rw_attr.lck_attr_val |= LCK_ATTR_RW_NO_SLEEP;
+@@ -2298,9 +2301,18 @@ pmap_bootstrap(
+ 	kernel_pmap->hw_asid = 0;
+ 	kernel_pmap->sw_asid = 0;
+ 
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pb: kernel_pmap init\n"); }
++#endif
+ 	pmap_lock_init(kernel_pmap);
+ 
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pb: lock ok\n"); }
++#endif
+ 	pmap_max_asids = pmap_compute_max_asids();
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pb: max_asids ok\n"); }
++#endif
+ #if HAS_16BIT_ASID
+ 	asid_chunk_size = MAX_HW_ASIDS;
+ #else
+@@ -2330,11 +2342,17 @@ pmap_bootstrap(
+ 	 * space for these data structures.
+ 	 */
+ 	pmap_data_bootstrap();
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pb: data_bootstrap ok\n"); }
++#endif
+ 
+ 	/**
+ 	 * Bootstrap any necessary SART data structures and values needed from the device tree.
+ 	 */
+ 	sart_bootstrap();
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pb: sart ok\n"); }
++#endif
+ 
+ 	/**
+ 	 * Don't make any assumptions about the alignment of avail_start before this
+@@ -2364,6 +2382,9 @@ pmap_bootstrap(
+ 	virtual_space_start = vstart;
+ 	virtual_space_end = VM_MAX_KERNEL_ADDRESS;
+ 
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pb: tables zeroed\n"); }
++#endif
+ 	bitmap_full(&asid_bitmap[0], pmap_max_asids);
+ #if !HAS_16BIT_ASID
+ 	bitmap_full(&asid_plru_bitmap[0], MAX_HW_ASIDS);
+@@ -2415,6 +2436,9 @@ pmap_bootstrap(
+ 	 * this is important.
+ 	 */
+ 	avail_start = round_page(avail_start);
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("    pb: exit\n"); }
++#endif
+ }
+ 
+ #if XNU_MONITOR
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 7534b4c..b007e5d 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2259,9 +2259,20 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: pre ttbr0-invalidate\n"); }
+ #endif
+ 
++#if defined(HUSKY)
++	/*
++	 * Bring-up: keep the bootstrap V=P TTBR0 (it lives in __BOOTDATA, intact
++	 * until arm_vm_prot_finalize) so husky_vp_bc can log until ml_io_map
++	 * works after pmap_bootstrap. Nothing uses TTBR0 before user pmaps.
++	 */
++#else
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
++#endif
+ 
+ 	flush_mmu_tlb();
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: off bootstrap tables (ttbr1)\n"); }
++#endif
+ 	kva_active = TRUE;
+ 	// global table pointers may need to be different due to physical aperture remapping
+ 	cpu_tte = (tt_entry_t*)(phystokv(cpu_ttep));
+@@ -2297,6 +2308,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ 	/* Calculate the number of pages that belong to the kernelcache. */
+ 	vm_page_kernelcache_count = (unsigned int) (atop_64(arm_vm_kernelcache_phys_end - arm_vm_kernelcache_phys_start));
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: pre auxkc\n"); }
++#endif
+ 
+ 	if (arm_vm_auxkc_init()) {
+ 		if (segLOWESTROAuxKC < segLOWESTRO) {
+@@ -2357,9 +2371,13 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+         arm_vm_map(cpu_tte, cur, ARM_PTE_EMPTY);
+     }
+ #endif
++#endif
++#if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: pre pmap_bootstrap\n"); }
+ #endif
+ 	pmap_bootstrap(dynamic_memory_begin);
+ #if defined(HUSKY)
++	{ extern void husky_vp_bc(const char *); husky_vp_bc("  avi: post pmap_bootstrap (vp)\n"); }
+ 	/* ml_io_map works now; husky_vp_bc would fault (TTBR0 invalidated above). */
+ 	{ extern void husky_early_bc(const char *); husky_early_bc("  avi: pmap_bootstrap ok\n"); }
+ #endif
