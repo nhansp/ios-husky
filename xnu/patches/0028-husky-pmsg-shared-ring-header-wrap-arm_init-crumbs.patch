@@ -1,0 +1,280 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index f01702d..1b6de04 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -355,40 +355,60 @@ arm_auxkc_init(void *mh, void *base)
+ void husky_vp_bc(const char *s);
+ /* TTBR0 at the first crumb: the bootstrap V=P tables this path relies on. */
+ uint64_t husky_vp_ttbr0;
++
++#define HUSKY_RING_PA	0xfd5ff000UL
++#define HUSKY_RING_SIG	0x43474244U
++#define HUSKY_RING_CAP	(0x200000U - 12U)	/* pmsg zone minus header */
++
++/* Refetch a line from RAM (clean+invalidate). */
++static inline void
++husky_vp_civac(uintptr_t a)
++{
++	__asm__ volatile ("dc civac, %0; dsb sy" :: "r" (a) : "memory");
++}
++
++/* Push a line to PoC so pstore sees it after a reset. */
++static inline void
++husky_vp_cvac(uintptr_t a)
++{
++	__asm__ volatile ("dc cvac, %0; dsb sy" :: "r" (a) : "memory");
++}
++
+ void
+ husky_vp_bc(const char *s)
+ {
+ 	volatile struct { uint32_t sig, start, size; uint8_t data[]; } *p =
+-	    (void *)0xfd5ff000UL;
++	    (void *)HUSKY_RING_PA;
+ 	if (husky_vp_ttbr0 == 0) {
+ 		__asm__ volatile ("mrs %0, TTBR0_EL1" : "=r" (husky_vp_ttbr0));
+ 	}
+ 	/*
+-	 * The ring is also written through Device mappings (pe_serial's console),
+-	 * so drop any stale cached copy before reading the header or merging bytes
+-	 * into partly-written lines.
++	 * This alias is cacheable, but the ring is also written through Device
++	 * mappings (pe_serial) and read from RAM by pstore after the reset. So
++	 * refetch each line before touching it and clean it to PoC after. The
++	 * header in RAM is the only write position; wrap like Linux's
++	 * persistent_ram (start = next write, size = valid bytes).
+ 	 */
+-	for (uintptr_t a = 0xfd5ff000UL; a < 0xfd5ff000UL + 12 + 0x3000U; a += 64) {
+-		__asm__ volatile ("dc civac, %0" :: "r" (a) : "memory");
+-	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	if (p->sig != 0x43474244U || p->size > 0x3000U) {
+-		p->sig = 0x43474244U;
++	husky_vp_civac(HUSKY_RING_PA);
++	if (p->sig != HUSKY_RING_SIG || p->size > HUSKY_RING_CAP || p->start >= HUSKY_RING_CAP) {
++		p->sig = HUSKY_RING_SIG;
+ 		p->start = 0;
+ 		p->size = 0;
+ 	}
+-	uint32_t pos = p->size;
+-	while (*s && pos < 0x3000U) {
+-		p->data[pos++] = (uint8_t)*s++;
+-	}
+-	p->start = pos;
+-	p->size = pos;
+-	/* The ring is mapped cacheable here, so clean to PoC or a watchdog reset
+-	 * loses the writes before pstore reads physical RAM. */
+-	for (uintptr_t a = 0xfd5ff000UL; a < 0xfd5ff000UL + 12 + pos; a += 64) {
+-		__asm__ volatile ("dc cvac, %0" :: "r" (a) : "memory");
++	uint32_t start = p->start, size = p->size;
++	while (*s) {
++		uintptr_t a = (uintptr_t)&p->data[start];
++		husky_vp_civac(a);
++		p->data[start] = (uint8_t)*s++;
++		husky_vp_cvac(a);
++		start = (start + 1 == HUSKY_RING_CAP) ? 0 : start + 1;
++		if (size < HUSKY_RING_CAP) {
++			size++;
++		}
+ 	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
++	p->start = start;
++	p->size = size;
++	husky_vp_cvac(HUSKY_RING_PA);
+ }
+ 
+ /* "<label>=0x<16 hex digits>\n" through husky_vp_bc. */
+@@ -680,8 +700,8 @@ arm_init(
+ 	arm_vm_init(xmaxmem, args);
+ 
+ #if defined(HUSKY)
+-	/* arm_vm_init invalidated TTBR0, so husky_vp_bc (V=P) would fault here; use
+-	 * ml_io_map-based husky_early_bc only. */
++	/* husky_early_bc takes the V=P path while TTBR0 keeps the bootstrap
++	 * tables, ml_io_map once it does not. */
+ 	extern void husky_early_bc(const char *s);
+ 	husky_early_bc("arm_init: arm_vm_init done\n");
+ #endif
+@@ -748,10 +768,19 @@ arm_init(
+ 		(void)switch_to_serial_console(); /* Switch into serial mode from video console */
+ 		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
+ 	}
++#if defined(HUSKY)
++	husky_early_bc("arm_init: serial mode done\n");
++#endif
+ 	PE_create_console();
++#if defined(HUSKY)
++	husky_early_bc("arm_init: PE_create_console ok\n");
++#endif
+ 
+ 	/* setup console output */
+ 	PE_init_printf(FALSE);
++#if defined(HUSKY)
++	husky_early_bc("arm_init: PE_init_printf ok\n");
++#endif
+ 
+ #if __arm64__
+ #if DEBUG
+@@ -760,11 +789,20 @@ arm_init(
+ #endif
+ 
+ 	cpu_machine_idle_init(TRUE);
++#if defined(HUSKY)
++	husky_early_bc("arm_init: cpu_machine_idle_init ok\n");
++#endif
+ 
+ 	PE_init_platform(TRUE, &BootCpuData);
++#if defined(HUSKY)
++	husky_early_bc("arm_init: PE_init_platform(vm) ok\n");
++#endif
+ 
+ 	/* Initialize the debug infrastructure system-wide and on the local core. */
+ 	pe_arm_debug_init_early(&BootCpuData);
++#if defined(HUSKY)
++	husky_early_bc("arm_init: pe_arm_debug_init_early ok\n");
++#endif
+ 
+ #if __arm64__
+ 	extern bool cpu_config_correct;
+@@ -773,14 +811,23 @@ arm_init(
+ 	}
+ 
+ 	ml_map_cpu_pio();
++#if defined(HUSKY)
++	husky_early_bc("arm_init: ml_map_cpu_pio ok\n");
++#endif
+ 
+ #if APPLE_ARM64_ARCH_FAMILY
+ 	configure_late_apple_regs(true);
+ #endif
++#if defined(HUSKY)
++	husky_early_bc("arm_init: late apple regs ok\n");
++#endif
+ 
+ #endif
+ 
+ 	cpu_timebase_init(TRUE);
++#if defined(HUSKY)
++	husky_early_bc("arm_init: cpu_timebase_init ok\n");
++#endif
+ 
+ #if KPERF
+ 	/* kptimer_curcpu_up() must be called after cpu_timebase_init */
+@@ -788,11 +835,20 @@ arm_init(
+ #endif /* KPERF */
+ 
+ 	PE_init_cpu();
++#if defined(HUSKY)
++	husky_early_bc("arm_init: PE_init_cpu ok\n");
++#endif
+ #if __arm64__
+ 	apt_msg_init();
+ 	apt_msg_init_cpu();
++#endif
++#if defined(HUSKY)
++	husky_early_bc("arm_init: apt_msg ok\n");
+ #endif
+ 	fiq_context_init(TRUE);
++#if defined(HUSKY)
++	husky_early_bc("arm_init: fiq_context_init ok\n");
++#endif
+ 
+ 
+ #if HIBERNATION
+@@ -811,6 +867,9 @@ arm_init(
+ 	 * against string vulnerabilities
+ 	 */
+ 	__stack_chk_guard &= ~(0xFFULL << 8);
++#if defined(HUSKY)
++	husky_early_bc("arm_init: machine_startup\n");
++#endif
+ 	machine_startup(args);
+ }
+ 
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index ad50ac8..d983281 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -815,9 +815,29 @@ struct husky_prz {
+ };
+ 
+ static volatile struct husky_prz *husky_prz;
+-static uint32_t husky_pmsg_pos;
+ #define HUSKY_PMSG_CAP		(HUSKY_PMSG_SIZE - sizeof(struct husky_prz))
+ 
++/*
++ * Append one byte. The header in RAM is the only write position, shared with
++ * the shim and the V=P breadcrumbs; wraps like Linux's persistent_ram
++ * (start = next write, size = valid bytes) so the newest output survives.
++ */
++static void
++husky_ring_putc(volatile struct husky_prz *z, uint8_t c)
++{
++	if (z->sig != HUSKY_PMSG_SIG || z->size > HUSKY_PMSG_CAP || z->start >= HUSKY_PMSG_CAP) {
++		z->sig = HUSKY_PMSG_SIG;
++		z->start = 0;
++		z->size = 0;
++	}
++	uint32_t start = z->start, size = z->size;
++	z->data[start] = c;
++	z->start = (start + 1 == HUSKY_PMSG_CAP) ? 0 : start + 1;
++	if (size < HUSKY_PMSG_CAP) {
++		z->size = size + 1;
++	}
++}
++
+ /*
+  * husky bring-up breadcrumb usable from early C (arm_init/arm_vm_init), once
+  * the VM is far enough along for ml_io_map (i.e. from just after arm_vm_init).
+@@ -844,35 +864,16 @@ husky_early_bc(const char *s)
+ 	}
+ 	if (husky_bc_prz == NULL) {
+ 		husky_bc_prz = (volatile struct husky_prz *)ml_io_map(HUSKY_PMSG_PHYS, HUSKY_PMSG_SIZE);
+-		if (husky_bc_prz->sig != HUSKY_PMSG_SIG || husky_bc_prz->size > HUSKY_PMSG_CAP) {
+-			husky_bc_prz->sig = HUSKY_PMSG_SIG;
+-			husky_bc_prz->start = 0;
+-			husky_bc_prz->size = 0;
+-		}
+ 	}
+-	uint32_t pos = husky_bc_prz->size;
+-	while (*s && pos < HUSKY_PMSG_CAP) {
+-		husky_bc_prz->data[pos++] = (uint8_t)*s++;
++	while (*s) {
++		husky_ring_putc(husky_bc_prz, (uint8_t)*s++);
+ 	}
+-	husky_bc_prz->start = pos;
+-	husky_bc_prz->size = pos;
+ }
+ 
+ static void
+ husky_pmsg_init(void)
+ {
+-	if (husky_prz == NULL) {
+-		return;
+-	}
+-	/* Continue after the shim's log if the zone is already a valid ring. */
+-	if (husky_prz->sig == HUSKY_PMSG_SIG && husky_prz->size <= HUSKY_PMSG_CAP) {
+-		husky_pmsg_pos = husky_prz->size;
+-	} else {
+-		husky_prz->sig = HUSKY_PMSG_SIG;
+-		husky_pmsg_pos = 0;
+-		husky_prz->start = 0;
+-		husky_prz->size = 0;
+-	}
++	/* Nothing to do: every write re-reads the ring header (husky_ring_putc). */
+ }
+ 
+ static unsigned int
+@@ -887,11 +888,7 @@ husky_pmsg_transmit_data(uint8_t c)
+ 	if (husky_prz == NULL) {
+ 		return;
+ 	}
+-	if (husky_pmsg_pos < HUSKY_PMSG_CAP) {
+-		husky_prz->data[husky_pmsg_pos++] = c;
+-	}
+-	husky_prz->start = husky_pmsg_pos;
+-	husky_prz->size = husky_pmsg_pos;
++	husky_ring_putc(husky_prz, c);
+ }
+ 
+ static unsigned int
