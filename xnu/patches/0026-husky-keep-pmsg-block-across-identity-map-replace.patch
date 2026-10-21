@@ -1,0 +1,29 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index b007e5d..fe5e0e2 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -880,8 +880,24 @@ arm_replace_identity_map(void)
+ 	bzero(l1_ptp_virt, ARM_PGBYTES);
+ 	*tte1 = ARM_TTE_BOOT_TABLE | (l2_ptp_phys & ARM_TTE_TABLE_MASK);
+ 
++#if defined(HUSKY)
++	/*
++	 * Bring-up: start.s put the pmsg ring's 32MB V=P block (0xfc000000) in
++	 * this L2. Carry it across the wipe, or husky_vp_bc only keeps working off
++	 * a stale TLB entry until the next flush.
++	 */
++	const vm_offset_t husky_pmsg_blk = 0xfc000000UL;
++	const boolean_t husky_keep = L1_TABLE_T1_INDEX(husky_pmsg_blk, TCR_EL1_BOOT) == L1_TABLE_T1_INDEX(paddr, TCR_EL1_BOOT) &&
++	    L2_TABLE_INDEX(husky_pmsg_blk) != L2_TABLE_INDEX(paddr);
++	const tt_entry_t husky_pmsg_tte = husky_keep ? l2_ptp_virt[L2_TABLE_INDEX(husky_pmsg_blk)] : 0;
++#endif
+ 	bzero(l2_ptp_virt, ARM_PGBYTES);
+ 	*tte2 = ARM_TTE_BOOT_TABLE | (l3_ptp_phys & ARM_TTE_TABLE_MASK);
++#if defined(HUSKY)
++	if (husky_keep) {
++		l2_ptp_virt[L2_TABLE_INDEX(husky_pmsg_blk)] = husky_pmsg_tte;
++	}
++#endif
+ 
+ 	*ptep = (paddr & ARM_PTE_MASK) |
+ 	    ARM_PTE_TYPE_VALID |
