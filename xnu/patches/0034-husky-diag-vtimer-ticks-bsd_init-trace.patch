@@ -1,0 +1,71 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index ffe7ce0..0823297 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -498,7 +498,11 @@ bsd_init(void)
+ 	check_for_failure_injection(XNU_STAGE_BSD_INIT_START);
+ #endif
+ 
++#if defined(HUSKY)
++#define DEBUG_BSDINIT 1 /* bring-up: trace bsd_init over the pmsg console */
++#else
+ #define DEBUG_BSDINIT 0
++#endif
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index e8f184d..0e10660 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3020,6 +3020,11 @@ sleh_irq(arm_saved_state_t *state)
+ 	}
+ 	sleh_interrupt_handler_prologue(state, intid == 27 ? DBG_INTR_TYPE_TIMER : DBG_INTR_TYPE_OTHER);
+ 	if (intid == 27) {
++		/* Bring-up: prove the vtimer IRQ path is live. */
++		static uint64_t husky_ticks;
++		if ((husky_ticks++ & 1023) == 0) {
++			kprintf("husky: vtimer IRQ #%llu\n", husky_ticks);
++		}
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		ml_interrupt_masked_debug_start(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+@@ -3095,6 +3100,14 @@ sleh_fiq(arm_saved_state_t *state)
+ 
+ 	sleh_interrupt_handler_prologue(state, type);
+ 
++#if defined(HUSKY)
++	/* Group 0 belongs to EL3 here; a FIQ reaching EL1 is unexpected. */
++	static bool husky_fiq_seen;
++	if (!husky_fiq_seen) {
++		husky_fiq_seen = true;
++		kprintf("husky: unexpected FIQ (type %u)\n", type);
++	}
++#endif
+ #if APPLEVIRTUALPLATFORM
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR0_EL1");
+ #endif
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index c977c98..89b4c36 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -903,6 +903,9 @@ kernel_bootstrap_thread(void)
+ #ifdef  IOKIT
+ 	kernel_bootstrap_log("PE_lockdown_iokit");
+ 	PE_lockdown_iokit();
++#if defined(HUSKY)
++	kernel_bootstrap_log("PE_lockdown_iokit done");
++#endif
+ #endif
+ 	/*
+ 	 * max_cpus must be nailed down by the time PE_lockdown_iokit() finishes,
+@@ -919,6 +922,9 @@ kernel_bootstrap_thread(void)
+ 	 *	Start the user bootstrap.
+ 	 */
+ #ifdef  MACH_BSD
++#if defined(HUSKY)
++	kernel_bootstrap_log("bsd_init");
++#endif
+ 	bsd_init();
+ #endif
+ 
