@@ -257,6 +257,7 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	    ocs_out, status_out);
 }
 
+#ifdef UFSPROBE
 static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
 {
 	uint8_t cdb[10] = { 0x28, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, count >> 8, count, 0 };
@@ -272,7 +273,6 @@ static uint64_t le64(const uint8_t *p)
 	return v;
 }
 
-#ifdef UFSPROBE
 /* One line per GPT entry of at least 64 MiB: name, first LBA, size in MiB (4K blocks). */
 static void list_partitions(uint32_t entry_lba, uint32_t nent)
 {
