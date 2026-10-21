@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/HuskyWatchdog.cpp b/iokit/Kernel/arm/HuskyWatchdog.cpp
 new file mode 100644
-index 0000000..4dc6cdf
+index 0000000..ea817be
 --- /dev/null
 +++ b/iokit/Kernel/arm/HuskyWatchdog.cpp
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,147 @@
 +/*
 + * Built-in IOWatchdog for HUSKY (ported from ios-sweet 0040/0045).
 + *
@@ -20,6 +20,12 @@ index 0000000..4dc6cdf
 + * the IOService with IOPMUPrimary = 1 and crashes when there is none
 + * (customer builds ignore -wdt_no_pmu). HUSKY has no Apple PMU, so this
 + * service carries IOPMUPrimary and accepts property writes.
++ *
++ * The real Tensor watchdogs (s3c2410-style, zuma DT watchdog_cl0/cl1) are
++ * left armed by ABL and reset the phone ~120 s into every boot. While the
++ * kernel is healthy a thread call reloads each enabled one every few
++ * seconds (WTCNT = WTDAT); a hung or panicked kernel still gets reset back
++ * to Android, which is how its logs are read.
 + */
 +#include <pexpert/arm64/board_config.h>
 +
@@ -30,6 +36,33 @@ index 0000000..4dc6cdf
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOMemoryDescriptor.h>
 +#include <sys/proc.h>
++#include <kern/thread_call.h>
++#include <kern/clock.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define HUSKY_WDT_KICK_SECS     5
++#define WTCON                   0x0             /* bit5 enable */
++#define WTDAT                   0x4             /* reload value */
++#define WTCNT                   0x8             /* current count */
++
++static const vm_offset_t husky_wdt_phys[] = { 0x10060000, 0x10070000 };
++static volatile uint32_t *husky_wdt_regs[2];
++static thread_call_t husky_wdt_call;
++
++static void
++husky_wdt_kick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	for (unsigned int i = 0; i < 2; i++) {
++		volatile uint32_t *r = husky_wdt_regs[i];
++		if (r != NULL && (r[WTCON / 4] & (1u << 5))) {
++			r[WTCNT / 4] = r[WTDAT / 4];
++		}
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(HUSKY_WDT_KICK_SECS, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(husky_wdt_call, deadline);
++}
 +
 +class IOWatchdog : public IOService {
 +	OSDeclareDefaultStructors(IOWatchdog);
@@ -56,7 +89,13 @@ index 0000000..4dc6cdf
 +	setProperty(kIOUserClientClassKey, "IOWatchdogUserClient");
 +	setProperty("IOPMUPrimary", 1ULL, 32);
 +	registerService();
-+	IOLog("HUSKY WDT: IOWatchdog registered (accepts check-ins, never fires)\n");
++	for (unsigned int i = 0; i < 2; i++) {
++		husky_wdt_regs[i] = (volatile uint32_t *)ml_io_map(husky_wdt_phys[i], 0x100);
++	}
++	husky_wdt_call = thread_call_allocate_with_priority(husky_wdt_kick, NULL, THREAD_CALL_PRIORITY_KERNEL);
++	husky_wdt_kick(NULL, NULL);
++	IOLog("HUSKY WDT: IOWatchdog registered; kicking Tensor WDT0 con 0x%x WDT1 con 0x%x every %us\n",
++	    husky_wdt_regs[0][WTCON / 4], husky_wdt_regs[1][WTCON / 4], HUSKY_WDT_KICK_SECS);
 +	return true;
 +}
 +

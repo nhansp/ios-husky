@@ -208,6 +208,18 @@ void shim_main(uint64_t dtb, uint64_t entry_el)
 	 * sign its arm64e auth pointers, and jump to xnu. loader_boot only
 	 * returns on error; log it and reset so Android comes back up.
 	 */
+	/*
+	 * Tensor watchdogs (s3c2410-style, zuma DT watchdog_cl0/cl1): ABL leaves
+	 * one armed and nothing in xnu kicks it, which resets the phone ~120 s
+	 * into every boot. Log their state (read-only): WTCON bit5 = enable,
+	 * bit0 = reset enable, [15:8] prescaler, [4:3] divider; WTDAT reload,
+	 * WTCNT current count.
+	 */
+	con_hex2("WDT0", "con=", rd32(0x10060000), "dat=", rd32(0x10060004));
+	con_hex2("WDT0", "cnt=", rd32(0x10060008), "cnt'=", rd32(0x10060008));
+	con_hex2("WDT1", "con=", rd32(0x10070000), "dat=", rd32(0x10070004));
+	con_hex2("WDT1", "cnt=", rd32(0x10070008), "cnt'=", rd32(0x10070008));
+
 	stage = "load";
 	ufs_bringup();
 #ifdef FBPROBE
