@@ -163,7 +163,9 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
     gic = node('gic', [
         ph(),
         ('compatible', cstr('arm,gic-v3')),
-        ('interrupt-controller', b''),
+        # pe_arm_map_interrupt_controller looks the PIC up by this value; without
+        # it pe_arm_init_interrupts bails before ml_init_timebase.
+        ('interrupt-controller', cstr('master')),
         ('virtual-timer-intid', u32(VTIMER_INTID)),
         ('reg', u64(GICD - SOC_BASE, GICD_SIZE, GICR - SOC_BASE, GICR_SIZE)),
     ])
@@ -175,6 +177,11 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
         ('#size-cells', u32(2)),
         ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
     ], [gic,
+        # pe_arm_map_interrupt_controller also requires a device_type "timer"
+        # node and maps its reg, but arm64 uses the architected timer and never
+        # touches it; point it at the GICD page so the mapping is harmless.
+        node('timer', [ph(), ('device_type', cstr('timer')),
+                       ('reg', u64(GICD - SOC_BASE, 0x4000))]),
         # husky,pmsg-console: pe_serial.c routes the kernel console into the
         # ramoops pmsg zone (0xfd5ff000); 'defaults' serial-device selects it.
         node('serial0', [('AAPL,phandle', u32(serial_phandle)),
