@@ -1,19 +1,20 @@
 diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
-index dfb3a45..f06e815 100644
+index dfb3a45..364f781 100644
 --- a/bsd/kern/kern_proc.c
 +++ b/bsd/kern/kern_proc.c
-@@ -4193,6 +4193,21 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+@@ -4193,6 +4193,22 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
  		break;
  	}
  out:
 +#if defined(ARM64_BOARD_CONFIG_HUSKY)
 +	/*
-+	 * HUSKY diagnostic: entitlement queries (usermanagerd verifying its XPC
-+	 * clients, ...). The first 200 are logged with their result.
++	 * HUSKY diagnostic: entitlement queries about another process
++	 * (usermanagerd verifying its XPC clients, ...). The first 400 are logged
++	 * with their result.
 +	 */
-+	if (ops == CS_OPS_ENTITLEMENTS_BLOB || ops == CS_OPS_DER_ENTITLEMENTS_BLOB) {
++	if ((ops == CS_OPS_ENTITLEMENTS_BLOB || ops == CS_OPS_DER_ENTITLEMENTS_BLOB) && !forself) {
 +		static int husky_csops_logged;
-+		if (os_atomic_inc_orig(&husky_csops_logged, relaxed) < 200) {
++		if (os_atomic_inc_orig(&husky_csops_logged, relaxed) < 400) {
 +			char caller[32];
 +			proc_selfname(caller, sizeof(caller));
 +			printf("HUSKY csops: %s -> pid %d (%s) op %d err %d csflags 0x%x\n", caller, pid,
