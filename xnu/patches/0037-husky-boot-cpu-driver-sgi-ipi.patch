@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/HuskyCPU.cpp b/iokit/Kernel/arm/HuskyCPU.cpp
 new file mode 100644
-index 0000000..704d9c3
+index 0000000..501d500
 --- /dev/null
 +++ b/iokit/Kernel/arm/HuskyCPU.cpp
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,167 @@
 +/*
 + * Single-CPU bring-up for husky using XNU's legacy IOCPU interface, ported
 + * from ios-sweet's SweetCPU. A kernelcache registers processors from a CPU
@@ -20,6 +20,7 @@ index 0000000..704d9c3
 +#include <libkern/c++/OSData.h>
 +#include <libkern/c++/OSNumber.h>
 +#include <arm64/proc_reg.h>
++#include <machine/atomic.h>
 +#include <kern/processor.h>
 +
 +class HuskyCPU : public IOCPU {
@@ -197,10 +198,21 @@ index 66056f4..e620c4d 100644
  iokit/Kernel/arm/HuskyPlatformExpert.cpp						optional iokitcpp
 +iokit/Kernel/arm/HuskyCPU.cpp							optional iokitcpp
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 0e10660..d5c1db3 100644
+index 0e10660..ebd1d72 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -3010,16 +3010,16 @@ sleh_irq(arm_saved_state_t *state)
+@@ -281,6 +281,10 @@ extern void arm64_thread_exception_return(void) __dead2;
+ void cpu_signal_handler(void);
+ extern unsigned int gFastIPI;
+ #endif /* defined(HAS_IPI) */
++#if defined(HUSKY) && !defined(HAS_IPI)
++/* HUSKY routes GIC SGIs to the cross-CPU signal handler in sleh_irq. */
++void cpu_signal_handler(void);
++#endif
+ 
+ static arm_saved_state64_t *original_faulting_state = NULL;
+ 
+@@ -3010,16 +3014,16 @@ sleh_irq(arm_saved_state_t *state)
  
  #if defined(HUSKY)
  	/*
@@ -221,7 +233,7 @@ index 0e10660..d5c1db3 100644
  		/* Bring-up: prove the vtimer IRQ path is live. */
  		static uint64_t husky_ticks;
  		if ((husky_ticks++ & 1023) == 0) {
-@@ -3029,10 +3029,25 @@ sleh_irq(arm_saved_state_t *state)
+@@ -3029,10 +3033,25 @@ sleh_irq(arm_saved_state_t *state)
  		ml_interrupt_masked_debug_start(rtclock_intr, DBG_INTR_TYPE_TIMER);
  		rtclock_intr(TRUE);
  		ml_interrupt_masked_debug_end();
