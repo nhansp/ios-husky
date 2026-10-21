@@ -1,0 +1,247 @@
+diff --git a/libkern/conf/Makefile.template b/libkern/conf/Makefile.template
+index 6ef0911..b6ea01d 100644
+--- a/libkern/conf/Makefile.template
++++ b/libkern/conf/Makefile.template
+@@ -19,6 +19,24 @@ include $(MakeInc_def)
+ CFLAGS+= -include meta_features.h -DLIBKERN_KERNEL_PRIVATE -DOSALLOCDEBUG=1
+ SFLAGS+= -include meta_features.h
+ 
++# Portable BearSSL AES for the HUSKY built-in crypto table (no corecrypto kext).
++ifeq ($(CURRENT_MACHINE_CONFIG),HUSKY)
++HUSKY_AES_ROOT = $(SRCROOT)/libkern/crypto/husky_bearssl
++HUSKY_AES_INC = -I$(HUSKY_AES_ROOT)/inc -I$(HUSKY_AES_ROOT)/src
++husky_aes.o_INCFLAGS = $(HUSKY_AES_INC)
++husky_aes_ct.o_INCFLAGS = $(HUSKY_AES_INC)
++husky_aes_ct_enc.o_INCFLAGS = $(HUSKY_AES_INC)
++husky_aes_ct_dec.o_INCFLAGS = $(HUSKY_AES_INC)
++husky_aes_ct_cbcenc.o_INCFLAGS = $(HUSKY_AES_INC)
++husky_aes_ct_cbcdec.o_INCFLAGS = $(HUSKY_AES_INC)
++husky_aes.o_CFLAGS_ADD += -mgeneral-regs-only
++husky_aes_ct.o_CFLAGS_ADD += -mgeneral-regs-only
++husky_aes_ct_enc.o_CFLAGS_ADD += -mgeneral-regs-only
++husky_aes_ct_dec.o_CFLAGS_ADD += -mgeneral-regs-only
++husky_aes_ct_cbcenc.o_CFLAGS_ADD += -mgeneral-regs-only
++husky_aes_ct_cbcdec.o_CFLAGS_ADD += -mgeneral-regs-only
++endif
++
+ # Runtime support functions don't interact well with LTO (9294679)
+ stack_protector.o_CFLAGS_ADD += $(CFLAGS_NOLTO_FLAG)
+ 
+diff --git a/libkern/conf/files b/libkern/conf/files
+index c4684c2..e79e250 100644
+--- a/libkern/conf/files
++++ b/libkern/conf/files
+@@ -97,6 +97,12 @@ libkern/crypto/corecrypto_sha1.c		optional crypto
+ libkern/crypto/corecrypto_md5.c			optional crypto
+ libkern/crypto/corecrypto_des.c			optional crypto
+ libkern/crypto/corecrypto_aes.c			optional crypto
++libkern/crypto/husky_aes.c	optional crypto
++libkern/crypto/husky_aes_ct.c	optional crypto
++libkern/crypto/husky_aes_ct_enc.c	optional crypto
++libkern/crypto/husky_aes_ct_dec.c	optional crypto
++libkern/crypto/husky_aes_ct_cbcenc.c	optional crypto
++libkern/crypto/husky_aes_ct_cbcdec.c	optional crypto
+ libkern/crypto/corecrypto_aesxts.c		optional crypto
+ libkern/crypto/corecrypto_rand.c		optional crypto
+ libkern/crypto/corecrypto_rsa.c		    optional crypto
+diff --git a/libkern/crypto/husky_aes.c b/libkern/crypto/husky_aes.c
+new file mode 100644
+index 0000000..fc9661d
+--- /dev/null
++++ b/libkern/crypto/husky_aes.c
+@@ -0,0 +1,111 @@
++/*
++ * HUSKY AES CBC/ECB provider (ported from ios-sweet) backed by BearSSL's portable bitslice AES.
++ * Upstream sources and MIT license are staged by 0044-stage-bearssl.sh.
++ * No heap, SIMD or CPU crypto extension is needed. Contexts can be copied:
++ * their only pointer is the immutable BearSSL class descriptor.
++ */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include <libkern/libkern.h>
++#include <libkern/crypto/aes.h>
++#include <corecrypto/ccmode.h>
++#include <corecrypto/cc_error.h>
++#include "husky_bearssl/inc/bearssl_block.h"
++
++_Static_assert(sizeof(br_aes_ct_cbcenc_keys) <= sizeof(aes_encrypt_ctx),
++	"BearSSL encryption context does not fit the XNU AES ABI");
++_Static_assert(sizeof(br_aes_ct_cbcdec_keys) <= sizeof(aes_decrypt_ctx),
++	"BearSSL decryption context does not fit the XNU AES ABI");
++
++static int
++husky_aes_encrypt_init(const struct ccmode_cbc *mode, cccbc_ctx *ctx,
++	size_t key_len, const void *key)
++{
++	(void)mode;
++	if (ctx == NULL) {
++		return CCERR_PARAMETER;
++	}
++	cc_clear(sizeof(br_aes_ct_cbcenc_keys), ctx);
++	if (key == NULL || (key_len != 16 && key_len != 24 && key_len != 32)) {
++		return CCERR_PARAMETER;
++	}
++	br_aes_ct_cbcenc_init((br_aes_ct_cbcenc_keys *)(void *)ctx, key, key_len);
++	return CCERR_OK;
++}
++
++static int
++husky_aes_decrypt_init(const struct ccmode_cbc *mode, cccbc_ctx *ctx,
++	size_t key_len, const void *key)
++{
++	(void)mode;
++	if (ctx == NULL) {
++		return CCERR_PARAMETER;
++	}
++	cc_clear(sizeof(br_aes_ct_cbcdec_keys), ctx);
++	if (key == NULL || (key_len != 16 && key_len != 24 && key_len != 32)) {
++		return CCERR_PARAMETER;
++	}
++	br_aes_ct_cbcdec_init((br_aes_ct_cbcdec_keys *)(void *)ctx, key, key_len);
++	return CCERR_OK;
++}
++
++static int
++husky_aes_check(const void *ctx, const void *iv, size_t nblocks,
++	const void *in, void *out, unsigned rounds)
++{
++	if (ctx == NULL || iv == NULL ||
++		(rounds != 10 && rounds != 12 && rounds != 14)) {
++		return CCERR_PARAMETER;
++	}
++	if (nblocks > SIZE_MAX / 16) {
++		return CCERR_OVERFLOW;
++	}
++	if (nblocks != 0 && (in == NULL || out == NULL)) {
++		return CCERR_PARAMETER;
++	}
++	return CCERR_OK;
++}
++
++static int
++husky_aes_encrypt_cbc(const cccbc_ctx *ctx, cccbc_iv *iv, size_t nblocks,
++	const void *in, void *out)
++{
++	const br_aes_ct_cbcenc_keys *key = (const void *)ctx;
++	int error = husky_aes_check(ctx, iv, nblocks, in, out,
++		key == NULL ? 0 : key->num_rounds);
++	if (error != CCERR_OK || nblocks == 0) {
++		return error;
++	}
++	/* BearSSL is in-place; copy first so both corecrypto API forms work. */
++	memmove(out, in, nblocks * 16);
++	br_aes_ct_cbcenc_run(key, iv, out, nblocks * 16);
++	return CCERR_OK;
++}
++
++static int
++husky_aes_decrypt_cbc(const cccbc_ctx *ctx, cccbc_iv *iv, size_t nblocks,
++	const void *in, void *out)
++{
++	const br_aes_ct_cbcdec_keys *key = (const void *)ctx;
++	int error = husky_aes_check(ctx, iv, nblocks, in, out,
++		key == NULL ? 0 : key->num_rounds);
++	if (error != CCERR_OK || nblocks == 0) {
++		return error;
++	}
++	memmove(out, in, nblocks * 16);
++	br_aes_ct_cbcdec_run(key, iv, out, nblocks * 16);
++	return CCERR_OK;
++}
++
++const struct ccmode_cbc husky_aes_cbc_encrypt = {
++	.size = sizeof(br_aes_ct_cbcenc_keys),
++	.block_size = 16,
++	.init = husky_aes_encrypt_init,
++	.cbc = husky_aes_encrypt_cbc,
++};
++const struct ccmode_cbc husky_aes_cbc_decrypt = {
++	.size = sizeof(br_aes_ct_cbcdec_keys),
++	.block_size = 16,
++	.init = husky_aes_decrypt_init,
++	.cbc = husky_aes_decrypt_cbc,
++};
++#endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/libkern/crypto/husky_aes_ct.c b/libkern/crypto/husky_aes_ct.c
+new file mode 100644
+index 0000000..bab701b
+--- /dev/null
++++ b/libkern/crypto/husky_aes_ct.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0044-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_bearssl/src/symcipher/aes_ct.c"
++#endif
+diff --git a/libkern/crypto/husky_aes_ct_cbcdec.c b/libkern/crypto/husky_aes_ct_cbcdec.c
+new file mode 100644
+index 0000000..e28b336
+--- /dev/null
++++ b/libkern/crypto/husky_aes_ct_cbcdec.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0044-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_bearssl/src/symcipher/aes_ct_cbcdec.c"
++#endif
+diff --git a/libkern/crypto/husky_aes_ct_cbcenc.c b/libkern/crypto/husky_aes_ct_cbcenc.c
+new file mode 100644
+index 0000000..174bba7
+--- /dev/null
++++ b/libkern/crypto/husky_aes_ct_cbcenc.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0044-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_bearssl/src/symcipher/aes_ct_cbcenc.c"
++#endif
+diff --git a/libkern/crypto/husky_aes_ct_dec.c b/libkern/crypto/husky_aes_ct_dec.c
+new file mode 100644
+index 0000000..dc16744
+--- /dev/null
++++ b/libkern/crypto/husky_aes_ct_dec.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0044-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_bearssl/src/symcipher/aes_ct_dec.c"
++#endif
+diff --git a/libkern/crypto/husky_aes_ct_enc.c b/libkern/crypto/husky_aes_ct_enc.c
+new file mode 100644
+index 0000000..c3a5211
+--- /dev/null
++++ b/libkern/crypto/husky_aes_ct_enc.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0044-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include "husky_bearssl/src/symcipher/aes_ct_enc.c"
++#endif
+diff --git a/libkern/crypto/register_crypto.c b/libkern/crypto/register_crypto.c
+index 816f9c7..26e7eac 100644
+--- a/libkern/crypto/register_crypto.c
++++ b/libkern/crypto/register_crypto.c
+@@ -51,7 +51,8 @@ register_crypto_functions(const crypto_functions_t funcs)
+ /*
+  * husky bring-up: the standalone kernel has no corecrypto kext, so nothing
+  * registers g_crypto_funcs and the first crypto_* / SHA* caller faults on it.
+- * Register what xnu's in-tree corecrypto provides (SHA-256/512, HMAC)
++ * Register what xnu's in-tree corecrypto provides (SHA-256/512, HMAC),
++ * portable BearSSL AES-CBC (husky_aes.c)
+  * plus the random hooks over the bring-up PRNG. Everything else stays NULL
+  * until the real corecrypto (kernelcache) replaces this table.
+  */
+@@ -102,6 +103,9 @@ husky_random_kmem_init(crypto_random_ctx_t ctx __unused)
+ {
+ }
+ 
++extern const struct ccmode_cbc husky_aes_cbc_encrypt;
++extern const struct ccmode_cbc husky_aes_cbc_decrypt;
++
+ static struct crypto_functions husky_crypto_funcs;
+ 
+ void husky_register_bringup_crypto(void);
+@@ -118,6 +122,9 @@ husky_register_bringup_crypto(void)
+ 	husky_crypto_funcs.cchmac_update_fn = cchmac_update;
+ 	husky_crypto_funcs.cchmac_final_fn = cchmac_final;
+ 	husky_crypto_funcs.cchmac_fn = cchmac;
++	/* AES (legacy aes_encrypt/decrypt API): BearSSL constant-time, husky_aes.c */
++	husky_crypto_funcs.ccaes_cbc_encrypt = &husky_aes_cbc_encrypt;
++	husky_crypto_funcs.ccaes_cbc_decrypt = &husky_aes_cbc_decrypt;
+ 	husky_crypto_funcs.random_generate_fn = husky_random_generate;
+ 	husky_crypto_funcs.random_uniform_fn = husky_random_uniform;
+ 	husky_crypto_funcs.random_kmem_ctx_size_fn = husky_random_kmem_ctx_size;
