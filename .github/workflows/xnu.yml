@@ -29,6 +29,9 @@ on:
       use_ccache:
         description: route the compiler through ccache (off until the deployment-target interaction is resolved)
         default: "false"
+      incremental:
+        description: reuse the last green run's dxb tree (deps, KDK, xnu objects) via the Actions cache
+        default: "true"
   # Dispatch-only: a push trigger raced every manual dispatch and left a
   # confusing concurrency-cancelled run each time. Build via `gh workflow run`.
 
@@ -43,6 +46,9 @@ env:
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'VMAPPLE' }}
   USE_CCACHE: ${{ inputs.use_ccache || 'false' }}
+  INCREMENTAL: ${{ inputs.incremental || 'true' }}
+  # One rolling entry per (version, config, board); bump v1 to force a cold build.
+  DXB_CACHE_PREFIX: dxb-v1-${{ inputs.macos_version || '26.5' }}-${{ inputs.kernel_config || 'DEVELOPMENT' }}-${{ inputs.machine_config || 'VMAPPLE' }}-
   # ccache gives fast incremental rebuilds across runs (content-addressed, so
   # it survives DXB re-cloning xnu each run, unlike mtime-based object caches).
   CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -59,6 +65,9 @@ jobs:
     # xnu-8796 / Xcode 15. Adjust if the macos-26 image label differs.
     runs-on: macos-26
     timeout-minutes: 150
+    permissions:
+      contents: read
+      actions: write # prune superseded dxb cache entries
     steps:
       - uses: actions/checkout@v4
 
@@ -104,6 +113,49 @@ jobs:
             grep -n 'libHUSKY.os' dxb/build.sh | head
           fi
 
+      # Incremental builds. DXB skips every dependency step whose output is
+      # already in fakeroot/, and build_xnu runs make over the existing
+      # xnu.obj, so restoring the last green run's tree leaves only the kernel
+      # objects our patch changes touch. The Actions cache is private to the
+      # repo and evicts by LRU at 10 GB; a release asset would be public.
+      - name: Restore dxb tree
+        id: dxbcache
+        if: env.INCREMENTAL == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            dxb/xnu
+            dxb/build
+            dxb/fakeroot
+            dxb/venv
+            kdkcache
+          key: ${{ env.DXB_CACHE_PREFIX }}${{ github.run_id }}
+          restore-keys: ${{ env.DXB_CACHE_PREFIX }}
+
+      - name: Prepare incremental tree
+        if: env.INCREMENTAL == 'true'
+        run: |
+          du -sh dxb/xnu dxb/build dxb/fakeroot kdkcache 2>/dev/null || true
+          # The KDK pkg install takes ~1.5 min; a pruned copy rides in the cache.
+          shopt -s nullglob
+          for k in kdkcache/*.kdk; do
+            sudo mkdir -p /Library/Developer/KDKs
+            sudo ln -sfn "$PWD/$k" /Library/Developer/KDKs/
+            echo "KDK from cache: $k"
+          done
+          if [ -d dxb/xnu/.git ]; then
+            # Back to pristine so DXB re-applies the current patch series
+            # (an edited patch would otherwise fail --check and be skipped).
+            git -C dxb/xnu checkout -q -- .
+            git -C dxb/xnu clean -fdqx -e compile_commands.json
+            # Never let a stale kernel be collected, or satisfy build_xnu's
+            # "already built" check.
+            rm -f dxb/build/xnu.obj/kernel.* dxb/fakeroot/System/Library/Kernels/kernel.*
+          fi
+          # After patching, age unchanged sources so make only rebuilds real changes.
+          sed -i '' 's|^    patches$|    patches; bash "'"$GITHUB_WORKSPACE"'/.github/scripts/xnu-mtime-sync.sh" "${WORK_DIR}/xnu" "${BUILD_DIR}/xnu-src.manifest"|' dxb/build.sh
+          grep -n 'xnu-mtime-sync' dxb/build.sh
+
       - name: ccache cache
         if: ${{ (inputs.use_ccache || 'false') == 'true' }}
         uses: actions/cache@v4
@@ -138,6 +190,45 @@ jobs:
           # Tee to a file so a failure step can extract a tiny error report
           # on the runner (the full log is too big for a slow link to pull).
           bash build.sh 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # Only a green tree is saved: the source manifest is written before make
+      # runs, so a failed build's state must never be restored.
+      - name: Stage KDK for cache
+        if: success() && env.INCREMENTAL == 'true'
+        run: |
+          shopt -s nullglob
+          mkdir -p kdkcache
+          for k in /Library/Developer/KDKs/*.kdk; do
+            [ -L "$k" ] && continue # already the cached copy
+            # The build only needs KernelSupport, usr/local, headers and
+            # plists; the shipped kernels and dSYMs are most of the size.
+            rsync -a --exclude 'System/Library/Kernels/' --exclude '*.dSYM' "$k" kdkcache/ \
+              || { echo "KDK staging failed; next run downloads it again"; rm -rf "kdkcache/$(basename "$k")"; }
+          done
+          du -sh kdkcache/* dxb/xnu dxb/build dxb/fakeroot 2>/dev/null || true
+
+      - name: Save dxb tree
+        if: success() && env.INCREMENTAL == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            dxb/xnu
+            dxb/build
+            dxb/fakeroot
+            dxb/venv
+            kdkcache
+          key: ${{ env.DXB_CACHE_PREFIX }}${{ github.run_id }}
+
+      - name: Prune superseded dxb caches
+        if: success() && env.INCREMENTAL == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          KEEP="${DXB_CACHE_PREFIX}${GITHUB_RUN_ID}"
+          gh cache list --key "$DXB_CACHE_PREFIX" --limit 50 --json key --jq '.[].key' \
+            | while read -r k; do [ "$k" = "$KEEP" ] || gh cache delete "$k" || true; done
+          gh cache list --limit 10 || true
 
       - name: Error summary
         if: failure()
