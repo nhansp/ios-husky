@@ -37,16 +37,24 @@ f2fs_blocks=$(adb -s "$SERIAL" exec-out "su -c 'dd if=$data_dev bs=1024 skip=1 c
 (( f2fs_blocks * 4096 <= ROOT_OFFSET )) || { echo "f2fs ($f2fs_blocks blocks) reaches into the iOS region: refusing" >&2; exit 1; }
 
 echo "userdata $part_size B; f2fs ends at $((f2fs_blocks * 4096)); writing $img_size B at $ROOT_OFFSET"
-seek=$(( ROOT_OFFSET / (4 << 20) ))
-adb -s "$SERIAL" exec-in "su -c 'dd of=$DEV bs=4194304 seek=$seek conv=fsync 2>/dev/null'" < "$IMG"
-echo "verifying..."
-want=$(sha256sum "$IMG" | cut -d' ' -f1)
-got=$(su "dd if=$DEV bs=4194304 skip=$seek count=$(( img_size / (4 << 20) )) 2>/dev/null | sha256sum" | cut -d' ' -f1)
-if (( img_size % (4 << 20) )); then
-	echo "(image not a multiple of 4 MiB: verify skipped)"
-elif [[ "$want" == "$got" ]]; then
-	echo "ok: $want"
-else
-	echo "MISMATCH: image $want, device $got" >&2
-	exit 1
-fi
+# Chunked, resumable: a single 20 GiB `adb exec-in` stream was seen to stop
+# silently after ~1.6 GiB. Each 256 MiB chunk is compared by sha256 with the
+# device, written only if it differs, then verified (3 tries).
+CHUNK=$((256 << 20))
+nchunks=$(( (img_size + CHUNK - 1) / CHUNK ))
+for (( c = 0; c < nchunks; c++ )); do
+	off=$(( c * CHUNK ))
+	len=$(( img_size - off < CHUNK ? img_size - off : CHUNK ))
+	# bs=4096 counts work for a short last chunk too.
+	skip4k=$(( (ROOT_OFFSET + off) / 4096 )); n4k=$(( len / 4096 ))
+	want=$(dd if="$IMG" bs=4096 skip=$(( off / 4096 )) count=$n4k 2>/dev/null | sha256sum | cut -d' ' -f1)
+	for try in 1 2 3 4; do
+		got=$(su "dd if=$DEV bs=4096 skip=$skip4k count=$n4k 2>/dev/null | sha256sum" | cut -d' ' -f1)
+		[[ "$got" == "$want" ]] && break
+		(( try < 4 )) || { echo "chunk $c: still differs after 3 writes" >&2; exit 1; }
+		dd if="$IMG" bs=4096 skip=$(( off / 4096 )) count=$n4k 2>/dev/null |
+			adb -s "$SERIAL" exec-in "su -c 'dd of=$DEV bs=4096 seek=$skip4k conv=fsync 2>/dev/null'"
+		printf 'chunk %d/%d written (try %d)\n' $((c + 1)) $nchunks $try
+	done
+done
+echo "ok: all $nchunks chunks match"
