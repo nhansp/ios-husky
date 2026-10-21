@@ -1,0 +1,18 @@
+diff --git a/osfmk/prng/prng_random.c b/osfmk/prng/prng_random.c
+index 7bf7303..99bc75c 100644
+--- a/osfmk/prng/prng_random.c
++++ b/osfmk/prng/prng_random.c
+@@ -402,6 +402,13 @@ random_cpu_init(int cpu)
+ {
+ 	assert3s(cpu, !=, boot_cpu_id);
+ 
++#if defined(HUSKY)
++	/* No corecrypto kext on husky: read_random uses the bring-up PRNG,
++	 * which has no per-CPU generator to set up. */
++	if (!prng_ready) {
++		return;
++	}
++#endif
+ 	if (!prng_ready) {
+ 		panic("random_cpu_init: kernel prng has not been installed");
+ 	}
