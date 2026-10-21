@@ -1,0 +1,22 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index b861006..7534b4c 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1947,7 +1947,17 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #if defined(ARM_LARGE_MEMORY)
+ 	/* For large memory systems with no PPL such as virtual machines */
+ 	static_memory_end = phystokv(args->topOfKernelData);
++#if defined(HUSKY)
++	/*
++	 * Each block-aligned arm_vm_physmap_slide() can pad its VA up to a twig
++	 * (32MB on 16K pages) to match the PA's twig offset, so the aperture can
++	 * end past base + size. Reserve the same worst case the small-memory
++	 * path does; the physmap's L1 window has room to spare.
++	 */
++	physmap_end = physmap_base + real_phys_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE);
++#else
+ 	physmap_end = physmap_base + real_phys_size;
++#endif
+ #else
+ 	static_memory_end = physmap_base + mem_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE); // worst possible case for block alignment
+ 	physmap_end = physmap_base + real_phys_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE);
