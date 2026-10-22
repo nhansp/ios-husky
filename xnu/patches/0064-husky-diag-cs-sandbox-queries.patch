@@ -1,0 +1,34 @@
+diff --git a/bsd/kern/husky_amfi.c b/bsd/kern/husky_amfi.c
+index caf4d85..cba27dc 100644
+--- a/bsd/kern/husky_amfi.c
++++ b/bsd/kern/husky_amfi.c
+@@ -314,6 +314,10 @@ husky_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 		printf("HUSKY Sandbox: %s op %d\n", name, call);
+ 		kprintf("HUSKY Sandbox: %s op %d\n", name, call);
+ 	}
++	if (strncmp(proc_best_name(p), "containermanager", 16) == 0) {
++		/* diagnostic: every call from containermanagerd */
++		printf("HUSKY Sandbox: containermanagerd op %d\n", call);
++	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
+ 	case 5:         /* extension issue */
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index 364f781..ca2addc 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -4195,11 +4195,11 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ out:
+ #if defined(ARM64_BOARD_CONFIG_HUSKY)
+ 	/*
+-	 * HUSKY diagnostic: entitlement queries about another process
+-	 * (usermanagerd verifying its XPC clients, ...). The first 400 are logged
++	 * HUSKY diagnostic: code-signing queries about another process
++	 * (containermanagerd judging its clients, ...). The first 400 are logged
+ 	 * with their result.
+ 	 */
+-	if ((ops == CS_OPS_ENTITLEMENTS_BLOB || ops == CS_OPS_DER_ENTITLEMENTS_BLOB) && !forself) {
++	if (!forself) {
+ 		static int husky_csops_logged;
+ 		if (os_atomic_inc_orig(&husky_csops_logged, relaxed) < 400) {
+ 			char caller[32];
