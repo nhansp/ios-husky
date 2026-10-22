@@ -1,0 +1,59 @@
+diff --git a/iokit/Kernel/arm/HuskyFramebuffer.cpp b/iokit/Kernel/arm/HuskyFramebuffer.cpp
+index 53bb557..a567a14 100644
+--- a/iokit/Kernel/arm/HuskyFramebuffer.cpp
++++ b/iokit/Kernel/arm/HuskyFramebuffer.cpp
+@@ -96,6 +96,8 @@ public:
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -167,6 +169,18 @@ AppleCLCD::start(IOService *provider)
+ 	return true;
+ }
+ 
++IOReturn
++AppleCLCD::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    OSDictionary *properties, IOUserClient **handler)
++{
++	IOReturn ret = IOService::newUserClient(owningTask, securityID, type, properties, handler);
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("HUSKY FB: newUserClient %s type %u -> 0x%x handler %p\n", name, (unsigned)type, ret,
++	    handler ? *handler : NULL);
++	return ret;
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -305,6 +319,7 @@ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID,
+ 		return false;
+ 	}
+ 	fTask = owningTask;
++	IOLog("HUSKY FB: UC initWithTask type %u ok\n", (unsigned)type);
+ 	return true;
+ }
+ 
+@@ -312,10 +327,17 @@ bool
+ IOMobileFramebufferUserClient::start(IOService *provider)
+ {
+ 	fFB = OSDynamicCast(AppleCLCD, provider);
+-	if (fFB == NULL || !IOUserClient::start(provider)) {
++	if (fFB == NULL) {
++		IOLog("HUSKY FB: UC start: provider not AppleCLCD (%s)\n",
++		    provider ? provider->getMetaClass()->getClassName() : "null");
++		return false;
++	}
++	if (!IOUserClient::start(provider)) {
++		IOLog("HUSKY FB: UC start: IOUserClient::start failed\n");
+ 		return false;
+ 	}
+ 	fFB->addClient(this);
++	IOLog("HUSKY FB: UC start ok\n");
+ 	return true;
+ }
+ 
