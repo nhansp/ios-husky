@@ -1,0 +1,82 @@
+diff --git a/bsd/kern/husky_amfi.c b/bsd/kern/husky_amfi.c
+index cba27dc..c6bb6b0 100644
+--- a/bsd/kern/husky_amfi.c
++++ b/bsd/kern/husky_amfi.c
+@@ -328,6 +328,67 @@ husky_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ }
+ 
++/*
++ * Policy "AMFI": libxpc's amfi_* helpers call __mac_syscall("AMFI", op, arg)
++ * into AppleMobileFileIntegrity's MAC policy. Op 102 is
++ * amfi_launch_constraint_matches_process(audit token, constraint): the reply
++ * matches when the syscall returns 0 and the result's first word is 0.
++ * containermanagerd uses it as "strict scrutiny" before serving a client and
++ * drops the connection otherwise (container_error 52, XPC_INTERRUPTED_REPLY,
++ * for lsd, SpringBoard, ManagedSettings, ...). With no trust caches every
++ * root-filesystem binary is a platform binary here, so every constraint
++ * matches. Other ops are logged once and succeed.
++ */
++#define HUSKY_AMFI_OP_LAUNCH_CONSTRAINT_MATCHES 102
++
++struct husky_amfi_lc_args {
++	uint8_t audit_token[32];
++	user_addr_t constraint;
++	uint32_t constraint_len;
++	uint32_t pad;
++	user_addr_t result;             /* u32 error code + message buffer */
++	uint32_t result_size;
++};
++
++static uint64_t husky_amfi_ops_seen[4];
++
++static int
++husky_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	if (call >= 0 && call < 256 && !(husky_amfi_ops_seen[call / 64] & (1ULL << (call % 64)))) {
++		husky_amfi_ops_seen[call / 64] |= 1ULL << (call % 64);
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("HUSKY AMFI syscall: %s op %d\n", name, call);
++		kprintf("HUSKY AMFI syscall: %s op %d\n", name, call);
++	}
++	if (call == HUSKY_AMFI_OP_LAUNCH_CONSTRAINT_MATCHES) {
++		struct husky_amfi_lc_args a;
++		int error = copyin(arg, &a, sizeof(a));
++		if (error) {
++			return error;
++		}
++		if (a.result != USER_ADDR_NULL && a.result_size >= sizeof(uint32_t)) {
++			uint32_t ok = 0;        /* no error: the constraint matches */
++			error = copyout(&ok, a.result, sizeof(ok));
++		}
++		return error;
++	}
++	return 0;
++}
++
++static const struct mac_policy_ops husky_amfi_syscall_ops = {
++	.mpo_policy_syscall = husky_amfi_syscall,
++};
++
++static struct mac_policy_conf husky_amfi_syscall_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "HUSKY AppleMobileFileIntegrity syscall stand-in",
++	.mpc_ops = &husky_amfi_syscall_ops,
++};
++
++static mac_policy_handle_t husky_amfi_syscall_handle;
++
+ static const struct mac_policy_ops husky_sandbox_mac_ops = {
+ 	.mpo_policy_syscall = husky_sandbox_syscall,
+ };
+@@ -363,6 +424,9 @@ husky_amfi_policy_register(void)
+ 	    error ? "NOT registered" : "registered", error);
+ 	kprintf("HUSKY AMFI: platform binary policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&husky_amfi_syscall_conf, &husky_amfi_syscall_handle, NULL);
++	printf("HUSKY AMFI: syscall policy %s (%d)\n", error ? "NOT registered" : "registered", error);
++	kprintf("HUSKY AMFI: syscall policy %s (%d)\n", error ? "NOT registered" : "registered", error);
+ 	error = mac_policy_register(&husky_sandbox_mac_conf, &husky_sandbox_mac_handle, NULL);
+ 	printf("HUSKY Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
