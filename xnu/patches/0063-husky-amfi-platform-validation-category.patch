@@ -1,0 +1,19 @@
+diff --git a/bsd/kern/husky_amfi.c b/bsd/kern/husky_amfi.c
+index 34eef2d..caf4d85 100644
+--- a/bsd/kern/husky_amfi.c
++++ b/bsd/kern/husky_amfi.c
+@@ -276,6 +276,14 @@ husky_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+ 	*cs_flags |= CS_SIGNED;
+ 	if (mp != NULL && (vfs_flags(mp) & MNT_ROOTFS)) {
+ 		*cs_flags |= CS_PLATFORM_BINARY;
++		/*
++		 * AMFI also records the validation category (nothing else in XNU
++		 * sets it); clients use it to judge peers, e.g. containermanagerd's
++		 * "strict scrutiny" before granting system group containers
++		 * (otherwise CS_VALIDATION_CATEGORY_INVALID: every container lookup
++		 * fails with error 52).
++		 */
++		(void)csblob_set_validation_category(cs_blob, CS_VALIDATION_CATEGORY_PLATFORM);
+ 	}
+ 	if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
+ 		husky_amfi_attach_entitlements(cs_blob);
