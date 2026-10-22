@@ -1,6 +1,6 @@
 diff --git a/iokit/Kernel/arm/HuskyFramebuffer.cpp b/iokit/Kernel/arm/HuskyFramebuffer.cpp
 new file mode 100644
-index 0000000..5a44a17
+index 0000000..53bb557
 --- /dev/null
 +++ b/iokit/Kernel/arm/HuskyFramebuffer.cpp
 @@ -0,0 +1,455 @@
@@ -62,12 +62,12 @@ index 0000000..5a44a17
 +	kHuskyFBNotifications           = 72,
 +};
 +
-+#define HUSKY_FB_SWAP_REC_SIZE          0x46c
++#define HUSKY_FB_SWAP_REC_SIZE          0x588
 +#define HUSKY_FB_LAYERS                 4
 +#define HUSKY_FB_NOTIFY_TYPES           8
 +#define HUSKY_FB_NOTIFY_VSYNC           5
 +#define HUSKY_FB_VSYNC_US               16667
-+#define HUSKY_FB_DOT_PITCH              395     /* ppi, 6.67" 1080x2400 */
++#define HUSKY_FB_DOT_PITCH              489     /* ppi, 6.7" 1344x2992 */
 +#define HUSKY_FB_FORMAT_BGRA            0x42475241
 +
 +class IOMobileFramebuffer : public IOService {
@@ -228,7 +228,7 @@ index 0000000..5a44a17
 +void
 +AppleCLCD::swap(const uint8_t *rec)
 +{
-+	uint32_t mask = get32(rec, 0x104);
++	uint32_t mask = get32(rec, 0x14c);
 +
 +	if (!fConsolePaused) {
 +		int quiet = 0;
@@ -241,9 +241,9 @@ index 0000000..5a44a17
 +	}
 +
 +	for (uint32_t layer = 0; layer < HUSKY_FB_LAYERS; layer++) {
-+		uint32_t id = get32(rec, 0x54 + 4 * layer);
-+		const uint8_t *a = rec + 0x64 + 16 * layer;
-+		const uint8_t *b = rec + 0xc4 + 16 * layer;
++		uint32_t id = get32(rec, 0x9c + 4 * layer);
++		const uint8_t *a = rec + 0xac + 16 * layer;
++		const uint8_t *b = rec + 0x10c + 16 * layer;
 +		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
 +		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
 +		int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
@@ -255,7 +255,7 @@ index 0000000..5a44a17
 +		if (husky_fb_swaps_logged < 16) {
 +			husky_fb_swaps_logged++;
 +			IOLog("HUSKY FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
-+			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
++			    get32(rec, 0x98), layer, id, s ? s->width : 0, s ? s->height : 0,
 +			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
 +			    get32(a, 12), dx, dy, w, h);
 +		}
