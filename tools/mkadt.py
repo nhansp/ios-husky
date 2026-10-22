@@ -31,7 +31,7 @@ import adt  # noqa: E402
 # shim+payload image, which ends ~0x81600000) up to just under gsa, 32MB-block
 # aligned.
 # Publish /chosen/unique-chip-id (see the /chosen node); needs corecrypto.
-PLATFORM_UUID_FROM_ECID = False
+PLATFORM_UUID_FROM_ECID = True   # 0048 gives SHA-1; publishes unique-chip-id -> IOPlatformUUID 7DB69C72-...-53F8F9396228 (stops the data-migration loop)
 
 PHYS_BASE = 0x82000000
 MEM_SIZE = 0x0d000000	# -> ends 0x8f000000, ~2MB clear of gsa@90200000
