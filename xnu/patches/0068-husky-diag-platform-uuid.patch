@@ -1,0 +1,14 @@
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+index 76555f6..de248f1 100644
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -2252,6 +2252,9 @@ IOPlatformExpertDevice::generatePlatformUUID( void )
+ 
+ 		entry->release();
+ 	}
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	IOLog("HUSKY UUID: IOPlatformUUID = %s\n", string ? string->getCStringNoCopy() : "(none)");
++#endif
+ #else /* !defined(__x86_64__) */
+ 	OSData * data;
+ 
