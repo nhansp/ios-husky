@@ -1,0 +1,200 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index b54ed2f..4fcb63f 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -965,6 +965,12 @@ set_proc_name(struct image_params *imgp, proc_t p)
+ 
+ 	bcopy((caddr_t)imgp->ip_ndp->ni_cnd.cn_nameptr, (caddr_t)p->p_comm, buflen);
+ 	p->p_comm[buflen] = '\0';
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	{
++		extern void husky_porttrace_exec(const char *, void *, int);
++		husky_porttrace_exec(p->p_comm, p, proc_pid(p));
++	}
++#endif
+ 
+ 	/*
+ 	 * This happens during image activation, so the crash behavior flags from
+diff --git a/osfmk/ipc/husky_ipcdump.c b/osfmk/ipc/husky_ipcdump.c
+index 7afe103..654cba3 100644
+--- a/osfmk/ipc/husky_ipcdump.c
++++ b/osfmk/ipc/husky_ipcdump.c
+@@ -13,6 +13,7 @@
+ #include <ipc/ipc_port.h>
+ #include <ipc/ipc_service_port.h>
+ #include <kern/task.h>
++#include <pexpert/pexpert.h>
+ 
+ #define HUSKY_PORTS_MAX 48
+ 
+@@ -88,4 +89,119 @@ husky_sample_ports(const char *name, task_t task)
+ 		    found[i].msgs, found[i].srights, found[i].svc[0] ? found[i].svc : "-");
+ 	}
+ }
++/*
++ * HUSKY port trace: one launchd service port (boot-arg huskyporttrace, default
++ * com.apple.mobile.usermanagerd.xpc) and one process (boot-arg huskymsgtrace,
++ * default usermanagerd). Logs as "PTR ...": every message sent to or received
++ * from the service port, and every message the process sends or receives, with
++ * the sender/receiver, msgh_id, bits and size. First 500 lines.
++ */
++extern void proc_selfname(char *buf, int size);
++extern int proc_selfpid(void);
++extern void *get_bsdtask_info(task_t);
++
++static char husky_ptr_svc[MACH_SERVICE_PORT_INFO_STRING_NAME_MAX_BUF_LEN];
++static char husky_ptr_proc[32];
++static bool husky_ptr_parsed;
++static ipc_port_t volatile husky_ptr_port;
++static void * volatile husky_ptr_procp;
++static int husky_ptr_ctor_pid = -1;
++static bool husky_ptr_announced;
++static int husky_ptr_lines;
++
++#define HUSKY_PTR_MAX 500
++
++static void
++husky_ptr_parse(void)
++{
++	if (husky_ptr_parsed) {
++		return;
++	}
++	if (!PE_parse_boot_argn("huskyporttrace", husky_ptr_svc, sizeof(husky_ptr_svc))) {
++		strlcpy(husky_ptr_svc, "com.apple.mobile.usermanagerd.xpc", sizeof(husky_ptr_svc));
++	}
++	if (!PE_parse_boot_argn("huskymsgtrace", husky_ptr_proc, sizeof(husky_ptr_proc))) {
++		strlcpy(husky_ptr_proc, "usermanagerd", sizeof(husky_ptr_proc));
++	}
++	husky_ptr_parsed = true;
++}
++
++/* Called from mach_port_construct with the new port locked: record only. */
++void husky_porttrace_construct(ipc_port_t port, const char *svc);
++
++void
++husky_porttrace_construct(ipc_port_t port, const char *svc)
++{
++	husky_ptr_parse();
++	if (svc != NULL && strncmp(svc, husky_ptr_svc, sizeof(husky_ptr_svc)) == 0) {
++		husky_ptr_port = port;
++		husky_ptr_ctor_pid = proc_selfpid();
++		husky_ptr_announced = false;
++	}
++}
++
++/* Called from set_proc_name during image activation. */
++void husky_porttrace_exec(const char *comm, void *p, int pid);
++
++void
++husky_porttrace_exec(const char *comm, void *p, int pid)
++{
++	husky_ptr_parse();
++	if (comm != NULL && strncmp(comm, husky_ptr_proc, sizeof(husky_ptr_proc)) == 0) {
++		husky_ptr_procp = p;
++		printf("PTR exec %s pid %d: tracing its messages\n", comm, pid);
++	}
++}
++
++static bool
++husky_ptr_begin(void)
++{
++	if (husky_ptr_lines >= HUSKY_PTR_MAX) {
++		return false;
++	}
++	husky_ptr_lines++;
++	if (!husky_ptr_announced && husky_ptr_port != IP_NULL) {
++		husky_ptr_announced = true;
++		printf("PTR service %s constructed by pid %d (port %p)\n", husky_ptr_svc,
++		    husky_ptr_ctor_pid, husky_ptr_port);
++	}
++	return true;
++}
++
++/* Called from ipc_kmsg_send before the destination is locked. */
++void husky_porttrace_send(ipc_port_t dest, mach_msg_header_t *hdr);
++
++void
++husky_porttrace_send(ipc_port_t dest, mach_msg_header_t *hdr)
++{
++	bool to_svc = (dest != IP_NULL && dest == husky_ptr_port);
++	bool by_proc = (husky_ptr_procp != NULL && get_bsdtask_info(current_task()) == husky_ptr_procp);
++
++	if (!(to_svc || by_proc) || !husky_ptr_begin()) {
++		return;
++	}
++	char name[20];
++	proc_selfname(name, sizeof(name));
++	printf("PTR send %s[%d] -> %s id %d bits 0x%x size %u\n", name, proc_selfpid(),
++	    to_svc ? "SERVICE" : (MACH_MSGH_BITS_REMOTE(hdr->msgh_bits) == MACH_MSG_TYPE_PORT_SEND_ONCE ? "send-once" : "other"),
++	    hdr->msgh_id, hdr->msgh_bits, hdr->msgh_size);
++}
++
++/* Called from mach_msg_receive_results before copyout; dest = the receive port. */
++void husky_porttrace_recv(ipc_port_t dest, mach_msg_header_t *hdr);
++
++void
++husky_porttrace_recv(ipc_port_t dest, mach_msg_header_t *hdr)
++{
++	bool from_svc = (dest != IP_NULL && dest == husky_ptr_port);
++	bool by_proc = (husky_ptr_procp != NULL && get_bsdtask_info(current_task()) == husky_ptr_procp);
++
++	if (!(from_svc || by_proc) || !husky_ptr_begin()) {
++		return;
++	}
++	char name[20];
++	proc_selfname(name, sizeof(name));
++	printf("PTR recv %s[%d] <- %s id %d bits 0x%x size %u\n", name, proc_selfpid(),
++	    from_svc ? "SERVICE" : "other", hdr->msgh_id, hdr->msgh_bits, hdr->msgh_size);
++}
+ #endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
+index 190e5d2..d6da169 100644
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -5166,6 +5166,12 @@ ipc_kmsg_send(
+ 
+ 	port = hdr->msgh_remote_port;
+ 	assert(IP_VALID(port));
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	{
++		extern void husky_porttrace_send(ipc_port_t, mach_msg_header_t *);
++		husky_porttrace_send(port, hdr);
++	}
++#endif
+ 	ip_mq_lock(port);
+ 
+ 	/*
+diff --git a/osfmk/ipc/mach_msg.c b/osfmk/ipc/mach_msg.c
+index afaaf38..9a9caaa 100644
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -349,6 +349,12 @@ mach_msg_receive_results(
+ 
+ 	/* Save destination port context for the trailer before copyout */
+ 	msgr.msgr_context = ikm_header(kmsg)->msgh_remote_port->ip_context;
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	{
++		extern void husky_porttrace_recv(ipc_port_t, mach_msg_header_t *);
++		husky_porttrace_recv(ikm_header(kmsg)->msgh_remote_port, ikm_header(kmsg));
++	}
++#endif
+ 
+ 	/*
+ 	 * restore the recv_bufs values that are used by
+diff --git a/osfmk/ipc/mach_port.c b/osfmk/ipc/mach_port.c
+index 7ef6a22..63f7c93 100644
+--- a/osfmk/ipc/mach_port.c
++++ b/osfmk/ipc/mach_port.c
+@@ -2621,6 +2621,12 @@ mach_port_construct(
+ 		return kr;
+ 	}
+ 	/* Port locked and active */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	if (ip_is_any_service_port_type(label.io_type)) {
++		extern void husky_porttrace_construct(ipc_port_t, const char *);
++		husky_porttrace_construct(port, sp_info.mspi_string_name);
++	}
++#endif
+ 
+ 	/*
+ 	 *	Step 4.  Apply configuration to our newly minted port.

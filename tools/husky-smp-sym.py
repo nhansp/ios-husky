@@ -45,7 +45,9 @@ def main():
         sys.exit(__doc__)
     dsc = sys.argv[2] if len(sys.argv) > 2 else DSC_DEFAULT
     procs = {}
-    for line in open(sys.argv[1], errors='replace'):
+    # Console lines from several CPUs can run together: split at each "SMP ".
+    text = open(sys.argv[1], errors='replace').read().replace('SMP ', '\nSMP ')
+    for line in text.splitlines():
         m = HDR.search(line)
         if m:
             procs[m.group(1)] = (int(m.group(3), 16), int(m.group(4), 16))
@@ -61,6 +63,7 @@ def main():
         print(f'  {m.group(1)} {m.group(2)}')
         frames = [('pc', m.group(3)), ('lr', m.group(4))]
         frames += [('bt', a) for a in m.group(5).split()]
+        frames = [(k, a) for k, a in frames if re.fullmatch(r'0x[0-9a-f]+', a)]
         for kind, a in frames:
             print(f'    {kind} {a}  {lookup(dsc, int(a, 16), slide, mh)}')
 
