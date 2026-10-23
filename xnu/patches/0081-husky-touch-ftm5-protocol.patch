@@ -1,0 +1,743 @@
+diff --git a/bsd/dev/husky_fts.c b/bsd/dev/husky_fts.c
+index 03478da..9f8d959 100644
+--- a/bsd/dev/husky_fts.c
++++ b/bsd/dev/husky_fts.c
+@@ -1,30 +1,28 @@
+ /*
+- * HUSKY: STMicroelectronics FingerTip (FTM5) touch controller driver.
+- *
+- * Implements communication with the ST FTM5 touch IC on spi@111D0000 on
+- * Google Tensor G3 ("zuma", Pixel 8 Pro).
++ * HUSKY: STMicroelectronics FingerTip FTM5 ("SALIXP", chip ID 36 40) touch
++ * controller on spi@111D0000, Google Tensor G3 ("zuma", Pixel 8 Pro).
+  *
+  * Boot-args:
+  * - huskytouch=0: driver idle (default, opt-in).
+- * - huskytouch=1: normal touch mode (reset, init, sense-on, event loop).
+- * - huskytouch=2: probe mode (read-only: power domain, CMU, USI/SPI and GPIO registers).
++ * - huskytouch=1: touch: bring-up, active scan, event polling into HuskyHIDTouch.
++ * - huskytouch=2: bring-up probe: register dumps, USI enable, reset pulse,
++ *   CONTROLLER_READY wait, chip-ID read; no scanning.
+  * - huskytouchdelay=N: initial delay in seconds (default 5).
+  * - huskytouchpoll=N: polling interval in milliseconds (default 10).
+- * - huskytouchinv=0/1: coordinate inversion for 1344x2992 panel (default 1).
++ * - huskytouchinv=0/1: invert both axes (default 0: the IC reports panel pixels,
++ *   0..1343 x 0..2991, DT st,max-coords).
+  * - huskytouchdebug=1: verbose event logging.
+  *
+- * FTM5 Protocol:
+- * - Hardware registers accessed via address-based commands:
+- *   FTS_CMD_HW_REG_R = 0xB6, FTS_CMD_HW_REG_W = 0xB6.
+- * - Chip ID read at address 0x0004 with 1 dummy byte -> 0x36 0x40.
+- * - System reset at address 0x0028 with value 0x80.
+- * - FIFO events read via 0x85 with 1 dummy byte (8 bytes per event packet).
+- * - Event ID decoded from (ev[0] >> 4) & 0x0f.
+- * - Touch ID from high nibble (ev[1] >> 4) & 0x0f; touch type from ev[1] & 0x0f.
+- * - Remaining events count from ev[7] & 0x1f.
++ * FTM5 SPI protocol (google-modules touch/fts/ftm5, SPI build): hardware
++ * registers are read with 0xFB and written with 0xFA, each followed by a
++ * 4-byte big-endian address; every read returns one dummy byte first. The FIFO
++ * is read with 0x87 (8-byte events, byte 7 bits 4:0 = events still queued).
++ * Event IDs are whole bytes (0x03 controller ready, 0x13/0x23/0x33 touch
++ * enter/motion/leave). Reset = reset GPIO low 10 ms then high, after which the
++ * IC queues CONTROLLER_READY.
+  *
+  * Fail safe: if the hardware does not respond or the chip ID does not match,
+- * the driver logs the result and cleanly gives up without hanging or panicking.
++ * the driver logs the result and gives up without hanging or panicking.
+  */
+ #if defined(ARM64_BOARD_CONFIG_HUSKY)
+ 
+@@ -48,34 +46,29 @@ extern int husky_hid_touch_ready(void);
+ 
+ #define HU_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
+ 
+-/* STMicroelectronics FTM5 address-based commands (google-modules touch/fts) */
+-#define FTM5_CMD_HW_REG_R       0xb6u
+-#define FTM5_CMD_HW_REG_W       0xb6u
+-#define FTM5_ADDR_DCHIP_ID      0x0004u
+-#define FTM5_ADDR_SYSTEM_RESET  0x0028u
+-#define FTM5_VAL_SYSTEM_RESET   0x80u
+-
+-/* ST FTM5 commands */
+-#define FTS_CMD_LEGACY_READ_INFO 0x80u
+-#define FTS_CMD_FIFO_READ_ONE   0x85u
+-#define FTS_CMD_FIFO_READ_ALL   0x86u
+-#define FTS_CMD_SENSE_ON        0x93u
++/* FTM5 opcodes and addresses (SPI) */
++#define FTM5_CMD_HW_REG_R       0xfbu
++#define FTM5_CMD_HW_REG_W       0xfau
++#define FTM5_CMD_FIFO_READ      0x87u
++#define FTM5_CMD_SCAN_MODE      0xa0u
++#define FTM5_SCAN_MODE_ACTIVE   0x00u
++#define FTM5_ADDR_DCHIP_ID      0x20000000u
+ 
+-/* ST FTM5 Event IDs (decoded from (ev[0] >> 4) & 0x0f) */
++/* FTM5 event IDs (whole byte 0) */
+ #define FTM5_EVT_NO_EVENT       0x00u
+-#define FTM5_EVT_STATUS         0x01u
+-#define FTM5_EVT_ENTER_POINT    0x03u
+-#define FTM5_EVT_LEAVE_POINT    0x04u
+-#define FTM5_EVT_MOTION_POINT   0x05u
+-#define FTM5_EVT_ERROR          0x0fu
+-
+-/* Expected ST FTS Chip ID for Pixel 8 Pro ("husky") */
++#define FTM5_EVT_CONTROLLER_READY 0x03u
++#define FTM5_EVT_ENTER_POINT    0x13u
++#define FTM5_EVT_MOTION_POINT   0x23u
++#define FTM5_EVT_LEAVE_POINT    0x33u
++#define FTM5_EVT_STATUS_UPDATE  0x43u
++#define FTM5_EVT_ERROR          0xf3u
++
++/* Chip ID of husky's controller (DT st,dchip_id) */
+ #define FTS_CHIP_ID_0           0x36u
+ #define FTS_CHIP_ID_1           0x40u
+ 
+-/* Event packet size */
+ #define FTS_EVENT_SIZE          8u
+-#define FTS_MAX_EVENTS_PER_POLL 16u
++#define FTS_FIFO_DEPTH          32u
+ 
+ static bool husky_fts_started = false;
+ static int fts_sleep_chan;
+@@ -89,28 +82,91 @@ fts_sleep_ms(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* Read len bytes of hardware register space at addr (after the dummy byte). */
++static int
++fts_hw_read(uint32_t addr, uint8_t *out, size_t len)
++{
++	uint8_t cmd[5] = {FTM5_CMD_HW_REG_R, (uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
++		          (uint8_t)(addr >> 8), (uint8_t)addr};
++	return husky_spi_write_read_dummy(cmd, sizeof(cmd), out, len, 1);
++}
++
++/* Read one FIFO event; a NO_EVENT packet means the FIFO is empty. */
++static int
++fts_fifo_read(uint8_t ev[FTS_EVENT_SIZE])
++{
++	uint8_t cmd = FTM5_CMD_FIFO_READ;
++	bzero(ev, FTS_EVENT_SIZE);
++	return husky_spi_write_read_dummy(&cmd, 1, ev, FTS_EVENT_SIZE, 1);
++}
++
++/*
++ * Common bring-up: USI/SPI, reset line, reset pulse, wait for
++ * CONTROLLER_READY, chip ID. Returns 0 when the chip ID matches.
++ */
++static int
++fts_bringup(void)
++{
++	uint8_t ev[FTS_EVENT_SIZE];
++	uint8_t id[3];
++	bool ready = false;
++	int err;
++
++	err = husky_spi_init();
++	if (err) {
++		HU_LOG("HUSKY TOUCH: SPI init failed (%d)\n", err);
++		return err;
++	}
++	err = husky_gpio_init();
++	if (err) {
++		HU_LOG("HUSKY TOUCH: GPIO init failed (%d)\n", err);
++		return err;
++	}
++
++	HU_LOG("HUSKY TOUCH: reset pulse (gpp21-2 low 10 ms, high)\n");
++	husky_gpio_reset_set(0);
++	fts_sleep_ms(10);
++	husky_gpio_reset_set(1);
++
++	/* The IC queues CONTROLLER_READY once its firmware is up. */
++	for (unsigned t = 0; t < 50 && !ready; t++) {
++		fts_sleep_ms(10);
++		err = fts_fifo_read(ev);
++		if (err) {
++			HU_LOG("HUSKY TOUCH: FIFO read err %d\n", err);
++			break;
++		}
++		if (ev[0] != FTM5_EVT_NO_EVENT) {
++			HU_LOG("HUSKY TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
++		}
++		ready = ev[0] == FTM5_EVT_CONTROLLER_READY;
++	}
++	HU_LOG("HUSKY TOUCH: controller ready: %s (irq line %d)\n", ready ? "yes" : "no",
++	    husky_gpio_irq_get());
++
++	bzero(id, sizeof(id));
++	err = fts_hw_read(FTM5_ADDR_DCHIP_ID, id, sizeof(id));
++	HU_LOG("HUSKY TOUCH: chip ID %02x %02x %02x (err %d, expected %02x %02x)\n",
++	    id[0], id[1], id[2], err, FTS_CHIP_ID_0, FTS_CHIP_ID_1);
++	if (err) {
++		return err;
++	}
++	return (id[0] == FTS_CHIP_ID_0 && id[1] == FTS_CHIP_ID_1) ? 0 : ENODEV;
++}
++
+ static void
+ husky_fts_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint32_t enabled = 0; /* Default 0: opt-in via boot-arg huskytouch=1 or 2 */
++	uint32_t enabled = 0;
+ 	uint32_t delay_s = 5;
+ 	uint32_t poll_ms = 10;
+-	uint32_t invert = 1;
++	uint32_t invert = 0;
+ 	uint32_t debug_log = 0;
+-
+-	int err = 0;
+-	bool id_matched = false;
+-	uint32_t active_mask = 0;
++	uint8_t ev[FTS_EVENT_SIZE];
+ 	unsigned poll_errors = 0;
+ 	bool seen_first_touch = false;
+-	unsigned drained = 0;
+-
+-	uint8_t ev[FTS_EVENT_SIZE];
+-	uint8_t id_buf[2];
+-	uint8_t reset_cmd[4];
+-	uint8_t chip_id_cmd[3];
+-	uint8_t sense_cmd = 0;
+-	uint8_t read_fifo_cmd = 0;
++	int err;
+ 
+ 	(void)PE_parse_boot_argn("huskytouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("huskytouchdelay", &delay_s, sizeof(delay_s));
+@@ -118,267 +174,104 @@ husky_fts_thread(__unused void *arg, __unused wait_result_t wr)
+ 	(void)PE_parse_boot_argn("huskytouchinv", &invert, sizeof(invert));
+ 	(void)PE_parse_boot_argn("huskytouchdebug", &debug_log, sizeof(debug_log));
+ 
+-	/* Opt-in check: driver is idle unless huskytouch=1 or huskytouch=2 */
+ 	if (enabled == 0) {
+ 		HU_LOG("HUSKY TOUCH: idle (opt-in via boot-arg huskytouch=1 or huskytouch=2)\n");
+ 		goto out;
+ 	}
+-
+-	/* Probe mode: read-only diagnostics */
+-	if (enabled == 2) {
+-		HU_LOG("HUSKY TOUCH: probe mode (huskytouch=2): starting read-only diagnostics\n");
+-		if (delay_s > 0) {
+-			fts_sleep_ms(delay_s * 1000u);
+-		}
+-
+-		/* Probe 1: Power domain pd-hsi0 and CMU clock gate registers */
+-		err = husky_spi_probe_dump();
+-		if (err) {
+-			HU_LOG("HUSKY TOUCH: probe mode: power domain or clock check failed (%d); ABORTING MMIO\n",
+-			    err);
+-			goto out;
+-		}
+-
+-		/* Probe 2: GPIO bank states (PERIC1 gpp21 and ALIVE gpn0) without modifying them */
+-		(void)husky_gpio_probe_dump();
+-
+-		/*
+-		 * One chip-ID transfer, only when the USI is already in SPI mode: that
+-		 * confirms the sysreg address (the DT gives it only as a phandle) and
+-		 * husky_spi_init then leaves SW_CONF alone. No reset, no sense-on.
+-		 */
+-		if ((husky_spi_probe_swconf & 0x7u) == 0x2u) {
+-			HU_LOG("HUSKY TOUCH: probe mode: USI in SPI mode; reading chip ID\n");
+-			if (husky_gpio_power_check()) {
+-				HU_LOG("HUSKY TOUCH: probe mode: chip ID 0x36 0x40 - controller alive\n");
+-			} else {
+-				HU_LOG("HUSKY TOUCH: probe mode: no chip ID (unpowered or protocol)\n");
+-			}
+-		} else {
+-			HU_LOG("HUSKY TOUCH: probe mode: USI SW_CONF 0x%x not SPI; no transfer\n",
+-			    husky_spi_probe_swconf);
+-		}
+-
+-		HU_LOG("HUSKY TOUCH: probe mode finished; stopping without modifying hardware state\n");
+-		goto out;
+-	}
+-
+-	/* Normal touch mode (huskytouch=1) */
+-	HU_LOG("HUSKY TOUCH: driver initializing in normal touch mode (start delay %u s)...\n",
+-	    delay_s);
++	HU_LOG("HUSKY TOUCH: mode %u, start in %u s\n", enabled, delay_s);
+ 	if (delay_s > 0) {
+ 		fts_sleep_ms(delay_s * 1000u);
+ 	}
+ 
+-	/* Step 1: Initialize GPIOs */
+-	HU_LOG("HUSKY TOUCH: configuring GPIOs (PERIC1 gpp21-2 reset, ALIVE gpn0-0 irq)...\n");
+-	err = husky_gpio_init();
+-	if (err) {
+-		HU_LOG("HUSKY TOUCH: GPIO init failed (%d); giving up\n", err);
+-		goto out;
+-	}
+-	HU_LOG("HUSKY TOUCH: GPIO init ok\n");
+-
+-	/* Step 2: Initialize USI SPI (includes power domain and clock guards) */
+-	HU_LOG("HUSKY TOUCH: initializing USI SPI controller (0x111D0000)...\n");
+-	err = husky_spi_init();
++	/* Power domain, CMU, USI/SPI and GPIO state before touching anything. */
++	err = husky_spi_probe_dump();
+ 	if (err) {
+-		HU_LOG("HUSKY TOUCH: SPI init failed (%d); giving up\n", err);
++		HU_LOG("HUSKY TOUCH: pd-hsi0 check failed (%d); no MMIO\n", err);
+ 		goto out;
+ 	}
+-	HU_LOG("HUSKY TOUCH: SPI init ok\n");
+-
+-	/* Step 3: Hardware Reset pulse via ts-reset pin */
+-	HU_LOG("HUSKY TOUCH: pulsing hardware reset pin (15ms low, 50ms boot wait)...\n");
+-	husky_gpio_reset_pulse();
+-	HU_LOG("HUSKY TOUCH: hardware reset complete\n");
+-
+-	/* Step 4: FTM5 Software System Reset (address 0x0028, value 0x80) */
+-	HU_LOG("HUSKY TOUCH: issuing FTM5 system reset command (0xB6 0x00 0x28 0x80)...\n");
+-	reset_cmd[0] = FTM5_CMD_HW_REG_W;
+-	reset_cmd[1] = (uint8_t)(FTM5_ADDR_SYSTEM_RESET >> 8);
+-	reset_cmd[2] = (uint8_t)(FTM5_ADDR_SYSTEM_RESET & 0xffu);
+-	reset_cmd[3] = FTM5_VAL_SYSTEM_RESET;
+-	(void)husky_spi_write_read(reset_cmd, sizeof(reset_cmd), NULL, 0);
+-	fts_sleep_ms(50);
+-
+-	/* Step 5: Validate chip ID (address 0x0004 with 1 dummy byte) */
+-	HU_LOG("HUSKY TOUCH: validating FTM5 chip ID at address 0x0004 (1 dummy byte)...\n");
+-	chip_id_cmd[0] = FTM5_CMD_HW_REG_R;
+-	chip_id_cmd[1] = (uint8_t)(FTM5_ADDR_DCHIP_ID >> 8);
+-	chip_id_cmd[2] = (uint8_t)(FTM5_ADDR_DCHIP_ID & 0xffu);
+-
+-	id_matched = false;
+-	for (int attempt = 1; attempt <= 5; attempt++) {
+-		bzero(id_buf, sizeof(id_buf));
+-		err = husky_spi_write_read_dummy(chip_id_cmd, sizeof(chip_id_cmd),
+-		    id_buf, sizeof(id_buf), 1);
+-		if (err == 0 && id_buf[0] == FTS_CHIP_ID_0 && id_buf[1] == FTS_CHIP_ID_1) {
+-			id_matched = true;
+-			break;
+-		}
+-
+-		/* Fallback: legacy 0x80 command */
+-		uint8_t legacy_cmd = FTS_CMD_LEGACY_READ_INFO;
+-		err = husky_spi_write_read_dummy(&legacy_cmd, 1, id_buf, sizeof(id_buf), 1);
+-		if (err == 0 && id_buf[0] == FTS_CHIP_ID_0 && id_buf[1] == FTS_CHIP_ID_1) {
+-			id_matched = true;
+-			break;
+-		}
+-
+-		err = husky_spi_write_read(&legacy_cmd, 1, id_buf, sizeof(id_buf));
+-		if (err == 0 && id_buf[0] == FTS_CHIP_ID_0 && id_buf[1] == FTS_CHIP_ID_1) {
+-			id_matched = true;
+-			break;
+-		}
+-
+-		delay(10000); /* 10ms */
+-	}
++	(void)husky_gpio_probe_dump();
+ 
+-	if (!id_matched) {
+-		HU_LOG("HUSKY TOUCH: chip ID read 0x%02x 0x%02x (err=%d, expected 0x%02x 0x%02x) - MISMATCH\n",
+-		    id_buf[0], id_buf[1], err, FTS_CHIP_ID_0, FTS_CHIP_ID_1);
+-		HU_LOG("HUSKY TOUCH: hardware not responding or unexpected chip ID; aborting safely\n");
++	err = fts_bringup();
++	if (enabled == 2 || err) {
++		HU_LOG("HUSKY TOUCH: %s (bring-up %d)\n",
++		    enabled == 2 ? "probe finished, no scanning" : "giving up", err);
+ 		goto out;
+ 	}
+ 
+-	HU_LOG("HUSKY TOUCH: chip ID 0x%02x 0x%02x (expected 0x36 0x40) - MATCH\n",
+-	    id_buf[0], id_buf[1]);
+-
+-	/* Step 6: Send Sense ON command (0x93) */
+-	HU_LOG("HUSKY TOUCH: sending sense ON command (0x93)...\n");
+-	sense_cmd = FTS_CMD_SENSE_ON;
+-	err = husky_spi_write_read(&sense_cmd, 1, NULL, 0);
+-	if (err) {
+-		HU_LOG("HUSKY TOUCH: sense ON command returned err %d\n", err);
+-	} else {
+-		HU_LOG("HUSKY TOUCH: sense ON command completed successfully\n");
+-	}
+-	fts_sleep_ms(20);
+-
+-	/* Step 7: Drain initial FIFO events with 1 dummy byte */
+-	HU_LOG("HUSKY TOUCH: draining initial FIFO events...\n");
+-	read_fifo_cmd = FTS_CMD_FIFO_READ_ONE;
+-	drained = 0;
+-	while (drained < 64) {
+-		bzero(ev, sizeof(ev));
+-		err = husky_spi_write_read_dummy(&read_fifo_cmd, 1, ev, FTS_EVENT_SIZE, 1);
+-		if (err != 0) {
+-			break;
++	/* Active scanning, all sensing on (setScanMode(ACTIVE, 0xff)). */
++	{
++		uint8_t wake[7] = {FTM5_CMD_HW_REG_W, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00};
++		uint8_t scan[3] = {FTM5_CMD_SCAN_MODE, FTM5_SCAN_MODE_ACTIVE, 0xffu};
++		err = husky_spi_write_read(wake, sizeof(wake), NULL, 0);
++		if (!err) {
++			err = husky_spi_write_read(scan, sizeof(scan), NULL, 0);
+ 		}
+-		uint8_t eid = (ev[0] >> 4) & 0x0fu;
+-		if (eid == FTM5_EVT_NO_EVENT) {
+-			break;
+-		}
+-		drained++;
++		HU_LOG("HUSKY TOUCH: active scan on (err %d); polling every %u ms, invert %u\n",
++		    err, poll_ms, invert);
+ 	}
+-	HU_LOG("HUSKY TOUCH: initial FIFO drain complete (%u stale events discarded)\n", drained);
+-
+-	/* Step 8: Event Polling Loop */
+-	HU_LOG("HUSKY TOUCH: starting event polling loop (interval %u ms, invert=%u)\n",
+-	    poll_ms, invert);
+ 
+ 	while (true) {
+ 		fts_sleep_ms(poll_ms);
+-
+-		/* Wait until HID event service is ready */
+ 		if (!husky_hid_touch_ready()) {
+ 			continue;
+ 		}
+ 
+-		unsigned events_this_poll = 0;
+-		while (events_this_poll < FTS_MAX_EVENTS_PER_POLL) {
+-			bzero(ev, sizeof(ev));
+-			err = husky_spi_write_read_dummy(&read_fifo_cmd, 1, ev, FTS_EVENT_SIZE, 1);
+-			if (err != 0) {
+-				poll_errors++;
+-				if ((poll_errors % 100u) == 1) {
+-					HU_LOG("HUSKY TOUCH: poll error %d (consecutive errors %u)\n",
+-					    err, poll_errors);
++		for (unsigned n = 0; n < FTS_FIFO_DEPTH; n++) {
++			err = fts_fifo_read(ev);
++			if (err) {
++				if ((poll_errors++ % 100u) == 0) {
++					HU_LOG("HUSKY TOUCH: poll error %d (%u)\n", err, poll_errors);
+ 				}
+ 				if (poll_errors >= 20) {
+ 					husky_hid_touch_release_all();
+-					active_mask = 0;
+ 				}
+ 				break;
+ 			}
+ 			poll_errors = 0;
+-
+-			/* FTM5 event ID is in high nibble of byte 0 */
+-			uint8_t event_id = (ev[0] >> 4) & 0x0fu;
+-			if (event_id == FTM5_EVT_NO_EVENT) {
+-				/* FIFO empty */
++			if (ev[0] == FTM5_EVT_NO_EVENT) {
+ 				break;
+ 			}
+ 
+-			events_this_poll++;
+-
+-			/*
+-			 * FTM5 event packet structure:
+-			 * ev[0]: [7:4] Event ID, [3:0] Status/subtype
+-			 * ev[1]: [7:4] Touch ID, [3:0] Touch Type
+-			 * ev[2]: X coordinate [11:4]
+-			 * ev[3]: Y coordinate [11:4]
+-			 * ev[4]: [7:4] X coordinate [3:0], [3:0] Y coordinate [3:0]
+-			 * ev[5]: Touch pressure / area
+-			 * ev[6]: Touch major / minor
+-			 * ev[7]: [4:0] Events remaining in FIFO
+-			 */
+-			int touch_id = (ev[1] >> 4) & 0x0fu;
+-			int touch_type = ev[1] & 0x0fu;
+-			uint8_t events_remaining = ev[7] & 0x1fu;
+-
+-			if (event_id == FTM5_EVT_ENTER_POINT || event_id == FTM5_EVT_MOTION_POINT) {
+-				int raw_x = (int)((ev[2] << 4) | ((ev[4] & 0xf0u) >> 4));
+-				int raw_y = (int)((ev[3] << 4) | (ev[4] & 0x0fu));
+-
+-				int x = raw_x;
+-				int y = raw_y;
++			int touch_id = (ev[1] >> 4) & 0x0f;
++			if (ev[0] == FTM5_EVT_ENTER_POINT || ev[0] == FTM5_EVT_MOTION_POINT) {
++				int x = ((ev[3] & 0x0f) << 8) | ev[2];
++				int y = (ev[4] << 4) | ((ev[3] & 0xf0) >> 4);
+ 				if (invert) {
+-					x = (HUSKY_PANEL_W - 1) - raw_x;
+-					y = (HUSKY_PANEL_H - 1) - raw_y;
++					x = (HUSKY_PANEL_W - 1) - x;
++					y = (HUSKY_PANEL_H - 1) - y;
++				}
++				if (x < 0) {
++					x = 0;
++				} else if (x >= HUSKY_PANEL_W) {
++					x = HUSKY_PANEL_W - 1;
++				}
++				if (y < 0) {
++					y = 0;
++				} else if (y >= HUSKY_PANEL_H) {
++					y = HUSKY_PANEL_H - 1;
+ 				}
+-
+-				/* Clamp to panel boundary */
+-				if (x < 0) x = 0;
+-				if (x >= HUSKY_PANEL_W) x = HUSKY_PANEL_W - 1;
+-				if (y < 0) y = 0;
+-				if (y >= HUSKY_PANEL_H) y = HUSKY_PANEL_H - 1;
+-
+ 				if (touch_id < HUSKY_TOUCH_FINGERS) {
+-					active_mask |= (1u << touch_id);
+ 					husky_hid_touch(touch_id, x, y, 1);
+-
+-					if (!seen_first_touch || debug_log) {
+-						seen_first_touch = true;
+-						HU_LOG("HUSKY TOUCH: contact %s id=%d type=%d pos=(%d,%d) raw=(%d,%d) rem=%u\n",
+-						    (event_id == FTM5_EVT_ENTER_POINT) ? "DOWN" : "MOVE",
+-						    touch_id, touch_type, x, y, raw_x, raw_y, events_remaining);
+-					}
+ 				}
+-			} else if (event_id == FTM5_EVT_LEAVE_POINT) {
++				if (!seen_first_touch || debug_log) {
++					seen_first_touch = true;
++					HU_LOG("HUSKY TOUCH: %s id %d type %d (%d,%d) z %u\n",
++					    ev[0] == FTM5_EVT_ENTER_POINT ? "down" : "move",
++					    touch_id, ev[1] & 0x0f, x, y, ev[5]);
++				}
++			} else if (ev[0] == FTM5_EVT_LEAVE_POINT) {
+ 				if (touch_id < HUSKY_TOUCH_FINGERS) {
+-					active_mask &= ~(1u << touch_id);
+ 					husky_hid_touch(touch_id, 0, 0, 0);
+-
+-					if (debug_log) {
+-						HU_LOG("HUSKY TOUCH: contact UP id=%d type=%d rem=%u\n",
+-						    touch_id, touch_type, events_remaining);
+-					}
+-				}
+-			} else if (event_id == FTM5_EVT_STATUS) {
+-				if (debug_log) {
+-					HU_LOG("HUSKY TOUCH: status event (type=0x%02x info=0x%02x rem=%u)\n",
+-					    ev[1], ev[2], events_remaining);
+ 				}
+-			} else if (event_id == FTM5_EVT_ERROR) {
+ 				if (debug_log) {
+-					HU_LOG("HUSKY TOUCH: error event (err=0x%02x data=0x%02x rem=%u)\n",
+-					    ev[1], ev[2], events_remaining);
++					HU_LOG("HUSKY TOUCH: up id %d\n", touch_id);
+ 				}
++			} else if (debug_log || ev[0] == FTM5_EVT_ERROR) {
++				HU_LOG("HUSKY TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x\n",
++				    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
+ 			}
+ 
+-			if (events_remaining == 0) {
++			if ((ev[7] & 0x1f) == 0) {
+ 				break;
+ 			}
+ 		}
+diff --git a/bsd/dev/husky_gpio.c b/bsd/dev/husky_gpio.c
+index 642c2fd..aec32d0 100644
+--- a/bsd/dev/husky_gpio.c
++++ b/bsd/dev/husky_gpio.c
+@@ -28,7 +28,9 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ /* PERIC1 pinctrl base (gpp21 at offset 0x20) */
+ #define HUSKY_PINCTRL_PERIC1_PA 0x10c40000ULL
+ #define HUSKY_PINCTRL_PERIC1_SZ 0x1000ULL
+-#define HUSKY_BANK_GPP21_OFF    0x20u
++/* PERIC1 banks: gpp19, gpp20, gpp21, ... 0x20 apart (Android pinctrl gpio-ranges;
++ * boot 0080 read the 4-pin gpp20 at 0x20). */
++#define HUSKY_BANK_GPP21_OFF    0x40u
+ #define HUSKY_RESET_PIN         2u
+ 
+ /* ALIVE pinctrl base (gpn0 at offset 0x00) */
+@@ -43,14 +45,6 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define REG_GPIO_PUD            0x08u
+ #define REG_GPIO_DRV            0x0cu
+ 
+-/* Expected ST Microelectronics FTM5 chip ID */
+-#define FTS_CHIP_ID_0           0x36u
+-#define FTS_CHIP_ID_1           0x40u
+-#define FTM5_CMD_HW_REG_R       0xb6u
+-#define FTM5_ADDR_DCHIP_ID_HI   0x00u
+-#define FTM5_ADDR_DCHIP_ID_LO   0x04u
+-#define FTS_CMD_LEGACY_READ_INFO 0x80u
+-
+ static vm_offset_t peric1_base = 0;
+ static vm_offset_t alive_base = 0;
+ static bool husky_gpio_initialized = false;
+@@ -143,14 +137,14 @@ husky_gpio_init(void)
+ 
+ 	peric1_base = ml_io_map(peric1_pa, peric1_sz);
+ 	if (!peric1_base) {
+-		printf("HUSKY GPIO: failed to map PERIC1 pinctrl at 0x%llx\n", peric1_pa);
++		HU_LOG("HUSKY GPIO: failed to map PERIC1 pinctrl at 0x%llx\n", peric1_pa);
+ 		lck_mtx_unlock(&husky_gpio_lock);
+ 		return ENXIO;
+ 	}
+ 
+ 	alive_base = ml_io_map(alive_pa, alive_sz);
+ 	if (!alive_base) {
+-		printf("HUSKY GPIO: failed to map ALIVE pinctrl at 0x%llx\n", alive_pa);
++		HU_LOG("HUSKY GPIO: failed to map ALIVE pinctrl at 0x%llx\n", alive_pa);
+ 		lck_mtx_unlock(&husky_gpio_lock);
+ 		return ENXIO;
+ 	}
+@@ -167,12 +161,12 @@ husky_gpio_init(void)
+ 	uint32_t init_gpn0_dat = gpio_rd(gpn0, REG_GPIO_DAT);
+ 	uint32_t init_gpn0_pud = gpio_rd(gpn0, REG_GPIO_PUD);
+ 
+-	printf("HUSKY GPIO: bootloader state PERIC1 gpp21: CON=0x%08x DAT=0x%08x PUD=0x%08x (pin 2: con=0x%x dat=%u)\n",
++	HU_LOG("HUSKY GPIO: bootloader state PERIC1 gpp21: CON=0x%08x DAT=0x%08x PUD=0x%08x (pin 2: con=0x%x dat=%u)\n",
+ 	    init_gpp21_con, init_gpp21_dat, init_gpp21_pud,
+ 	    (init_gpp21_con >> (HUSKY_RESET_PIN * 4)) & 0xfu,
+ 	    (init_gpp21_dat >> HUSKY_RESET_PIN) & 1u);
+ 
+-	printf("HUSKY GPIO: bootloader state ALIVE gpn0: CON=0x%08x DAT=0x%08x PUD=0x%08x (pin 0: con=0x%x dat=%u)\n",
++	HU_LOG("HUSKY GPIO: bootloader state ALIVE gpn0: CON=0x%08x DAT=0x%08x PUD=0x%08x (pin 0: con=0x%x dat=%u)\n",
+ 	    init_gpn0_con, init_gpn0_dat, init_gpn0_pud,
+ 	    (init_gpn0_con >> (HUSKY_IRQ_PIN * 4)) & 0xfu,
+ 	    (init_gpn0_dat >> HUSKY_IRQ_PIN) & 1u);
+@@ -196,7 +190,7 @@ husky_gpio_init(void)
+ 	husky_gpio_initialized = true;
+ 	lck_mtx_unlock(&husky_gpio_lock);
+ 
+-	printf("HUSKY GPIO: reset pin gpp21-2 (output high) and IRQ pin gpn0-0 (input) configured\n");
++	HU_LOG("HUSKY GPIO: reset pin gpp21-2 (output high) and IRQ pin gpn0-0 (input) configured\n");
+ 	return 0;
+ }
+ 
+@@ -263,48 +257,4 @@ husky_gpio_irq_is_asserted(void)
+ 	return (husky_gpio_irq_get() == 0) ? 1 : 0;
+ }
+ 
+-int
+-husky_gpio_power_check(void)
+-{
+-	if (husky_spi_init() != 0) {
+-		HU_LOG("HUSKY TOUCH: power check failed - SPI init error\n");
+-		return 0;
+-	}
+-
+-	/* Method 1: FTM5 address-based hardware register read (0xB6 0x00 0x04 + 1 dummy byte) */
+-	uint8_t ftm5_cmd[3] = {FTM5_CMD_HW_REG_R, FTM5_ADDR_DCHIP_ID_HI, FTM5_ADDR_DCHIP_ID_LO};
+-	uint8_t chip_id[2] = {0, 0};
+-
+-	int err = husky_spi_write_read_dummy(ftm5_cmd, sizeof(ftm5_cmd), chip_id, sizeof(chip_id), 1);
+-	if (err == 0 && chip_id[0] == FTS_CHIP_ID_0 && chip_id[1] == FTS_CHIP_ID_1) {
+-		HU_LOG("HUSKY TOUCH: controller is powered by bootloader, FTM5 chip ID verified 0x%02x 0x%02x\n",
+-		    chip_id[0], chip_id[1]);
+-		return 1;
+-	}
+-
+-	/* Method 2: Legacy STMFTS_READ_INFO (0x80) */
+-	delay(5000);
+-	uint8_t legacy_cmd = FTS_CMD_LEGACY_READ_INFO;
+-	chip_id[0] = 0;
+-	chip_id[1] = 0;
+-
+-	err = husky_spi_write_read_dummy(&legacy_cmd, 1, chip_id, sizeof(chip_id), 1);
+-	if (err == 0 && chip_id[0] == FTS_CHIP_ID_0 && chip_id[1] == FTS_CHIP_ID_1) {
+-		HU_LOG("HUSKY TOUCH: controller is powered by bootloader (legacy 0x80 with dummy), chip ID verified 0x%02x 0x%02x\n",
+-		    chip_id[0], chip_id[1]);
+-		return 1;
+-	}
+-
+-	err = husky_spi_write_read(&legacy_cmd, 1, chip_id, sizeof(chip_id));
+-	if (err == 0 && chip_id[0] == FTS_CHIP_ID_0 && chip_id[1] == FTS_CHIP_ID_1) {
+-		HU_LOG("HUSKY TOUCH: controller is powered by bootloader (legacy 0x80 direct), chip ID verified 0x%02x 0x%02x\n",
+-		    chip_id[0], chip_id[1]);
+-		return 1;
+-	}
+-
+-	HU_LOG("HUSKY TOUCH: chip ID read returned 0x%02x 0x%02x (err=%d, expected 0x%02x 0x%02x)\n",
+-	    chip_id[0], chip_id[1], err, FTS_CHIP_ID_0, FTS_CHIP_ID_1);
+-	return 0;
+-}
+-
+ #endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/bsd/dev/husky_gpio.h b/bsd/dev/husky_gpio.h
+index 4598a07..d5c9b81 100644
+--- a/bsd/dev/husky_gpio.h
++++ b/bsd/dev/husky_gpio.h
+@@ -43,13 +43,6 @@ int husky_gpio_irq_get(void);
+ /* Check if IRQ is asserted (active low: returns 1 if low, 0 if high) */
+ int husky_gpio_irq_is_asserted(void);
+ 
+-/*
+- * Check if the touch IC is powered by probing chip ID over SPI.
+- * Tries FTM5 address-based read (0xB6 0x00 0x04) with dummy byte framing,
+- * with fallback to legacy 0x80 read.
+- * Returns 1 if powered and responding with 0x36 0x40, 0 otherwise.
+- */
+-int husky_gpio_power_check(void);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/bsd/dev/husky_spi.c b/bsd/dev/husky_spi.c
+index 39ff107..7496d05 100644
+--- a/bsd/dev/husky_spi.c
++++ b/bsd/dev/husky_spi.c
+@@ -67,6 +67,11 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define REG_PENDING_CLR        0x24u
+ #define REG_SWAP_CFG           0x28u
+ #define REG_FB_CLK             0x2Cu
++#define REG_USI_CON            0xC4u
++#define REG_USI_OPTION         0xC8u
++#define USI_CON_RESET          (1u << 0)
++#define USI_OPTION_CLKREQ_ON   (1u << 1)
++#define USI_OPTION_CLKSTOP_ON  (1u << 2)
+ 
+ /* CH_CFG bits */
+ #define CH_HS_EN               (1u << 6)
+@@ -99,9 +104,6 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ /* FIFO depth on Exynos / Zuma SPI */
+ #define SPI_FIFO_DEPTH         64u
+ 
+-/* USI SW_CONF as read by husky_spi_probe_dump, ~0u if not read. */
+-uint32_t husky_spi_probe_swconf = ~0u;
+-
+ static vm_offset_t spi_base = 0;
+ static vm_offset_t sysreg_base = 0;
+ static bool husky_spi_initialized = false;
+@@ -209,7 +211,6 @@ husky_spi_probe_dump(void)
+ 	vm_offset_t sysreg = ml_io_map(HUSKY_SYSREG_HSI0_PA, HUSKY_SYSREG_HSI0_SIZE);
+ 	if (sysreg) {
+ 		uint32_t sw_conf = *(volatile uint32_t *)(sysreg + HUSKY_USI_SW_CONF_OFF);
+-		husky_spi_probe_swconf = sw_conf;
+ 		HU_LOG("HUSKY SPI: sysreg_hsi0@11020000 USI SW_CONF at 0x101c = 0x%x (mode: %s)\n",
+ 		    sw_conf,
+ 		    ((sw_conf & USI_SW_CONF_MASK) == USI_SW_CONF_SPI) ? "SPI" :
+@@ -226,6 +227,9 @@ husky_spi_probe_dump(void)
+ 		uint32_t mode_cfg = *(volatile uint32_t *)(spi + REG_MODE_CFG);
+ 		uint32_t cs_reg = *(volatile uint32_t *)(spi + REG_CS_REG);
+ 		uint32_t status = *(volatile uint32_t *)(spi + REG_STATUS);
++		uint32_t usi_con = *(volatile uint32_t *)(spi + REG_USI_CON);
++		uint32_t usi_opt = *(volatile uint32_t *)(spi + REG_USI_OPTION);
++		HU_LOG("  USI_CON   = 0x%08x, USI_OPTION = 0x%08x\n", usi_con, usi_opt);
+ 
+ 		HU_LOG("HUSKY SPI: spi@111D0000 registers:\n");
+ 		HU_LOG("  CH_CFG    = 0x%08x\n", ch_cfg);
+@@ -339,6 +343,20 @@ husky_spi_init(void)
+ 		return ENXIO;
+ 	}
+ 
++	/*
++	 * USI v2 wrapper at IP base + 0xC0 (Linux exynos-usi.c): the IP comes out
++	 * of reset with USI_CON.RESET set; clear it, and keep the clock requested
++	 * (CLKREQ_ON, CLKSTOP_ON off). Boot 0080 read every SPI register as 0.
++	 */
++	HU_LOG("HUSKY SPI: USI_CON 0x%x USI_OPTION 0x%x before enable\n",
++	    spi_rd(REG_USI_CON), spi_rd(REG_USI_OPTION));
++	spi_wr(REG_USI_CON, spi_rd(REG_USI_CON) & ~USI_CON_RESET);
++	delay(1);
++	spi_wr(REG_USI_OPTION, (spi_rd(REG_USI_OPTION) & ~USI_OPTION_CLKSTOP_ON) |
++	    USI_OPTION_CLKREQ_ON);
++	HU_LOG("HUSKY SPI: USI_CON 0x%x USI_OPTION 0x%x after enable\n",
++	    spi_rd(REG_USI_CON), spi_rd(REG_USI_OPTION));
++
+ 	/* Drive CS high (inactive) initially */
+ 	spi_wr(REG_CS_REG, CS_SIG_INACT);
+ 
+diff --git a/bsd/dev/husky_spi.h b/bsd/dev/husky_spi.h
+index 003e6da..aef193b 100644
+--- a/bsd/dev/husky_spi.h
++++ b/bsd/dev/husky_spi.h
+@@ -29,7 +29,6 @@ int husky_spi_check_power_and_clocks(uint32_t *out_pwr_cfg,
+  * (huskytouch=2). Does not modify hardware operational state.
+  */
+ int husky_spi_probe_dump(void);
+-extern uint32_t husky_spi_probe_swconf;
+ 
+ /*
+  * Initialize the USI SPI controller:
