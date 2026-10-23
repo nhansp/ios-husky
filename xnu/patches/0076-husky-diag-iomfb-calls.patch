@@ -1,0 +1,60 @@
+diff --git a/iokit/Kernel/arm/HuskyFramebuffer.cpp b/iokit/Kernel/arm/HuskyFramebuffer.cpp
+index 69d706a..97ef531 100644
+--- a/iokit/Kernel/arm/HuskyFramebuffer.cpp
++++ b/iokit/Kernel/arm/HuskyFramebuffer.cpp
+@@ -239,6 +239,13 @@ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x14c);
++	static uint32_t husky_fb_swapends_logged;
++
++	if (husky_fb_swapends_logged < 16) {
++		husky_fb_swapends_logged++;
++		IOLog("HUSKY FB: swapend %u mask 0x%x surfaces %u %u %u %u\n", get32(rec, 0x98), mask,
++		    get32(rec, 0x9c), get32(rec, 0xa0), get32(rec, 0xa4), get32(rec, 0xa8));
++	}
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -464,15 +471,34 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
+-	if (selector >= 64 || !(husky_fb_logged & (1ULL << selector))) {
+-		if (selector < 64) {
+-			husky_fb_logged |= 1ULL << selector;
+-		}
++	/*
++	 * Every call (first 400) with its scalar inputs and the head of the input
++	 * structure: shows what the window server asks for (display power, mode,
++	 * notification setup) and which selectors still answer with zeros.
++	 */
++	(void)husky_fb_logged;
++	static uint32_t husky_fb_calls_logged;
++	if (husky_fb_calls_logged < 400 && selector != kHuskyFBSwapBegin && selector != kHuskyFBSwapEnd) {
++		husky_fb_calls_logged++;
+ 		char name[32];
++		char sc[96] = "";
++		char st[56] = "";
++		int n = 0;
+ 		proc_selfname(name, sizeof(name));
+-		IOLog("HUSKY FB: %s sel %u in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-		    args->scalarInputCount, args->structureInputSize,
+-		    args->scalarOutputCount, args->structureOutputSize, ret);
++		for (uint32_t i = 0; i < args->scalarInputCount && i < 4 && n < (int)sizeof(sc) - 20; i++) {
++			n += snprintf(sc + n, sizeof(sc) - n, " 0x%llx", args->scalarInput[i]);
++		}
++		if (args->structureInputDescriptor == NULL && args->structureInput != NULL) {
++			const uint8_t *b = (const uint8_t *)args->structureInput;
++			n = 0;
++			for (uint32_t i = 0; i < args->structureInputSize && i < 16; i++) {
++				n += snprintf(st + n, sizeof(st) - n, "%02x", b[i]);
++			}
++		}
++		IOLog("HUSKY FB: %s sel %u in %u/%u [%s ] [%s] out %u/%u -> 0x%x%s\n", name, selector,
++		    args->scalarInputCount, args->structureInputSize, sc, st,
++		    args->scalarOutputCount, args->structureOutputSize, ret,
++		    (outCount == 0 && (args->scalarOutputCount || args->structureOutputSize)) ? " (zeros)" : "");
+ 	}
+ 	return ret;
+ }

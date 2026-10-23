@@ -26,9 +26,15 @@ if [[ "${1:-}" == -u ]]; then
 fi
 [[ -f "$KO" ]] || { echo "no $KO (build it, see header)" >&2; exit 1; }
 adb -s "$SERIAL" push "$KO" /data/local/tmp/hfsplus.ko >/dev/null
-# 512-byte sectors: start 40 GiB, length 20 GiB (ADT /husky-ufs root-offset).
+# 512-byte sectors: the whole iOS window, from 40 GiB (ADT /husky-ufs
+# root-offset) to 64 MiB (log-size) before the end of userdata. Since xnu 0075
+# grows the HFS+ volume to the window, its alternate volume header sits at the
+# window's end, and hfsplus rejects the volume if the mapping is shorter.
+# (Computed here: the device shell's arithmetic is 32-bit.)
+USERDATA=$(adb -s "$SERIAL" shell "su -c 'blockdev --getsize64 /dev/block/by-name/userdata'" | tr -d '\r')
+WINDOW_SECTORS=$(( (USERDATA - (40 << 30) - (64 << 20)) / 512 ))
 su "grep -q hfsplus /proc/filesystems || insmod /data/local/tmp/hfsplus.ko
-    dmctl getpath iosroot >/dev/null 2>&1 || dmctl create iosroot -ro linear 0 41943040 /dev/block/by-name/userdata 83886080
+    dmctl getpath iosroot >/dev/null 2>&1 || dmctl create iosroot -ro linear 0 $WINDOW_SECTORS /dev/block/by-name/userdata 83886080
     mkdir -p $MNT
     grep -q \" $MNT \" /proc/mounts || mount -t hfsplus -o ro \$(dmctl getpath iosroot) $MNT
     grep \" $MNT \" /proc/mounts"
