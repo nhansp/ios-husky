@@ -1,0 +1,331 @@
+diff --git a/bsd/kern/husky_amfi.c b/bsd/kern/husky_amfi.c
+index c237dc5..3f4e5c5 100644
+--- a/bsd/kern/husky_amfi.c
++++ b/bsd/kern/husky_amfi.c
+@@ -320,11 +320,50 @@ husky_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 		printf("HUSKY Sandbox: containermanagerd op %d\n", call);
+ 	}
+ 	switch (call) {
+-	case 4:         /* container path (audit token / pid) */
+-	case 5:         /* extension issue */
+-	case 6:         /* extension consume */
++	case 4:
++		/*
++		 * Container path for a pid / audit token: none. containermanagerd
++		 * also asks this for its clients, and a path would make it enforce
++		 * its client-sandbox rules; "not found" is the permissive answer.
++		 */
+ 		return ENOENT;
+-	default:        /* including 0x43, container expected: none */
++	case 5: {
++		/*
++		 * Extension issue (iOS 26): arg = u64[7] {class, type, subject,
++		 * flags, char *out (0x3ff0 bytes), pid, pidversion}. Userland treats
++		 * the token as opaque (only "invalid" is special); containermanagerd
++		 * hands it to clients (gamed needs one) and truncates at 0x800.
++		 */
++		static uint64_t husky_ext_seq;
++		uint64_t a[7];
++		char cls[96] = "", subj[256] = "", tok[480];
++		size_t got = 0;
++		if (copyin(arg, a, sizeof(a)) != 0 || a[4] == 0) {
++			return EINVAL;
++		}
++		if (a[0] != 0) {
++			(void)copyinstr((user_addr_t)a[0], cls, sizeof(cls), &got);
++		}
++		if (a[2] != 0) {
++			(void)copyinstr((user_addr_t)a[2], subj, sizeof(subj), &got);
++		}
++		cls[sizeof(cls) - 1] = '\0';
++		subj[sizeof(subj) - 1] = '\0';
++		snprintf(tok, sizeof(tok), "husky:%llx;%s;%llu;%llx;%lld;%s",
++		    ++husky_ext_seq, cls, a[1], a[3], (long long)a[5], subj);
++		return copyout(tok, (user_addr_t)a[4], strlen(tok) + 1);
++	}
++	case 6: {
++		/* Extension consume: arg = u64[3] {token, strlen + 1, u64 *handle}; handle >= 0. */
++		static uint64_t husky_ext_handle;
++		uint64_t a[3], h;
++		if (copyin(arg, a, sizeof(a)) != 0) {
++			return EINVAL;
++		}
++		h = ++husky_ext_handle;
++		return a[2] != 0 ? copyout(&h, (user_addr_t)a[2], sizeof(h)) : 0;
++	}
++	default:        /* 7 release (also of unknown handles), 0x43 container expected: none, ... */
+ 		return 0;
+ 	}
+ }
+diff --git a/iokit/Kernel/arm/HuskyFramebuffer.cpp b/iokit/Kernel/arm/HuskyFramebuffer.cpp
+index 97ef531..e9a97f6 100644
+--- a/iokit/Kernel/arm/HuskyFramebuffer.cpp
++++ b/iokit/Kernel/arm/HuskyFramebuffer.cpp
+@@ -42,6 +42,9 @@ extern "C" int husky_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+@@ -127,6 +130,68 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++static void
++husky_fb_set_number(OSDictionary *d, const char *key, uint64_t v)
++{
++	OSNumber *n = OSNumber::withNumber(v, 32);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++static void
++husky_fb_set_number_array(OSDictionary *d, const char *key, uint64_t v)
++{
++	OSNumber *n = OSNumber::withNumber(v, 32);
++	OSArray *a = n != NULL ? OSArray::withObjects((const OSObject **)&n, 1, 1) : NULL;
++	if (a != NULL) {
++		d->setObject(key, a);
++	}
++	OSSafeReleaseNULL(a);
++	OSSafeReleaseNULL(n);
++}
++
++/*
++ * Display capabilities QuartzCore reads (AppleDisplay::update_display_limits):
++ * one layer (our swap is a CPU copy of a single surface, no blending or
++ * scaling), source limits that cover the 1344x2992 panel (defaults are
++ * 1920x1200 rects), no multi-plane/YUV/rotation, and the plane base
++ * alignment as the dictionary CA expects (a bare number is dropped).
++ */
++static void
++husky_fb_publish_limits(IOService *fb)
++{
++	OSDictionary *layers = OSDictionary::withCapacity(2);
++	OSDictionary *src = OSDictionary::withCapacity(6);
++	OSDictionary *align = OSDictionary::withCapacity(1);
++
++	if (layers != NULL) {
++		husky_fb_set_number(layers, "MaxNumLayers", 1);
++		husky_fb_set_number(layers, "FullFrameRequired", 0);
++		fb->setProperty("IOMFBNumLayers", layers);
++	}
++	if (src != NULL) {
++		husky_fb_set_number(src, "MaxSrcBufferWidth", 4096);
++		husky_fb_set_number(src, "MaxSrcBufferHeight", 4096);
++		husky_fb_set_number(src, "MaxSrcRectWidth", 4096);
++		husky_fb_set_number_array(src, "MaxSrcRectWidthForPipe", 4096);
++		husky_fb_set_number(src, "MaxSrcRectTotal", 16777216);
++		husky_fb_set_number_array(src, "MaxSrcRectHeightForPipe", 4096);
++		fb->setProperty("IOMFBMaxSrcPixels", src);
++	}
++	if (align != NULL) {
++		husky_fb_set_number(align, "PlaneBaseAlignmentLinear", 64);
++		fb->setProperty("DisplayPipePlaneBaseAlignment", align);
++	}
++	fb->setProperty("IOMFBRGBMultiPlaneSupportKey", false);
++	fb->setProperty("IOMFBYUVSupportKey", false);
++	fb->setProperty("IOMFBSupportsRotation", false);
++	OSSafeReleaseNULL(layers);
++	OSSafeReleaseNULL(src);
++	OSSafeReleaseNULL(align);
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -164,7 +229,7 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	husky_fb_publish_limits(this);
+ 	registerService();
+ 	IOLog("HUSKY FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id);
+@@ -460,6 +525,21 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			    args->scalarInput[0] ? "on" : "off");
+ 		}
+ 		break;
++	case 29: {
++		/*
++		 * GetDisplayArea: two float32, the panel's physical size in mm
++		 * (-[CADisplay physicalSize]); 69.8 x 155.4, written as IEEE-754
++		 * bit patterns (no floating point in the kernel).
++		 */
++		if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL &&
++		    args->structureOutputSize >= 8) {
++			uint32_t area[2] = { 0x428b999a, 0x431b6666 };
++			memcpy(args->structureOutput, area, sizeof(area));
++			args->structureOutputSize = sizeof(area);
++			return kIOReturnSuccess;
++		}
++		break;
++	}
+ 	case kHuskyFBSwapWait:
+ 	default:
+ 		break;
+diff --git a/iokit/Kernel/arm/HuskySurface.cpp b/iokit/Kernel/arm/HuskySurface.cpp
+index 895b0d3..0a39020 100644
+--- a/iokit/Kernel/arm/HuskySurface.cpp
++++ b/iokit/Kernel/arm/HuskySurface.cpp
+@@ -57,7 +57,7 @@ enum {
+ 	kHuskySurfaceTrapReleaseFailed  = 5,
+ };
+ 
+-#define HUSKY_SURFACE_RESULT_SIZE       0xa68
++#define HUSKY_SURFACE_RESULT_SIZE       0xc68   /* iOS 26: 0x88 header + 20 x 0x98 planes */
+ #define HUSKY_SURFACE_MAX_ID            4096
+ #define HUSKY_SURFACE_MAX_DIM           16384
+ #define HUSKY_SURFACE_MAX_ALLOC         (256u << 20)
+@@ -424,6 +424,7 @@ public:
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
++	IOReturn trapNop(void *, void *, void *, void *, void *, void *);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+@@ -566,36 +567,41 @@ put64(uint8_t *p, uint32_t off, uint64_t v)
+ static void
+ husky_surface_fill_result(HuskySurface *s, HuskySurfaceRef *ref, uint8_t *out)
+ {
++	/*
++	 * iOS 26 layout (__ioSurfaceClientCreateWithLockResult): u64 fields,
++	 * header 0x88, then 20 planes of 0x98 bytes.
++	 */
+ 	bzero(out, HUSKY_SURFACE_RESULT_SIZE);
+ 	put64(out, 0x00, ref->data->getAddress());
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + HUSKY_SURFACE_TIMESTAMPS);
+ 	put32(out, 0x18, s->id);
+-	put32(out, 0x1c, s->allocSize);
+-	put32(out, 0x20, s->width);
+-	put32(out, 0x24, s->height);
+-	put32(out, 0x28, s->bytesPerRow);
+-	put32(out, 0x2c, s->offset);
+-	put32(out, 0x30, s->pixelFormat);
+-	put32(out, 0x34, s->allocSize);
+-	put32(out, 0x38, s->planeCount);
+-	memcpy(out + 0x40, &s->bytesPerElement, 2);
+-	out[0x42] = s->elementWidth;
+-	out[0x43] = s->elementHeight;
+-	put32(out, 0x44, s->cacheMode);
+-	put32(out, 0x50, s->parentID);
+-	put32(out, 0x54, 1);
+-	for (uint32_t i = 0; i < s->planeCount; i++) {
+-		uint8_t *p = out + 0x68 + i * 0x80;
++	put64(out, 0x20, s->allocSize);
++	put64(out, 0x28, s->width);
++	put64(out, 0x30, s->height);
++	put64(out, 0x38, s->bytesPerRow);
++	put64(out, 0x40, s->offset);
++	put32(out, 0x48, s->pixelFormat);
++	put64(out, 0x50, s->allocSize);         /* bytes flushed by FlushProcessorCaches */
++	put32(out, 0x58, s->planeCount);
++	memcpy(out + 0x60, &s->bytesPerElement, 2);
++	out[0x62] = s->elementWidth;
++	out[0x63] = s->elementHeight;
++	put32(out, 0x64, s->cacheMode);
++	put32(out, 0x70, s->parentID);
++	put32(out, 0x74, 1);                    /* slice count */
++	put64(out, 0x78, s->id);                /* trace id */
++	for (uint32_t i = 0; i < s->planeCount && i < HUSKY_SURFACE_MAX_PLANES; i++) {
++		uint8_t *p = out + 0x88 + i * 0x98;
+ 		const struct husky_surface_plane *pl = &s->planes[i];
+-		put32(p, 0x00, pl->width);
+-		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
+-		put32(p, 0x0c, pl->offset);
+-		put32(p, 0x14, pl->size);
+-		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+-		p[0x1a] = pl->elementWidth;
+-		p[0x1b] = pl->elementHeight;
++		put64(p, 0x00, pl->width);
++		put64(p, 0x08, pl->height);
++		put64(p, 0x18, pl->offset);
++		put64(p, 0x20, pl->bytesPerRow);
++		put64(p, 0x28, pl->size);
++		memcpy(p + 0x30, &pl->bytesPerElement, 2);
++		p[0x32] = pl->elementWidth;
++		p[0x33] = pl->elementHeight;
+ 	}
+ }
+ 
+@@ -730,12 +736,26 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 
+ 	switch (selector) {
+ 	case kHuskySurfaceLimits: {
+-		uint8_t limits[0x18] = { 0 };
+-		put32(limits, 0x0, HUSKY_SURFACE_ROW_ALIGN - 1);
+-		put32(limits, 0x4, HUSKY_SURFACE_ROW_ALIGN - 1);
+-		limits[0x16] = 1;
++		/*
++		 * iOS 26 (____ioSurfaceConnectInternal_block_invoke): 0x28-byte reply,
++		 * u16 ABI version at +0x22 must be 1, else the framework closes its
++		 * connection for good ("IOSurface.framework versus IOSurface.kext
++		 * version mismatch") and every create fails client side.
++		 * +0x00/+0x04 offset / bytes-per-row alignment masks, +0x08 max bytes
++		 * per row, +0x10/+0x18 max width/height, +0x20 = 0: the timestamp page
++		 * is mapped read-only, so the client must use selectors 0x21/0x2b.
++		 */
++		uint8_t limits[0x28] = { 0 };
++		put32(limits, 0x00, HUSKY_SURFACE_ROW_ALIGN - 1);
++		put32(limits, 0x04, HUSKY_SURFACE_ROW_ALIGN - 1);
++		put64(limits, 0x08, 0x40000);
++		put64(limits, 0x10, 16384);
++		put64(limits, 0x18, 16384);
++		limits[0x20] = 0;
++		limits[0x22] = 1;
+ 		husky_surf_log_once("sel", selector);
+-		return husky_struct_out(args, limits, sizeof(limits));
++		return husky_struct_out(args, limits,
++		    args->structureOutputSize >= sizeof(limits) || args->structureOutputDescriptor ? sizeof(limits) : 0x18);
+ 	}
+ 	case kHuskySurfaceCreate:
+ 		return create(args);
+@@ -861,19 +881,36 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ 	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
+ }
+ 
++/* Accepted and ignored: RemoveCoreVideoBridgedValues (8), RemoveBulkAttachments (9). */
++IOReturn
++IOSurfaceRootUserClient::trapNop(void *, void *, void *, void *, void *, void *)
++{
++	return kIOReturnSuccess;
++}
++
++/*
++ * iOS 26 _IOSurfaceClientRelease always issues trap 4 then trap 5 for one
++ * release; only trap 4 drops our reference, or a surface looked up twice
++ * would be unmapped while still in use.
++ */
+ static IOExternalTrap husky_surface_traps[] = {
+ 	[kHuskySurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+ 	[kHuskySurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+ 	[kHuskySurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kHuskySurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	[kHuskySurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+-	[kHuskySurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
++	[kHuskySurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapNop },
++	[6]                              = { NULL, NULL },      /* shared-event wait: unsupported */
++	[7]                              = { NULL, NULL },
++	[8]                              = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapNop },
++	[9]                              = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapNop },
+ };
+ 
+ IOExternalTrap *
+ IOSurfaceRootUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 index)
+ {
+-	if (index >= sizeof(husky_surface_traps) / sizeof(husky_surface_traps[0])) {
++	if (index >= sizeof(husky_surface_traps) / sizeof(husky_surface_traps[0]) ||
++	    husky_surface_traps[index].func == NULL) {
+ 		husky_surf_log_once("trap", index);
+ 		return NULL;
+ 	}
