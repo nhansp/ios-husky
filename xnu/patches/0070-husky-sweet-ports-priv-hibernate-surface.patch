@@ -1,0 +1,580 @@
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index c64e636..cc7cb94 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -153,6 +153,44 @@ mmioctl(dev_t dev, u_long cmd, __unused caddr_t data,
+ 	return 0;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++/*
++ * HUSKY: daemons started by launchd write stdout/stderr to /dev/null, and
++ * pointing a launchd job at /dev/console stops it from launching at all
++ * (backboardd, v8 image). Instead, what the processes named in boot-arg
++ * huskynull (comma separated, default "backboardd,SpringBoard") write to
++ * /dev/null goes to the console (and so to the persistent log) as
++ * "|name| text". huskynull=- turns it off.
++ */
++static char husky_null_names[128];
++static int husky_null_parsed;
++
++static bool
++husky_null_tee(char *name, size_t len)
++{
++	if (!husky_null_parsed) {
++		if (!PE_parse_boot_argn("huskynull", husky_null_names, sizeof(husky_null_names))) {
++			strlcpy(husky_null_names, "backboardd,SpringBoard", sizeof(husky_null_names));
++		}
++		husky_null_parsed = 1;
++	}
++	proc_selfname(name, (int)len);
++	size_t n = strlen(name);
++	for (const char *t = husky_null_names; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++#endif
++
+ int
+ mmrw(dev_t dev, struct uio *uio, enum uio_rw rw)
+ {
+@@ -216,6 +254,22 @@ mmrw(dev_t dev, struct uio *uio, enum uio_rw rw)
+ 			if (rw == UIO_READ) {
+ 				return 0;
+ 			}
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++			{
++				char name[32];
++				if (husky_null_tee(name, sizeof(name))) {
++					char buf[256];
++					c = MIN(uio_curriovlen(uio), sizeof(buf));
++					error = uiomove(buf, (int)c, uio);
++					if (error) {
++						break;
++					}
++					printf("|%s| %.*s%s", name, (int)c, buf,
++					    (c > 0 && buf[c - 1] == '\n') ? "" : "\n");
++					continue;
++				}
++			}
++#endif
+ 			c = uio_curriovlen(uio);
+ 
+ 			error = 0; /* Always succeeds, always consumes all input */
+diff --git a/bsd/kern/husky_amfi.c b/bsd/kern/husky_amfi.c
+index c6bb6b0..c237dc5 100644
+--- a/bsd/kern/husky_amfi.c
++++ b/bsd/kern/husky_amfi.c
+@@ -29,6 +29,7 @@
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
+ #include <sys/mount.h>
++#include <sys/priv.h>
+ #include <sys/proc.h>
+ #include <sys/systm.h>
+ #include <pexpert/pexpert.h>      /* kprintf */
+@@ -389,8 +390,46 @@ static struct mac_policy_conf husky_amfi_syscall_conf = {
+ 
+ static mac_policy_handle_t husky_amfi_syscall_handle;
+ 
++/*
++ * Privileges for non-root processes come from MAC policies (priv_check_cred
++ * -> mac_priv_grant); on iOS Sandbox/AMFI grant them. Without a grant UIKit
++ * apps die in CoreAnimation setup: work_interval_create(CA_CLIENT) needs
++ * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard).
++ * Grant that one; log the first denial of each other privilege per process.
++ */
++#define HUSKY_PRIV_LOG_MAX      64
++static struct {
++	int  priv;
++	char name[20];
++} husky_priv_logged[HUSKY_PRIV_LOG_MAX];
++static int husky_priv_logged_count;
++
++static int
++husky_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
++{
++	if (priv == PRIV_WORK_INTERVAL) {
++		return 0;
++	}
++	char name[20];
++	proc_selfname(name, sizeof(name));
++	for (int i = 0; i < husky_priv_logged_count; i++) {
++		if (husky_priv_logged[i].priv == priv &&
++		    strncmp(husky_priv_logged[i].name, name, sizeof(name)) == 0) {
++			return EPERM;
++		}
++	}
++	if (husky_priv_logged_count < HUSKY_PRIV_LOG_MAX) {
++		husky_priv_logged[husky_priv_logged_count].priv = priv;
++		strlcpy(husky_priv_logged[husky_priv_logged_count].name, name, sizeof(name));
++		husky_priv_logged_count++;
++		printf("HUSKY Sandbox: %s privilege %d denied\n", name, priv);
++	}
++	return EPERM;
++}
++
+ static const struct mac_policy_ops husky_sandbox_mac_ops = {
+ 	.mpo_policy_syscall = husky_sandbox_syscall,
++	.mpo_priv_grant = husky_sandbox_priv_grant,
+ };
+ 
+ static struct mac_policy_conf husky_sandbox_mac_conf = {
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index ca2addc..1836afc 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -6703,7 +6703,12 @@ out:
+ 	return error;
+ }
+ 
+-#if !XNU_TARGET_OS_OSX
++#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_HUSKY)
++/*
++ * HUSKY runs the iOS userland on the macOS config: SpringBoard calls
++ * pid_hibernate when an app leaves the foreground, and nosys (SIGSYS)
++ * killed it. Without CONFIG_FREEZE this returns ENOTSUP for pid >= -1.
++ */
+ /*
+  * Freeze the specified process (provided in args->pid), or find and freeze a PID.
+  * When a process is specified, this call is blocking, otherwise we wake up the
+@@ -6776,7 +6781,7 @@ out:
+ 	*ret = error;
+ 	return error;
+ }
+-#endif /* !XNU_TARGET_OS_OSX */
++#endif /* !XNU_TARGET_OS_OSX || HUSKY */
+ 
+ #if SOCKETS
+ 
+diff --git a/bsd/kern/syscalls.master b/bsd/kern/syscalls.master
+index c08a74c..f686855 100644
+--- a/bsd/kern/syscalls.master
++++ b/bsd/kern/syscalls.master
+@@ -650,7 +650,7 @@
+ 432	AUE_NULL	ALL	{ int audit_session_port(au_asid_t asid, user_addr_t portnamep); }
+ 433	AUE_NULL	ALL	{ int pid_suspend(int pid); }
+ 434	AUE_NULL	ALL	{ int pid_resume(int pid); }
+-#if CONFIG_EMBEDDED
++#if CONFIG_EMBEDDED || defined(ARM64_BOARD_CONFIG_HUSKY)
+ 435	AUE_NULL	ALL	{ int pid_hibernate(int pid); }
+ #else
+ 435     AUE_NULL        ALL     { int nosys(void); }
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index e3c0911..669da31 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2728,6 +2728,61 @@ is_io_service_match_property_table_bin(
+ 	return internal_io_service_match_property_table(service, matching, matchingCnt, matches);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++/*
++ * HUSKY IOKit trace: registry and matching calls made by the processes
++ * named in boot-arg huskyiolog (comma separated, default
++ * "backboardd,SpringBoard"; "-" turns it off) are printed as
++ * "IOK name: ...", at most 400 lines per boot, to find out what a daemon
++ * looks for before it gives up.
++ */
++static char husky_iolog_names[128];
++static int husky_iolog_parsed;
++static uint32_t husky_iolog_lines;
++
++static bool
++husky_iolog(char *name, size_t len)
++{
++	if (!husky_iolog_parsed) {
++		if (!PE_parse_boot_argn("huskyiolog", husky_iolog_names, sizeof(husky_iolog_names))) {
++			strlcpy(husky_iolog_names, "backboardd,SpringBoard", sizeof(husky_iolog_names));
++		}
++		husky_iolog_parsed = 1;
++	}
++	if (husky_iolog_lines >= 400) {
++		return false;
++	}
++	proc_selfname(name, (int)len);
++	size_t n = strlen(name);
++	for (const char *t = husky_iolog_names; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
++			husky_iolog_lines++;
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
++/* Compact XML of a matching dictionary, at most 240 characters. */
++static void
++husky_iolog_dict(const char *name, const char *what, OSObject *dict, const char *result)
++{
++	OSSerialize *ser = OSSerialize::withCapacity(256);
++	const char *text = "?";
++	if (ser != NULL && dict != NULL && dict->serialize(ser)) {
++		text = ser->text();
++	}
++	IOLog("IOK %s: %s %.240s -> %s\n", name, what, text, result);
++	OSSafeReleaseNULL(ser);
++}
++#endif
++
+ static kern_return_t
+ internal_io_service_get_matching_services(
+ 	mach_port_t main_port,
+@@ -2748,7 +2803,23 @@ internal_io_service_get_matching_services(
+ 
+ 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
+-		*existing = IOUserIterator::withIterator(IOService::getMatchingServices( dict ));
++		OSIterator *found = IOService::getMatchingServices( dict );
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++		char sname[32];
++		if (husky_iolog(sname, sizeof(sname))) {
++			unsigned int count = 0;
++			if (found != NULL) {
++				while (found->getNextObject() != NULL) {
++					count++;
++				}
++				found->reset();
++			}
++			char res[16];
++			snprintf(res, sizeof(res), "%u found", count);
++			husky_iolog_dict(sname, "matching", dict, res);
++		}
++#endif
++		*existing = IOUserIterator::withIterator(found);
+ 		kr = kIOReturnSuccess;
+ 	} else {
+ 		kr = kIOReturnBadArgument;
+@@ -2833,6 +2904,13 @@ internal_io_service_get_matching_service(
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
+ 		*service = IOService::copyMatchingService( dict );
+ 		kr = *service ? kIOReturnSuccess : kIOReturnNotFound;
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++		char sname[32];
++		if (husky_iolog(sname, sizeof(sname))) {
++			husky_iolog_dict(sname, "matching1", dict,
++			    *service ? (*service)->getMetaClass()->getClassName() : "none");
++		}
++#endif
+ 	} else {
+ 		kr = kIOReturnBadArgument;
+ 	}
+@@ -2936,6 +3014,14 @@ internal_io_service_add_notification(
+ 			continue;
+ 		}
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++		{
++			char sname[32];
++			if (husky_iolog(sname, sizeof(sname))) {
++				husky_iolog_dict(sname, notification_type, dict, "notify");
++			}
++		}
++#endif
+ 
+ 		if ((sym == gIOPublishNotification)
+ 		    || (sym == gIOFirstPublishNotification)) {
+@@ -3417,6 +3503,15 @@ is_io_registry_entry_from_path(
+ 	}
+ 
+ 	entry = IORegistryEntry::fromPath( path );
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	{
++		char sname[32];
++		if (husky_iolog(sname, sizeof(sname))) {
++			IOLog("IOK %s: path %.200s -> %s\n", sname, path,
++			    entry ? entry->getMetaClass()->getClassName() : "none");
++		}
++	}
++#endif
+ 
+ 	if (!entry && IOTaskRegistryCompatibility(current_task())) {
+ 		OSDictionary * matching;
+@@ -4226,6 +4321,14 @@ is_io_registry_entry_get_child_iterator(
+ 
+ 	*iterator = IOUserIterator::withIterator(entry->getChildIterator(
+ 		    IORegistryEntry::getPlane( plane )));
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	{
++		char sname[32];
++		if (husky_iolog(sname, sizeof(sname))) {
++			IOLog("IOK %s: children of %s in %.32s\n", sname, entry->getName(), plane);
++		}
++	}
++#endif
+ 
+ 	return kIOReturnSuccess;
+ }
+@@ -4441,6 +4544,15 @@ is_io_service_open_extended(
+ #endif
+ 		res = service->newUserClient( owningTask, (void *) owningTask,
+ 		    connect_type, propertiesDict, &client );
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++		{
++			char sname[32];
++			if (husky_iolog(sname, sizeof(sname))) {
++				IOLog("IOK %s: open %s type %u -> 0x%x\n", sname,
++				    service->getMetaClass()->getClassName(), connect_type, res);
++			}
++		}
++#endif
+ 
+ 		if (propertiesDict) {
+ 			propertiesDict->release();
+diff --git a/iokit/Kernel/arm/HuskyFramebuffer.cpp b/iokit/Kernel/arm/HuskyFramebuffer.cpp
+index a567a14..69d706a 100644
+--- a/iokit/Kernel/arm/HuskyFramebuffer.cpp
++++ b/iokit/Kernel/arm/HuskyFramebuffer.cpp
+@@ -26,11 +26,13 @@
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+- * the GUI by default: pausing it (boot-arg huskyfb_noconsole=1, on the
+- * first swap) switches the console to serial, which also hides panics.
++ * the GUI by default: boot-arg huskyfb_noconsole=1 stops drawing it from
++ * the first swap on (it still reaches the persistent log; panics draw).
+  */
+ #include "HuskySurface.h"
+ 
++extern "C" int husky_console_muted;     /* osfmk/console/serial_console.c */
++
+ #if defined(HUSKY)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+@@ -242,9 +244,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		int quiet = 0;
+ 		fConsolePaused = true;
+ 		if (PE_parse_boot_argn("huskyfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
+-			PE_Video video;
+-			PE_current_console(&video);
+-			PE_initialize_console(&video, kPEDisableScreen);
++			/* Not PE_initialize_console(kPEDisableScreen): its console switch
++			 * writes the read-only-late cons_ops_index and panics. */
++			husky_console_muted = 1;
+ 		}
+ 	}
+ 
+diff --git a/iokit/Kernel/arm/HuskyKeyStore.cpp b/iokit/Kernel/arm/HuskyKeyStore.cpp
+index c17734b..51599ab 100644
+--- a/iokit/Kernel/arm/HuskyKeyStore.cpp
++++ b/iokit/Kernel/arm/HuskyKeyStore.cpp
+@@ -42,11 +42,13 @@ enum {
+ 	kAKSLockBag          = 13,
+ 	kAKSGetSystem        = 14,
+ 	kAKSGetDeviceState   = 17,
++	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
+ 	kAKSAssertHold       = 26,
+ 	kAKSAssertDrop       = 27,
+ 	kAKSUnloadSessionBags = 55,
+ 	kAKSNotifyStateSet   = 102,
+ 	kAKSNotifyStateIsSet = 103,
++	kAKSAssertConsume    = 101,     /* aks_assert_consume */
+ };
+ 
+ /* The system (device) bag handle. */
+@@ -191,6 +193,7 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	case kAKSLockBag:
+ 	case kAKSAssertHold:
+ 	case kAKSAssertDrop:
++	case kAKSAssertConsume:
+ 	case kAKSUnloadSessionBags:
+ 	case kAKSNotifyStateSet:
+ 		args->scalarOutputCount = 0;
+@@ -221,6 +224,7 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutputCount = 1;
+ 		break;
+ 	case kAKSGetDeviceState:
++	case kAKSGetExtDeviceState:
+ 		args->scalarOutputCount = 0;
+ 		ret = husky_aks_device_state(args);
+ 		break;
+diff --git a/iokit/Kernel/arm/HuskySurface.cpp b/iokit/Kernel/arm/HuskySurface.cpp
+index 7e44ba8..895b0d3 100644
+--- a/iokit/Kernel/arm/HuskySurface.cpp
++++ b/iokit/Kernel/arm/HuskySurface.cpp
+@@ -407,7 +407,7 @@ class IOSurfaceRootUserClient : public IOUserClient {
+ 	OSArray *fRefs;
+ 
+ 	HuskySurfaceRef *findRef(uint32_t id, unsigned int *index);
+-	IOReturn addRef(HuskySurface *s, HuskySurfaceRef **refOut);
++	IOReturn addRef(HuskySurface *s, HuskySurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(HuskySurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
+ 
+@@ -495,17 +495,25 @@ IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
+ /*
+  * Count one more create/lookup of s by this client, mapping it into the
+  * task the first time. Takes over the caller's user count on s.
++ *
++ * A lookup of a surface this client already has maps nothing and counts
++ * nothing (*existing): IOSurface.framework then gets base address -1 in the
++ * lock result and reuses its cached IOSurfaceClient. Counting it instead
++ * made the framework build a second client for the same id; releasing that
++ * one (traps 4 + 5) unmapped the memory under the first (backboardd
++ * snapshot crash in CGDataProviderCreateWithData).
+  */
+ IOReturn
+-IOSurfaceRootUserClient::addRef(HuskySurface *s, HuskySurfaceRef **refOut)
++IOSurfaceRootUserClient::addRef(HuskySurface *s, HuskySurfaceRef **refOut, bool *existing)
+ {
++	*existing = false;
+ 	IOLockLock(fLock);
+ 	HuskySurfaceRef *ref = findRef(s->id, NULL);
+ 	if (ref != NULL && ref->surface == s) {
+-		ref->count++;
+ 		IOLockUnlock(fLock);
+ 		husky_surface_put(s);
+ 		*refOut = ref;
++		*existing = true;
+ 		return kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(fLock);
+@@ -615,7 +623,8 @@ IOReturn
+ IOSurfaceRootUserClient::returnSurface(HuskySurface *s, IOExternalMethodArguments *args)
+ {
+ 	HuskySurfaceRef *ref = NULL;
+-	IOReturn ret = addRef(s, &ref);
++	bool existing = false;
++	IOReturn ret = addRef(s, &ref, &existing);
+ 	if (ret != kIOReturnSuccess) {
+ 		return ret;
+ 	}
+@@ -624,10 +633,13 @@ IOSurfaceRootUserClient::returnSurface(HuskySurface *s, IOExternalMethodArgument
+ 		ret = kIOReturnNoMemory;
+ 	} else {
+ 		husky_surface_fill_result(s, ref, out);
++		if (existing) {
++			put64(out, 0x00, ~0ULL);        /* "already yours": use the cached client */
++		}
+ 		ret = husky_struct_out(args, out, HUSKY_SURFACE_RESULT_SIZE);
+ 		IOFreeData(out, HUSKY_SURFACE_RESULT_SIZE);
+ 	}
+-	if (ret != kIOReturnSuccess) {
++	if (ret != kIOReturnSuccess && !existing) {
+ 		/* The caller never learns the id: undo this create/lookup. */
+ 		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
+ 	}
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index f15235c..60b1fab 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -277,6 +277,12 @@ _cnputc(char c, bool poll)
+  */
+ #if defined(ARM64_BOARD_CONFIG_HUSKY)
+ extern void husky_log_append(const char *c, int size);  /* bsd/dev/husky_ufs.c */
++/*
++ * Set by AppleCLCD (boot-arg huskyfb_noconsole=1) once the GUI presents:
++ * console text still goes to the persistent log, but is not drawn over
++ * the GUI. A panic draws again.
++ */
++int husky_console_muted;
+ #endif
+ 
+ static inline void
+@@ -284,6 +290,9 @@ _cnputs(char *c, int size, bool poll)
+ {
+ #if defined(ARM64_BOARD_CONFIG_HUSKY)
+ 	husky_log_append(c, size);
++	if (husky_console_muted && !panic_active()) {
++		return;
++	}
+ #endif
+ 
+ 	if (disableConsoleOutput) {
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 4e8afb3..ed02129 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -962,6 +962,7 @@ exception_triage(
+ 
+ #if defined(ARM64_BOARD_CONFIG_HUSKY)
+ #include <vm/vm_shared_region_xnu.h>
++#include <vm/vm_map_lock_internal.h>
+ #include <arm/thread.h>
+ 
+ /*
+@@ -1011,6 +1012,51 @@ husky_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 		fp = frame[0];
+ 	}
+ 	printf("%s\n", line);
++
++	if (sig == 11 || sig == 10) {
++		/*
++		 * Which mapping the faulting address is in, or which two it falls
++		 * between (ported from ios-sweet 0066). The entries are copied out
++		 * under the map interlock and printed after it is dropped.
++		 */
++		struct {
++			uint64_t start, end;
++			int prot, maxprot, tag;
++		} e[2];
++		int ne = 0;
++		bool inside;
++		uint64_t far = (uint64_t)saved_state64(ss)->far;
++		vm_map_t map = current_map();
++		vm_map_entry_t entry;
++
++		vm_map_ilk_lock_shared(map);
++		inside = vm_map_lookup_or_next(map, (vm_map_offset_t)far, &entry);
++		for (int i = 0; i < 2; i++) {
++			/* inside: the entry holding far; else the entry before, then the one after */
++			vm_map_entry_t cur = inside ? entry : (i == 0 ? entry->vme_prev : entry);
++			if (cur == vm_map_to_entry(map)) {
++				if (inside) {
++					break;
++				}
++				continue;
++			}
++			e[ne].start = (uint64_t)cur->vme_start;
++			e[ne].end = (uint64_t)cur->vme_end;
++			e[ne].prot = cur->protection;
++			e[ne].maxprot = cur->max_protection;
++			e[ne].tag = (int)VME_ALIAS(cur);
++			ne++;
++			if (inside) {
++				break;
++			}
++		}
++		vm_map_ilk_unlock_shared(map);
++		for (int i = 0; i < ne; i++) {
++			printf("CRASH %s map%s 0x%llx-0x%llx prot %d/%d tag %d\n", name,
++			    inside ? " (far inside)" : ((i == 0 && e[0].end <= far) ? " before far" : " after far"),
++			    e[i].start, e[i].end, e[i].prot, e[i].maxprot, e[i].tag);
++		}
++	}
+ }
+ 
+ /*
+@@ -1038,7 +1084,7 @@ husky_sample_task(const char *name, int pid, task_t task)
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+ 		arm_saved_state_t *ss = find_user_regs(thread);
+-		char line[220];
++		char line[400];
+ 		int n;
+ 		uint64_t fp;
+ 
+@@ -1048,7 +1094,7 @@ husky_sample_task(const char *name, int pid, task_t task)
+ 		fp = get_saved_state_fp(ss);
+ 		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
+ 		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
+-		for (int i = 0; i < 10 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+ 			uint64_t frame[2];
+ 			if (vm_map_read_user(map, (vm_map_address_t)fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+ 				break;
