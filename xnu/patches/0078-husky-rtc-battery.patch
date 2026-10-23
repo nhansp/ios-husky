@@ -1,0 +1,247 @@
+diff --git a/iokit/Kernel/arm/HuskyBattery.cpp b/iokit/Kernel/arm/HuskyBattery.cpp
+new file mode 100644
+index 0000000..a8357df
+--- /dev/null
++++ b/iokit/Kernel/arm/HuskyBattery.cpp
+@@ -0,0 +1,144 @@
++/*
++ * Built-in static battery for husky, the static part of ios-sweet's
++ * SweetBattery: 100 %, on external power, not charging. Without an
++ * IOPMPowerSource powerd reports no battery and SpringBoard draws an empty red
++ * one. Real fuel-gauge data (MAX77779 on I2C) is future work. Named
++ * AppleSmartBattery because powerd also matches on that class name.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(HUSKY)
++#include <IOKit/IOLib.h>
++#include <IOKit/pwr_mgt/IOPMPowerSource.h>
++#include <libkern/c++/OSCollectionIterator.h>
++
++class AppleSmartBattery : public IOPMPowerSource {
++	OSDeclareDefaultStructors(AppleSmartBattery);
++public:
++	bool init(OSDictionary *dictionary = NULL) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++private:
++	void putNumber(const char *key, UInt32 value);
++	void putBool(const char *key, bool value);
++	void publish(void);
++};
++OSDefineMetaClassAndStructors(AppleSmartBattery, IOPMPowerSource);
++
++/* Pixel 8 Pro nominal capacity, mAh. */
++#define HUSKY_BATTERY_MAH 5050u
++
++bool
++AppleSmartBattery::init(OSDictionary *dictionary)
++{
++	/* IOCatalogue calls init(dictionary), but IOPMPowerSource only overrides
++	 * init(void): run it to allocate the PS dictionary, then copy the
++	 * personality into the registry as IOService::init would. */
++	if (!IOPMPowerSource::init()) {
++		return false;
++	}
++	if (dictionary) {
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
++		if (!it) {
++			return false;
++		}
++		OSObject *object;
++		bool ok = true;
++		while ((object = it->getNextObject())) {
++			const OSSymbol *key = OSDynamicCast(OSSymbol, object);
++			if (!key || !setProperty(key, dictionary->getObject(key))) {
++				ok = false;
++				break;
++			}
++		}
++		it->release();
++		if (!ok) {
++			return false;
++		}
++	}
++	return true;
++}
++
++void
++AppleSmartBattery::putNumber(const char *key, UInt32 value)
++{
++	const OSSymbol *symbol = OSSymbol::withCString(key);
++	OSNumber *number = OSNumber::withNumber(value, 32);
++	if (symbol && number) {
++		setPSProperty(symbol, number);
++	}
++	OSSafeReleaseNULL(number);
++	OSSafeReleaseNULL(symbol);
++}
++
++void
++AppleSmartBattery::putBool(const char *key, bool value)
++{
++	const OSSymbol *symbol = OSSymbol::withCString(key);
++	if (symbol) {
++		setPSProperty(symbol, value ? kOSBooleanTrue : kOSBooleanFalse);
++		symbol->release();
++	}
++}
++
++void
++AppleSmartBattery::publish(void)
++{
++	const UInt32 mv = 4300;
++
++	setBatteryInstalled(true);
++	setCurrentCapacity(HUSKY_BATTERY_MAH);
++	setMaxCapacity(HUSKY_BATTERY_MAH);
++	setExternalConnected(true);
++	setExternalChargeCapable(true);
++	setIsCharging(false);
++	setAtWarnLevel(false);
++	setAtCriticalLevel(false);
++	setVoltage(mv);
++	setAmperage(0);
++	setTimeRemaining(-1);
++	setCycleCount(0);
++	putBool("FullyCharged", true);
++	putBool("AppleRawExternalConnected", true);
++	putNumber("AppleRawCurrentCapacity", HUSKY_BATTERY_MAH);
++	putNumber("AppleRawMaxCapacity", HUSKY_BATTERY_MAH);
++	putNumber("DesignCapacity", HUSKY_BATTERY_MAH);
++	putNumber("NominalChargeCapacity", HUSKY_BATTERY_MAH);
++	putNumber("InstantAmperage", 0);
++	/* Centidegrees C, fixed: no thermistor is read. */
++	putNumber("Temperature", 2500);
++	putNumber("VirtualTemperature", 2500);
++
++	/* IOPMCopyBatteryInfo's per-source compatibility dictionary. */
++	OSDictionary *legacy = OSDictionary::withCapacity(6);
++	if (legacy) {
++		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
++		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
++		    kIOBatteryFlagsKey};
++		UInt32 values[] = {HUSKY_BATTERY_MAH, HUSKY_BATTERY_MAH, mv, 0, 0,
++		    (UInt32)(kIOBatteryInstalled | kIOBatteryChargerConnect)};
++		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
++			OSNumber *number = OSNumber::withNumber(values[i], 32);
++			if (number) {
++				legacy->setObject(keys[i], number);
++				number->release();
++			}
++		}
++		setLegacyIOBatteryInfo(legacy);
++		legacy->release();
++	}
++	updateStatus();
++	IOLog("HUSKY BATTERY: static 100%%, external power, not charging\n");
++}
++
++bool
++AppleSmartBattery::start(IOService *provider)
++{
++	if (!IOPMPowerSource::start(provider)) {
++		return false;
++	}
++	/* A complete source before registerService wakes powerd. */
++	publish();
++	registerService();
++	return true;
++}
++#endif /* HUSKY */
+diff --git a/iokit/Kernel/arm/HuskyPlatformExpert.cpp b/iokit/Kernel/arm/HuskyPlatformExpert.cpp
+index 9cea11f..acf74b8 100644
+--- a/iokit/Kernel/arm/HuskyPlatformExpert.cpp
++++ b/iokit/Kernel/arm/HuskyPlatformExpert.cpp
+@@ -12,6 +12,8 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
+ 
+ class HuskyPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(HuskyPlatformExpert);
+@@ -23,8 +25,27 @@ public:
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+ 	bool getTargetName(char *name, int maxLength) APPLE_KEXT_OVERRIDE;
+ 	bool getProductName(char *name, int maxLength) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+ 
++/*
++ * No RTC driver (the S2MPG14 PMIC RTC sits behind ACPM): the calendar is the
++ * boot-arg huskytime=<unix seconds> (mkxnuboot stamps the build time) plus
++ * uptime, and settimeofday moves the base. Publishing IORTC also ends
++ * IOKitInitializeTime's 30 s wait for an RTC.
++ */
++static long husky_rtc_base;
++static uint64_t husky_rtc_base_abs;
++
++static long
++husky_uptime_secs(uint64_t since)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - since, &ns);
++	return (long)(ns / NSEC_PER_SEC);
++}
++
+ OSDefineMetaClassAndStructors(HuskyPlatformExpert, IODTPlatformExpert);
+ 
+ bool
+@@ -36,6 +57,13 @@ HuskyPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("HUSKY: platform expert registered\n");
++
++	unsigned long long t = 0;
++	(void)PE_parse_boot_argn("huskytime", &t, sizeof(t));
++	husky_rtc_base = (long)t;
++	husky_rtc_base_abs = 0;
++	publishResource("IORTC");
++	IOLog("HUSKY: RTC base %ld (huskytime)\n", husky_rtc_base);
+ 	return true;
+ }
+ 
+@@ -98,4 +126,16 @@ HuskyPlatformExpert::getProductName(char *name, int maxLength)
+ 	strlcpy(name, "iPhone 11 Pro Max", (size_t)maxLength);
+ 	return true;
+ }
++long
++HuskyPlatformExpert::getGMTTimeOfDay(void)
++{
++	return husky_rtc_base ? husky_rtc_base + husky_uptime_secs(husky_rtc_base_abs) : 0;
++}
++
++void
++HuskyPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	husky_rtc_base = secs;
++	husky_rtc_base_abs = mach_absolute_time();
++}
+ #endif /* HUSKY */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index a50b427..7259cfd 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -67,6 +67,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'husky,display';"
+     "   },"
++    "   {"
++    "     'IOClass'         = AppleSmartBattery;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleSmartBattery;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 9b9813b..0757e2c 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -14,3 +14,4 @@ iokit/Kernel/arm/HuskyKeyStore.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskyWatchdog.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskySurface.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskyFramebuffer.cpp						optional iokitcpp
++iokit/Kernel/arm/HuskyBattery.cpp						optional iokitcpp

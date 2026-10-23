@@ -24,6 +24,9 @@ MKBOOTIMG=${MKBOOTIMG:-artifacts/mkbootimg/mkbootimg.py}
 # rd=ufsroot0: HFS+ root in the iOS window of userdata (bsd/dev/husky_ufs.c);
 # add ufsrw=1 rootrw=1 for a writable root and the persistent console log.
 CMDLINE=${CMDLINE:-"debug=0xc cpus=9 keepsyms=1 -v -enable_kprintf_spam startup_debug=1 -noprogress rd=ufsroot0"}
+# No RTC driver: xnu's calendar starts from huskytime (UTC seconds), so stamp
+# the build time. Build the image right before booting it.
+[[ "$CMDLINE" == *huskytime=* ]] || CMDLINE="$CMDLINE huskytime=$(date +%s)"
 
 mkdir -p out/boot
 echo ">> building shim"
