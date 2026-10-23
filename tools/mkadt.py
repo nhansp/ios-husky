@@ -138,6 +138,9 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
     ], [node('memory-map', [ph()]),
+        # libimage4's __darwin_el0_init panics "failed to get manifest
+        # properties" (cryptexd crash loop) when this node is missing.
+        node('manifest-properties', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`;
         # lp-sip1 unauthenticated (unsealed) root for the extracted iOS cache.
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])

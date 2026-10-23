@@ -1,0 +1,106 @@
+diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
+index 6f8a417..e93e207 100644
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -5146,6 +5146,32 @@ memorystatus_on_ledger_footprint_exceeded(boolean_t warning, boolean_t memlimit_
+ 	}
+ #endif /* VM_PRESSURE_EVENTS */
+ 
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	/*
++	 * HUSKY: the per-process limits in jetsamproperties are tuned for real
++	 * iPhones with a GPU; with CPU rendering and 4 GiB our daemons overshoot
++	 * them and got killed at e.g. 8 MB (usernotificationsd). Fatal limits are
++	 * not enforced unless boot-arg huskymemlimit=1; the offender is logged
++	 * (first 200 times) and keeps running.
++	 */
++	if (memlimit_is_fatal) {
++		static int husky_memlimit = -1;
++		static int husky_memlimit_logged;
++		if (husky_memlimit < 0) {
++			int v = 0;
++			husky_memlimit = PE_parse_boot_argn("huskymemlimit", &v, sizeof(v)) ? v : 0;
++		}
++		if (husky_memlimit == 0) {
++			if (husky_memlimit_logged < 200) {
++				husky_memlimit_logged++;
++				printf("HUSKY memlimit: %s [%d] exceeded its fatal memory limit; not killed\n",
++				    proc_best_name(p), proc_getpid(p));
++			}
++			return;
++		}
++	}
++#endif
++
+ 	if (memlimit_is_fatal) {
+ 		/*
+ 		 * If this process has no high watermark or has a fatal task limit, then we have been invoked because the task
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index ed02129..bdd77ff 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -998,13 +998,18 @@ husky_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 	    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss), fp,
+ 	    (uint64_t)saved_state64(ss)->far);
+ 
+-	char line[200];
++	/* Up to 32 frames, 12 per line ("bt" then "bt+" continuation lines). */
++	char line[300];
+ 	int n = snprintf(line, sizeof(line), "CRASH %s bt", name);
+-	for (int i = 0; i < 10 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++	for (int i = 0; i < 32 && fp != 0 && (fp & 7) == 0; i++) {
+ 		uint64_t frame[2];
+ 		if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
+ 			break;
+ 		}
++		if (i != 0 && (i % 12) == 0) {
++			printf("%s\n", line);
++			n = snprintf(line, sizeof(line), "CRASH %s bt+", name);
++		}
+ 		n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
+ 		if (frame[0] <= fp) {
+ 			break;
+@@ -1013,6 +1018,43 @@ husky_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 	}
+ 	printf("%s\n", line);
+ 
++	/*
++	 * Assertion text: os_crash/abort/fatalError/objc and CF exceptions leave a
++	 * message in the image's gCRAnnotations (crashreporter_annotations_t:
++	 * u64 version, char *message, char *signature, char *backtrace,
++	 * char *message2, ...). Unslid struct addresses for the 23G90 shared cache.
++	 */
++	static const struct {
++		const char *lib;
++		uint64_t    unslid;
++	} husky_cra[] = {
++		{ "libsystem_c", 0x1ea0be5e0ULL },
++		{ "libswiftCore", 0x1e9c16df8ULL },
++		{ "libobjc", 0x1e9c140c0ULL },
++		{ "CoreFoundation", 0x1e9cc3ef8ULL },
++	};
++	for (unsigned int k = 0; k < sizeof(husky_cra) / sizeof(husky_cra[0]); k++) {
++		uint64_t ann[5];
++		if (slide == 0 || copyin((user_addr_t)(husky_cra[k].unslid + slide), ann, sizeof(ann)) != 0 ||
++		    ann[0] > 16) {
++			continue;   /* not mapped, or not a crashreporter_annotations_t */
++		}
++		const uint64_t msgs[2] = { ann[1], ann[4] };
++		for (int m = 0; m < 2; m++) {
++			char text[240];
++			vm_size_t got = 0;
++			if (msgs[m] == 0) {
++				continue;
++			}
++			int err = copyinstr((user_addr_t)msgs[m], text, sizeof(text), &got);
++			if (err != 0 && err != 63 /* ENAMETOOLONG: truncated, keep it */) {
++				continue;
++			}
++			text[sizeof(text) - 1] = '\0';
++			printf("CRASH %s msg %s%s: %s\n", name, husky_cra[k].lib, m ? " (2)" : "", text);
++		}
++	}
++
+ 	if (sig == 11 || sig == 10) {
+ 		/*
+ 		 * Which mapping the faulting address is in, or which two it falls
