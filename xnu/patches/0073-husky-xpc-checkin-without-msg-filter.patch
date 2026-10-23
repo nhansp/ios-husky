@@ -1,0 +1,38 @@
+diff --git a/osfmk/ipc/mach_port.c b/osfmk/ipc/mach_port.c
+index 63f7c93..7f7fe07 100644
+--- a/osfmk/ipc/mach_port.c
++++ b/osfmk/ipc/mach_port.c
+@@ -2976,9 +2976,21 @@ mach_port_is_connection_for_service(
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+ 
++#if !defined(ARM64_BOARD_CONFIG_HUSKY)
+ 	if (!mach_msg_filter_at_least(MACH_MSG_FILTER_CALLBACKS_VERSION_1)) {
+ 		return KERN_NOT_SUPPORTED;
+ 	}
++#else
++	/*
++	 * HUSKY has no Sandbox kext, so no message-filter callbacks are ever
++	 * registered and no service port carries a sandbox label. libxpc calls
++	 * this on every listener check-in and treats anything but success as a
++	 * "bogus check-in": it destroys the client's message, and every XPC
++	 * client of a named service gets "connection interrupted". Without a
++	 * filter there is nothing to verify: fall through to the "no sblabel"
++	 * path below (filter policy 0, success) after the service port checks.
++	 */
++#endif
+ 
+ 	ret = ipc_port_translate_receive(space, service_port_name, &service_port);
+ 	if (ret) {
+@@ -2993,6 +3005,11 @@ mach_port_is_connection_for_service(
+ 
+ 	/* Port is locked and active */
+ 	service_port_sblabel = label.iol_service->ispl_sblabel;
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	if (!mach_msg_filter_at_least(MACH_MSG_FILTER_CALLBACKS_VERSION_1)) {
++		service_port_sblabel = NULL;    /* no filter callbacks to call */
++	}
++#endif
+ 	if (service_port_sblabel) {
+ 		mach_msg_filter_retain_sblabel_callback(service_port_sblabel);
+ 	}
