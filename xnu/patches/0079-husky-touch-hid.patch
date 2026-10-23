@@ -14,7 +14,7 @@ index 75666a9..93a5e4e 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/husky_fts.c b/bsd/dev/husky_fts.c
 new file mode 100644
-index 0000000..e2b4e95
+index 0000000..3ab42c6
 --- /dev/null
 +++ b/bsd/dev/husky_fts.c
 @@ -0,0 +1,400 @@
@@ -59,7 +59,7 @@ index 0000000..e2b4e95
 +#include "husky_spi.h"
 +#include "husky_gpio.h"
 +#include "husky_fts.h"
-+#include "iokit/Kernel/arm/hid/HuskyHIDTouch.h"
++#include "../../iokit/Kernel/arm/hid/HuskyHIDTouch.h"
 +
 +extern kern_return_t thread_terminate(thread_t);
 +extern void husky_hid_touch(int id, int x, int y, int touching);
