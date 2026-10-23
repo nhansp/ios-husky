@@ -1,0 +1,55 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 2cb7705..f940a9a 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -197,6 +197,10 @@
+ #endif /* SKYWALK */
+ 
+ #include <pexpert/pexpert.h>
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++#include <sys/disk.h>           /* DKIOCGETBLOCKSIZE/COUNT for the root grow */
++#include <sys/ioccom.h>
++#endif
+ #include <machine/pal_routines.h>
+ #include <console/video_console.h>
+ 
+@@ -980,6 +984,39 @@ bsd_init(void)
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	/*
++	 * HUSKY: the iOS root image is a 20 GiB HFS+ volume inside a ~70 GiB UFS
++	 * window, and it fills up at runtime (daemons then fail with ENOSPC).
++	 * With boot-arg huskygrowroot=1, grow it in place to the window size
++	 * through HFS's own live resize (HFSIOC_RESIZE_VOLUME -> hfs_extendfs,
++	 * journaled). Only ever grows, and only by more than 1 GiB.
++	 */
++	{
++		int grow = 0;
++		if (PE_parse_boot_argn("huskygrowroot", &grow, sizeof(grow)) && grow &&
++		    rootvp != NULLVP && rootvnode != NULLVP && !vfs_isrdonly(rootvnode->v_mount)) {
++			vfs_context_t gctx = vfs_context_kernel();
++			uint32_t secsize = 0;
++			uint64_t seccount = 0;
++			if (VNOP_IOCTL(rootvp, DKIOCGETBLOCKSIZE, (caddr_t)&secsize, 0, gctx) == 0 &&
++			    VNOP_IOCTL(rootvp, DKIOCGETBLOCKCOUNT, (caddr_t)&seccount, 0, gctx) == 0) {
++				struct vfsstatfs *sf = vfs_statfs(rootvnode->v_mount);
++				uint64_t cur = (uint64_t)sf->f_blocks * sf->f_bsize;
++				uint64_t devsize = ((uint64_t)secsize * seccount) & ~((1ULL << 20) - 1);
++				printf("HUSKY: root volume %llu MiB, device %llu MiB\n", cur >> 20, devsize >> 20);
++				if (cur != 0 && devsize > cur + (1ULL << 30)) {
++					int gerr = VNOP_IOCTL(rootvnode, _IOW('h', 2, u_int64_t) /* HFSIOC_RESIZE_VOLUME */,
++					    (caddr_t)&devsize, 0, gctx);
++					printf("HUSKY: grow root volume to %llu MiB -> %d\n", devsize >> 20, gerr);
++				}
++			} else {
++				printf("HUSKY: grow root: device size unknown\n");
++			}
++		}
++	}
++#endif
++
+ 
+ #if CONFIG_NETBOOT
+ 	if (netboot) {
