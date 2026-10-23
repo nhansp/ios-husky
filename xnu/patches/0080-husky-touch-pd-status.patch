@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/husky_spi.c b/bsd/dev/husky_spi.c
+index f3775b5..f9b9934 100644
+--- a/bsd/dev/husky_spi.c
++++ b/bsd/dev/husky_spi.c
+@@ -31,7 +31,8 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define HUSKY_PD_HSI0_SIZE      0x20ULL
+ #define PD_LOCAL_PWR_CFG_OFF    0x00u
+ #define PD_LOCAL_PWR_STATUS_OFF 0x04u
+-#define PD_PWR_STATUS_ON        0x03u
++/* gs101/zuma: bit 0 of LOCAL_PWR_STATUS (Linux pm_domains.c gs101 local_pwr_cfg = BIT(0)); boot 0079 read CFG=STATUS=0x1. */
++#define PD_PWR_STATUS_ON        0x01u
+ 
+ /* CMU clock controller (Zuma clock / cmu_hsi0) */
+ #define HUSKY_CLK_ZUMA_PA       0x26040000ULL
+@@ -154,7 +155,7 @@ husky_spi_check_power_and_clocks(uint32_t *out_pwr_cfg,
+ 		*out_pwr_status = status;
+ 	}
+ 
+-	HU_LOG("HUSKY SPI: pd-hsi0@15462A80 power domain: CFG=0x%x STATUS=0x%x (expected ON: 0x3)\n",
++	HU_LOG("HUSKY SPI: pd-hsi0@15462A80 power domain: CFG=0x%x STATUS=0x%x (ON = bit 0)\n",
+ 	    cfg, status);
+ 
+ 	if ((status & PD_PWR_STATUS_ON) != PD_PWR_STATUS_ON) {
