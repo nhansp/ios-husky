@@ -1,5 +1,79 @@
+diff --git a/bsd/dev/husky_fts.c b/bsd/dev/husky_fts.c
+index 3ab42c6..03478da 100644
+--- a/bsd/dev/husky_fts.c
++++ b/bsd/dev/husky_fts.c
+@@ -143,10 +143,21 @@ husky_fts_thread(__unused void *arg, __unused wait_result_t wr)
+ 		(void)husky_gpio_probe_dump();
+ 
+ 		/*
+-		 * No chip-ID transfer here: it needs husky_spi_init, which writes USI
+-		 * SW_CONF at a sysreg address the DT gives only as a phandle (0x183).
+-		 * The SW_CONF read above confirms the address first.
++		 * One chip-ID transfer, only when the USI is already in SPI mode: that
++		 * confirms the sysreg address (the DT gives it only as a phandle) and
++		 * husky_spi_init then leaves SW_CONF alone. No reset, no sense-on.
+ 		 */
++		if ((husky_spi_probe_swconf & 0x7u) == 0x2u) {
++			HU_LOG("HUSKY TOUCH: probe mode: USI in SPI mode; reading chip ID\n");
++			if (husky_gpio_power_check()) {
++				HU_LOG("HUSKY TOUCH: probe mode: chip ID 0x36 0x40 - controller alive\n");
++			} else {
++				HU_LOG("HUSKY TOUCH: probe mode: no chip ID (unpowered or protocol)\n");
++			}
++		} else {
++			HU_LOG("HUSKY TOUCH: probe mode: USI SW_CONF 0x%x not SPI; no transfer\n",
++			    husky_spi_probe_swconf);
++		}
+ 
+ 		HU_LOG("HUSKY TOUCH: probe mode finished; stopping without modifying hardware state\n");
+ 		goto out;
+diff --git a/bsd/dev/husky_gpio.c b/bsd/dev/husky_gpio.c
+index 544b159..642c2fd 100644
+--- a/bsd/dev/husky_gpio.c
++++ b/bsd/dev/husky_gpio.c
+@@ -267,7 +267,7 @@ int
+ husky_gpio_power_check(void)
+ {
+ 	if (husky_spi_init() != 0) {
+-		printf("HUSKY TOUCH: power check failed - SPI init error\n");
++		HU_LOG("HUSKY TOUCH: power check failed - SPI init error\n");
+ 		return 0;
+ 	}
+ 
+@@ -277,7 +277,7 @@ husky_gpio_power_check(void)
+ 
+ 	int err = husky_spi_write_read_dummy(ftm5_cmd, sizeof(ftm5_cmd), chip_id, sizeof(chip_id), 1);
+ 	if (err == 0 && chip_id[0] == FTS_CHIP_ID_0 && chip_id[1] == FTS_CHIP_ID_1) {
+-		printf("HUSKY TOUCH: controller is powered by bootloader, FTM5 chip ID verified 0x%02x 0x%02x\n",
++		HU_LOG("HUSKY TOUCH: controller is powered by bootloader, FTM5 chip ID verified 0x%02x 0x%02x\n",
+ 		    chip_id[0], chip_id[1]);
+ 		return 1;
+ 	}
+@@ -290,19 +290,19 @@ husky_gpio_power_check(void)
+ 
+ 	err = husky_spi_write_read_dummy(&legacy_cmd, 1, chip_id, sizeof(chip_id), 1);
+ 	if (err == 0 && chip_id[0] == FTS_CHIP_ID_0 && chip_id[1] == FTS_CHIP_ID_1) {
+-		printf("HUSKY TOUCH: controller is powered by bootloader (legacy 0x80 with dummy), chip ID verified 0x%02x 0x%02x\n",
++		HU_LOG("HUSKY TOUCH: controller is powered by bootloader (legacy 0x80 with dummy), chip ID verified 0x%02x 0x%02x\n",
+ 		    chip_id[0], chip_id[1]);
+ 		return 1;
+ 	}
+ 
+ 	err = husky_spi_write_read(&legacy_cmd, 1, chip_id, sizeof(chip_id));
+ 	if (err == 0 && chip_id[0] == FTS_CHIP_ID_0 && chip_id[1] == FTS_CHIP_ID_1) {
+-		printf("HUSKY TOUCH: controller is powered by bootloader (legacy 0x80 direct), chip ID verified 0x%02x 0x%02x\n",
++		HU_LOG("HUSKY TOUCH: controller is powered by bootloader (legacy 0x80 direct), chip ID verified 0x%02x 0x%02x\n",
+ 		    chip_id[0], chip_id[1]);
+ 		return 1;
+ 	}
+ 
+-	printf("HUSKY TOUCH: chip ID read returned 0x%02x 0x%02x (err=%d, expected 0x%02x 0x%02x)\n",
++	HU_LOG("HUSKY TOUCH: chip ID read returned 0x%02x 0x%02x (err=%d, expected 0x%02x 0x%02x)\n",
+ 	    chip_id[0], chip_id[1], err, FTS_CHIP_ID_0, FTS_CHIP_ID_1);
+ 	return 0;
+ }
 diff --git a/bsd/dev/husky_spi.c b/bsd/dev/husky_spi.c
-index f3775b5..f9b9934 100644
+index f3775b5..39ff107 100644
 --- a/bsd/dev/husky_spi.c
 +++ b/bsd/dev/husky_spi.c
 @@ -31,7 +31,8 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -12,7 +86,17 @@ index f3775b5..f9b9934 100644
  
  /* CMU clock controller (Zuma clock / cmu_hsi0) */
  #define HUSKY_CLK_ZUMA_PA       0x26040000ULL
-@@ -154,7 +155,7 @@ husky_spi_check_power_and_clocks(uint32_t *out_pwr_cfg,
+@@ -98,6 +99,9 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ /* FIFO depth on Exynos / Zuma SPI */
+ #define SPI_FIFO_DEPTH         64u
+ 
++/* USI SW_CONF as read by husky_spi_probe_dump, ~0u if not read. */
++uint32_t husky_spi_probe_swconf = ~0u;
++
+ static vm_offset_t spi_base = 0;
+ static vm_offset_t sysreg_base = 0;
+ static bool husky_spi_initialized = false;
+@@ -154,7 +158,7 @@ husky_spi_check_power_and_clocks(uint32_t *out_pwr_cfg,
  		*out_pwr_status = status;
  	}
  
@@ -21,3 +105,68 @@ index f3775b5..f9b9934 100644
  	    cfg, status);
  
  	if ((status & PD_PWR_STATUS_ON) != PD_PWR_STATUS_ON) {
+@@ -205,6 +209,7 @@ husky_spi_probe_dump(void)
+ 	vm_offset_t sysreg = ml_io_map(HUSKY_SYSREG_HSI0_PA, HUSKY_SYSREG_HSI0_SIZE);
+ 	if (sysreg) {
+ 		uint32_t sw_conf = *(volatile uint32_t *)(sysreg + HUSKY_USI_SW_CONF_OFF);
++		husky_spi_probe_swconf = sw_conf;
+ 		HU_LOG("HUSKY SPI: sysreg_hsi0@11020000 USI SW_CONF at 0x101c = 0x%x (mode: %s)\n",
+ 		    sw_conf,
+ 		    ((sw_conf & USI_SW_CONF_MASK) == USI_SW_CONF_SPI) ? "SPI" :
+@@ -286,7 +291,7 @@ husky_spi_init(void)
+ 	/* CRITICAL: Verify power domain and clock status before ANY MMIO */
+ 	int err = husky_spi_check_power_and_clocks(NULL, NULL, NULL);
+ 	if (err) {
+-		printf("HUSKY SPI: power domain or clock check failed (%d); aborting init!\n", err);
++		HU_LOG("HUSKY SPI: power domain or clock check failed (%d); aborting init!\n", err);
+ 		lck_mtx_unlock(&husky_spi_lock);
+ 		return err;
+ 	}
+@@ -311,7 +316,7 @@ husky_spi_init(void)
+ 
+ 	sysreg_base = ml_io_map(sysreg_pa, sysreg_sz);
+ 	if (!sysreg_base) {
+-		printf("HUSKY SPI: failed to map USI sysreg at 0x%llx\n", sysreg_pa);
++		HU_LOG("HUSKY SPI: failed to map USI sysreg at 0x%llx\n", sysreg_pa);
+ 		lck_mtx_unlock(&husky_spi_lock);
+ 		return ENXIO;
+ 	}
+@@ -329,7 +334,7 @@ husky_spi_init(void)
+ 
+ 	spi_base = ml_io_map(spi_pa, spi_sz);
+ 	if (!spi_base) {
+-		printf("HUSKY SPI: failed to map SPI registers at 0x%llx\n", spi_pa);
++		HU_LOG("HUSKY SPI: failed to map SPI registers at 0x%llx\n", spi_pa);
+ 		lck_mtx_unlock(&husky_spi_lock);
+ 		return ENXIO;
+ 	}
+@@ -359,7 +364,7 @@ husky_spi_init(void)
+ 	husky_spi_initialized = true;
+ 	lck_mtx_unlock(&husky_spi_lock);
+ 
+-	printf("HUSKY SPI: controller initialized at 0x%llx (USI SW_CONF=0x%x)\n",
++	HU_LOG("HUSKY SPI: controller initialized at 0x%llx (USI SW_CONF=0x%x)\n",
+ 	    (uint64_t)spi_pa, conf_readback);
+ 
+ 	return 0;
+@@ -450,7 +455,7 @@ husky_spi_transfer(const uint8_t *tx, uint8_t *rx, size_t len)
+ 		spi_wr(REG_PACKET_CNT, 0);
+ 
+ 		if (received < chunk) {
+-			printf("HUSKY SPI: transfer timeout (expected %zu, got %zu)\n",
++			HU_LOG("HUSKY SPI: transfer timeout (expected %zu, got %zu)\n",
+ 			    chunk, received);
+ 			husky_spi_flush();
+ 			err = ETIMEDOUT;
+diff --git a/bsd/dev/husky_spi.h b/bsd/dev/husky_spi.h
+index aef193b..003e6da 100644
+--- a/bsd/dev/husky_spi.h
++++ b/bsd/dev/husky_spi.h
+@@ -29,6 +29,7 @@ int husky_spi_check_power_and_clocks(uint32_t *out_pwr_cfg,
+  * (huskytouch=2). Does not modify hardware operational state.
+  */
+ int husky_spi_probe_dump(void);
++extern uint32_t husky_spi_probe_swconf;
+ 
+ /*
+  * Initialize the USI SPI controller:
