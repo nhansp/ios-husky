@@ -1,0 +1,1213 @@
+diff --git a/iokit/Kernel/arm/hid/HuskyHID.cpp b/iokit/Kernel/arm/hid/HuskyHID.cpp
+index 25f941d..e06ba21 100644
+--- a/iokit/Kernel/arm/hid/HuskyHID.cpp
++++ b/iokit/Kernel/arm/hid/HuskyHID.cpp
+@@ -6,7 +6,10 @@
+  * opens them with IOServiceOpen type 'esuc' (IOHIDEventServiceUserClient,
+  * compiled here from IOHIDFamily-1915.140.3, the version the iOS 16.7
+  * userland ships) and reads serialized IOHIDEvents from the user client's
+- * shared queue. This file has the minimal IOHIDEventService base class and
++ * shared queue. iOS 26 (IOHIDFamily 2222+) changed two things on that path,
++ * both carried in IOHIDEvent.cpp / IOHIDEventStructDefs.h: one queue header
++ * per event of a collection, and a 0xa0-byte digitizer event with double
++ * coordinates. This file has the minimal IOHIDEventService base class and
+  * the buttons service:
+  *
+  *   HuskyHIDButtons  consumer-control keys (power, volume, home)
+diff --git a/iokit/Kernel/arm/hid/IOHIDEvent.cpp b/iokit/Kernel/arm/hid/IOHIDEvent.cpp
+index 205f0a9..b20b26a 100644
+--- a/iokit/Kernel/arm/hid/IOHIDEvent.cpp
++++ b/iokit/Kernel/arm/hid/IOHIDEvent.cpp
+@@ -908,12 +908,12 @@ IOHIDEvent * IOHIDEvent::digitizerEvent(
+     event->transducerIndex  = transducerID; // Multitouch uses this as a path ID
+     event->transducerType   = type;
+     event->buttonMask       = buttonState;
+-    event->position.x       = x;
+-    event->position.y       = y;
+-    event->position.z       = z;
+-    event->pressure         = tipPressure;
+-    event->auxPressure      = auxPressure;
+-    event->twist            = twist;
++    event->position.x       = CAST_FIXED_TO_DOUBLE(x);
++    event->position.y       = CAST_FIXED_TO_DOUBLE(y);
++    event->position.z       = CAST_FIXED_TO_DOUBLE(z);
++    event->pressure         = CAST_FIXED_TO_DOUBLE(tipPressure);
++    event->auxPressure      = CAST_FIXED_TO_DOUBLE(auxPressure);
++    event->twist            = CAST_FIXED_TO_DOUBLE(twist);
+ 
+ 
+     // Let's assume no tip pressure means finger
+@@ -921,16 +921,16 @@ IOHIDEvent * IOHIDEvent::digitizerEvent(
+         case kIOHIDDigitizerTransducerTypeFinger:
+             event->identity = 2;        // Multitouch interprets this as 'finger', hard code to 2 or index finger
+             event->orientationType = kIOHIDDigitizerOrientationTypeQuality;
+-            event->orientation.quality.majorRadius = 5<<16;
+-            event->orientation.quality.minorRadius = 5<<16;
+-            event->orientation.polar.majorRadius = 5<<16;
+-            event->orientation.polar.minorRadius = 5<<16;
++            event->orientation.quality.majorRadius = CAST_FIXED_TO_DOUBLE(5<<16);
++            event->orientation.quality.minorRadius = CAST_FIXED_TO_DOUBLE(5<<16);
++            event->orientation.polar.majorRadius = CAST_FIXED_TO_DOUBLE(5<<16);
++            event->orientation.polar.minorRadius = CAST_FIXED_TO_DOUBLE(5<<16);
+             break;
+         default:
+-            event->orientation.quality.majorRadius = 3<<16;
+-            event->orientation.quality.minorRadius = 3<<16;
+-            event->orientation.polar.majorRadius = 3<<16;
+-            event->orientation.polar.minorRadius = 3<<16;
++            event->orientation.quality.majorRadius = CAST_FIXED_TO_DOUBLE(3<<16);
++            event->orientation.quality.minorRadius = CAST_FIXED_TO_DOUBLE(3<<16);
++            event->orientation.polar.majorRadius = CAST_FIXED_TO_DOUBLE(3<<16);
++            event->orientation.polar.minorRadius = CAST_FIXED_TO_DOUBLE(3<<16);
+             break;
+     }
+ 
+@@ -967,8 +967,8 @@ IOHIDEvent * IOHIDEvent::digitizerEventWithTiltOrientation(
+ 
+     event->orientationType = kIOHIDDigitizerOrientationTypeTilt;
+ 
+-    event->orientation.tilt.x = xTilt;
+-    event->orientation.tilt.y = xTilt;
++    event->orientation.tilt.x = CAST_FIXED_TO_DOUBLE(xTilt);
++    event->orientation.tilt.y = CAST_FIXED_TO_DOUBLE(xTilt);
+ 
+ exit:
+     return me;
+@@ -1004,8 +1004,8 @@ IOHIDEvent * IOHIDEvent::digitizerEventWithPolarOrientation(
+ 
+     event->orientationType = kIOHIDDigitizerOrientationTypePolar;
+ 
+-    event->orientation.polar.altitude   = altitude;
+-    event->orientation.polar.azimuth    = azimuth;
++    event->orientation.polar.altitude   = CAST_FIXED_TO_DOUBLE(altitude);
++    event->orientation.polar.azimuth    = CAST_FIXED_TO_DOUBLE(azimuth);
+ 
+ exit:
+     return me;
+@@ -1039,8 +1039,8 @@ IOHIDEvent * IOHIDEvent::digitizerEventWithPolarOrientation(
+  
+     event = (IOHIDDigitizerEventData *)me->_data;
+  
+-    event->orientation.polar.quality = quality;
+-    event->orientation.polar.density = density;
++    event->orientation.polar.quality = CAST_FIXED_TO_DOUBLE(quality);
++    event->orientation.polar.density = CAST_FIXED_TO_DOUBLE(density);
+     
+ exit:
+     return me;
+@@ -1076,8 +1076,8 @@ IOHIDEvent * IOHIDEvent::digitizerEventWithPolarOrientation(
+ 
+     event = (IOHIDDigitizerEventData *)me->_data;
+ 
+-    event->orientation.polar.majorRadius = majorRadius;
+-    event->orientation.polar.minorRadius = minorRadius;
++    event->orientation.polar.majorRadius = CAST_FIXED_TO_DOUBLE(majorRadius);
++    event->orientation.polar.minorRadius = CAST_FIXED_TO_DOUBLE(minorRadius);
+ 
+ exit:
+     return me;
+@@ -1117,11 +1117,11 @@ IOHIDEvent * IOHIDEvent::digitizerEventWithQualityOrientation(
+ 
+     event->orientationType = kIOHIDDigitizerOrientationTypeQuality;
+ 
+-    event->orientation.quality.quality          = quality;
+-    event->orientation.quality.density          = density;
+-    event->orientation.quality.irregularity     = irregularity;
+-    event->orientation.quality.majorRadius      = majorRadius;
+-    event->orientation.quality.minorRadius      = minorRadius;
++    event->orientation.quality.quality          = CAST_FIXED_TO_DOUBLE(quality);
++    event->orientation.quality.density          = CAST_FIXED_TO_DOUBLE(density);
++    event->orientation.quality.irregularity     = CAST_FIXED_TO_DOUBLE(irregularity);
++    event->orientation.quality.majorRadius      = CAST_FIXED_TO_DOUBLE(majorRadius);
++    event->orientation.quality.minorRadius      = CAST_FIXED_TO_DOUBLE(minorRadius);
+ 
+ exit:
+     return me;
+@@ -1537,19 +1537,19 @@ void IOHIDEvent::setDoubleValue( IOHIDEventField         key,
+     SET_EVENT_VALUE(this, key, value, options, Double);
+ }
+ 
++/*
++ * HUSKY: event serialization in the format of IOHIDFamily-2222 and later (iOS 17
++ * onwards; iOS 26 ships 2222.x): every event of a collection, the parent and
++ * each child, is its own IOHIDSystemQueueElement header followed by its event
++ * data, and the parent header's eventCount is the total. IOHIDFamily-1915 (the
++ * rest of this directory) wrote one header for the whole tree, which iOS 26's
++ * IOHIDLib misparses: backboardd got the hand collection but no fingers. The
++ * three functions below follow IOHIDFamily-2238.120.5.
++ */
+ //==============================================================================
+ // IOHIDEvent::getLength
+ //==============================================================================
+ size_t IOHIDEvent::getLength()
+-{
+-    _eventCount = 0;
+-    return getLength(&_eventCount);
+-}
+-
+-//==============================================================================
+-// IOHIDEvent::getLength
+-//==============================================================================
+-IOByteCount IOHIDEvent::getLength(UInt32 * count)
+ {
+     IOByteCount length = _data->size;
+ 
+@@ -1564,48 +1564,14 @@ IOByteCount IOHIDEvent::getLength(UInt32 * count)
+ 
+         for(i=0 ;i<childCount; i++) {
+             if ( (child = (IOHIDEvent *)_children->getObject(i)) ) {
+-                length += child->getLength(count) - sizeof(IOHIDSystemQueueElement);
++                length += child->getLength();
+             }
+         }
+     }
+ 
+-    if ( count )
+-        *count = *count + 1;
+-
+     return length;
+ }
+ 
+-//==============================================================================
+-// IOHIDEvent::appendBytes
+-//==============================================================================
+-IOByteCount IOHIDEvent::appendBytes(UInt8 * bytes, IOByteCount withLength)
+-{
+-    IOByteCount size = 0;
+-
+-    size = _data->size;
+-
+-    if ( size > withLength )
+-        return 0;
+-
+-    bcopy(_data, bytes, size);
+-
+-    if ( _children )
+-    {
+-        UInt32          i, childCount;
+-        IOHIDEvent *    child;
+-
+-        childCount = _children->getCount();
+-
+-        for(i=0 ;i<childCount; i++) {
+-            if ( (child = (IOHIDEvent *)_children->getObject(i)) ) {
+-                size += child->appendBytes(bytes + size, withLength - size);
+-            }
+-        }
+-    }
+-
+-    return size;
+-}
+-
+ //==============================================================================
+ // IOHIDEvent::withBytes
+ //==============================================================================
+@@ -1615,7 +1581,6 @@ IOHIDEvent * IOHIDEvent::withBytes(     const void *            bytes,
+     IOHIDSystemQueueElement *   queueElement= NULL;
+     IOHIDEvent *                parent      = NULL;
+     UInt32                      index       = 0;
+-    UInt32                      total       = 0;
+     UInt32                      offset      = 0;
+     UInt32                      sz          = 0;
+     UInt32                      attributeLength = 0;
+@@ -1623,49 +1588,43 @@ IOHIDEvent * IOHIDEvent::withBytes(     const void *            bytes,
+     UInt32                      eventDataSize = 0;
+     UInt32                      eventDataType = 0;
+ 
+-    if ( !bytes || !size || ( sizeof(IOHIDSystemQueueElement) > size ) ) {
++    if ( !bytes || !size ) {
+         return NULL;
+     }
+ 
+-    queueElement    = (IOHIDSystemQueueElement *)bytes;
+-    total           = (UInt32)size - sizeof(IOHIDSystemQueueElement);
+-
+-
+-    eventCount = queueElement->eventCount;
+-    attributeLength = queueElement->attributeLength;
+-    // to prevent complier reordering
+-    // local assignment should be enforced
+-    // before validation (55894984)
+-    COMPILER_BARRIER();
+-
+-    for (index=0; index < eventCount && offset<total; index++)
++    for (index=0; offset < size; index++)
+     {
+-        if (os_add_overflow(attributeLength, offset, &sz)) {
++        if ( sizeof(IOHIDSystemQueueElement) >= (size - offset) ) {
+             break;
+         }
+-        
+-        // Can bad value of offset cause overflow ??
+-        // we already checked that above
+-        
+-        if ( (attributeLength + offset) > total ) {
++
++        queueElement = (IOHIDSystemQueueElement *)((UInt8 *)bytes + offset);
++        attributeLength = queueElement->attributeLength;
++
++        // to prevent complier reordering
++        // local assignment should be enforced
++        // before validation (55894984)
++        COMPILER_BARRIER();
++
++        if ( os_add3_overflow(sizeof(IOHIDSystemQueueElement), attributeLength, offset, &offset) ) {
+             break;
+         }
+-        
+-        if ((total - (attributeLength + offset)) < sizeof(IOHIDEventData) ) {
++        COMPILER_BARRIER();
++
++        if ( offset >= size ) {
+             break;
+         }
+-        
+ 
+-        IOHIDEventData *eventData = (IOHIDEventData *)(queueElement->payload + attributeLength + offset);
+-        
+-        if (!eventData) {
++        if ( (size - offset) < sizeof(IOHIDEventData) ) {
+             break;
+         }
+-        
++
++        IOHIDEventData *eventData = (IOHIDEventData *)(queueElement->payload + attributeLength);
++
+         eventDataType = eventData->type;
+         eventDataSize = eventData->size;
+         COMPILER_BARRIER();
+-        
++
+         if ( eventDataType >= kIOHIDEventTypeCount ) {
+             break;
+         }
+@@ -1675,7 +1634,12 @@ IOHIDEvent * IOHIDEvent::withBytes(     const void *            bytes,
+         if (sz > eventDataSize) {
+             break;
+         }
+-        
++
++        // Validate eventDataSize against remaining input buffer before any allocation.
++        if ((size - offset) < eventDataSize) {
++            break;
++        }
++
+         IOHIDEvent *event = new IOHIDEvent;
+ 
+         if ( !event ) {
+@@ -1683,12 +1647,11 @@ IOHIDEvent * IOHIDEvent::withBytes(     const void *            bytes,
+         }
+ 
+         if (!event->initWithType(eventDataType, eventDataSize - sz) ||
+-            eventDataSize != event->_data->size ||
+-            (total - (attributeLength + offset)) < eventDataSize) {
++            eventDataSize != event->_data->size) {
+             event->release();
+             break;
+         }
+-        
++
+         bcopy(eventData, event->_data, event->_data->size);
+         event->_timeStamp = queueElement->timeStamp;
+         event->_options = queueElement->options;
+@@ -1696,17 +1659,22 @@ IOHIDEvent * IOHIDEvent::withBytes(     const void *            bytes,
+ 
+         if ( !parent ) {
+             parent = event;
++            eventCount = queueElement->eventCount;
+         }
+         else {
+             //Append event here;
+             parent->appendChild(event);
+             event->release();
+         }
+-        
+-        if ( ((UInt32) (offset + eventDataSize) ) <= offset ) {
++
++        if ( index >= (eventCount - 1) ) {
++            break;
++        }
++
++        if ( os_add_overflow(offset, eventDataSize, &offset) ) {
+             break;
+         }
+-        offset += eventDataSize;
++        COMPILER_BARRIER();
+     }
+ 
+     return parent;
+@@ -1719,58 +1687,109 @@ OSArray* IOHIDEvent::getChildren()
+ {
+     return _children;
+ }
++
+ //==============================================================================
+ // IOHIDEvent::readBytes
+ //==============================================================================
+ IOByteCount IOHIDEvent::readBytes(void * bytes, IOByteCount withLength)
+ {
+-    IOHIDSystemQueueElement *   queueElement= NULL;
+-    
++    UInt32 count = 0;
++    return readBytes(bytes, withLength, &count);
++}
++
++//==============================================================================
++// IOHIDEvent::readBytes
++//==============================================================================
++IOByteCount IOHIDEvent::readBytes(void * bytes, IOByteCount withLength, UInt32* outCount)
++{
++    IOByteCount size = 0;
++    IOHIDSystemQueueElement * queueElement = NULL;
++
+     if ( withLength < sizeof(IOHIDSystemQueueElement) )
+         return 0;
+-    
++
+     queueElement    = (IOHIDSystemQueueElement *)bytes;
+ 
+     queueElement->timeStamp         = _timeStamp;
+     queueElement->options           = _options;
+-    queueElement->eventCount        = _eventCount;
+     queueElement->senderID          = _senderID;
+     queueElement->attributeLength   = 0;
+ 
+-    //bytes += sizeof(IOHIDSystemQueueElement);
+-    withLength -= sizeof(IOHIDSystemQueueElement);
++    size += sizeof(IOHIDSystemQueueElement);
++
++    if ( (size + _data->size) > withLength )
++        return 0;
+ 
+-    return appendBytes((UInt8 *)queueElement->payload, withLength);
++    if ( _parent ) {
++        if ( _parent->_data ) {
++            _data->depth = _parent->_data->depth + 1;
++        }
++    }
++
++    bcopy(_data, (UInt8*)bytes + size, _data->size);
++    size += _data->size;
++
++    if ( _children )
++    {
++        UInt32          i, childCount;
++        IOHIDEvent *    child;
++
++        childCount = _children->getCount();
++
++        for(i=0 ;i<childCount; i++) {
++            if ( (child = (IOHIDEvent *)_children->getObject(i)) ) {
++                size += child->readBytes((UInt8*)bytes + size, withLength - size, outCount);
++            }
++        }
++    }
++
++    if ( outCount ) {
++        *outCount = *outCount + 1;
++    }
++
++    queueElement->eventCount = *outCount;
++
++    return size;
+ }
+ 
++//==============================================================================
++// IOHIDEvent::createBytes
++//==============================================================================
++// Only one level of children is serialized. Unlike 2238 (whose first header
++// keeps eventCount 1), the parent header carries the real total.
+ OSData *IOHIDEvent::createBytes()
+ {
+     OSData *result = NULL;
+     IOHIDSystemQueueElement queueElement = { 0 };
+-    
++    unsigned int childCount = _children ? _children->getCount() : 0;
++
+     result = OSData::withCapacity((unsigned int)getLength());
+     require(result, exit);
+-    
++
+     queueElement.timeStamp         = _timeStamp;
+     queueElement.options           = _options;
+-    queueElement.eventCount        = _eventCount;
++    queueElement.eventCount        = 1 + childCount;
+     queueElement.senderID          = _senderID;
+     queueElement.attributeLength   = 0;
+-    
++
+     result->appendBytes(&queueElement, sizeof(queueElement));
+     result->appendBytes(_data, _data->size);
+-    
+-    require_quiet(_children, exit);
+-    
+-    for (unsigned int i = 0; i < _children->getCount(); i++) {
++
++    for (unsigned int i = 0; i < childCount; i++) {
+         IOHIDEvent *child = (IOHIDEvent *)_children->getObject(i);
+-        if (!child) {
++        if ( !child ) {
+             continue;
+         }
+-        
++
++        queueElement.timeStamp         = child->_timeStamp;
++        queueElement.options           = child->_options;
++        queueElement.senderID          = child->_senderID;
++        queueElement.attributeLength   = 0;
++
++        result->appendBytes(&queueElement, sizeof(queueElement));
+         result->appendBytes(child->_data, child->_data->size);
+     }
+-    
++
+ exit:
+     return result;
+ }
+diff --git a/iokit/Kernel/arm/hid/IOHIDEvent.h b/iokit/Kernel/arm/hid/IOHIDEvent.h
+index 40084fe..98b1eaa 100644
+--- a/iokit/Kernel/arm/hid/IOHIDEvent.h
++++ b/iokit/Kernel/arm/hid/IOHIDEvent.h
+@@ -74,8 +74,7 @@ class IOHIDEvent : public OSObject
+     bool initWithCapacity(IOByteCount capacity);
+     bool initWithType(IOHIDEventType type, IOByteCount additionalCapacity=0);
+     bool initWithTypeTimeStamp(IOHIDEventType type, UInt64 timeStamp, IOOptionBits options = 0, IOByteCount additionalCapacity=0);
+-    IOByteCount getLength(UInt32 * eventCount);
+-    IOByteCount appendBytes(UInt8 * bytes, IOByteCount withLength);
++    IOByteCount readBytes(void * bytes, IOByteCount withLength, UInt32* outCount);
+     
+     static IOHIDEvent * _axisEvent (    IOHIDEventType          type,
+                                         UInt64                  timeStamp,
+diff --git a/iokit/Kernel/arm/hid/IOHIDEventMacroDefs.h b/iokit/Kernel/arm/hid/IOHIDEventMacroDefs.h
+index 8db8f73..0c10d9c 100644
+--- a/iokit/Kernel/arm/hid/IOHIDEventMacroDefs.h
++++ b/iokit/Kernel/arm/hid/IOHIDEventMacroDefs.h
+@@ -2510,13 +2510,13 @@ case kIOHIDEventTypeDigitizer:\
+             ((IOHIDDigitizerEventData*)event)->options.displayIntegrated = value ? 1 : 0; \
+             break; \
+         case kIOHIDEventFieldDigitizerX: \
+-            ((IOHIDDigitizerEventData*)event)->position.x = (typeof(((IOHIDDigitizerEventData*)event)->position.x)) CAST_INTEGER_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->position.x = (typeof(((IOHIDDigitizerEventData*)event)->position.x)) CAST_INTEGER_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerY: \
+-            ((IOHIDDigitizerEventData*)event)->position.y = (typeof(((IOHIDDigitizerEventData*)event)->position.y)) CAST_INTEGER_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->position.y = (typeof(((IOHIDDigitizerEventData*)event)->position.y)) CAST_INTEGER_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerZ: \
+-            ((IOHIDDigitizerEventData*)event)->position.z = (typeof(((IOHIDDigitizerEventData*)event)->position.z)) CAST_INTEGER_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->position.z = (typeof(((IOHIDDigitizerEventData*)event)->position.z)) CAST_INTEGER_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerIndex: \
+             ((IOHIDDigitizerEventData*)event)->transducerIndex = (typeof(((IOHIDDigitizerEventData*)event)->transducerIndex)) CAST_INTEGER_TO_INTEGER(value); \
+@@ -2537,13 +2537,13 @@ case kIOHIDEventTypeDigitizer:\
+             ((IOHIDDigitizerEventData*)event)->buttonMask = (typeof(((IOHIDDigitizerEventData*)event)->buttonMask)) CAST_INTEGER_TO_INTEGER(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerPressure: \
+-            ((IOHIDDigitizerEventData*)event)->pressure = (typeof(((IOHIDDigitizerEventData*)event)->pressure)) CAST_INTEGER_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->pressure = (typeof(((IOHIDDigitizerEventData*)event)->pressure)) CAST_INTEGER_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerAuxiliaryPressure: \
+-            ((IOHIDDigitizerEventData*)event)->auxPressure = (typeof(((IOHIDDigitizerEventData*)event)->auxPressure)) CAST_INTEGER_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->auxPressure = (typeof(((IOHIDDigitizerEventData*)event)->auxPressure)) CAST_INTEGER_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerTwist: \
+-            ((IOHIDDigitizerEventData*)event)->twist = (typeof(((IOHIDDigitizerEventData*)event)->twist)) CAST_INTEGER_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->twist = (typeof(((IOHIDDigitizerEventData*)event)->twist)) CAST_INTEGER_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerGenerationCount: \
+             ((IOHIDDigitizerEventData*)event)->generationCount = (typeof(((IOHIDDigitizerEventData*)event)->generationCount)) CAST_INTEGER_TO_INTEGER(value); \
+@@ -2568,22 +2568,22 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerAltitude: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.altitude = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.altitude)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.altitude = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.altitude)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerAzimuth: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerQuality: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.quality = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.quality)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.quality = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.quality)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerDensity: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.density = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.density)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.density = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.density)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMajorRadius: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMinorRadius: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                 }\
+                 break;\
+@@ -2592,22 +2592,22 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerQuality: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.quality = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.quality)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.quality = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.quality)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerDensity: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.density = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.density)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.density = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.density)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerIrregularity: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMajorRadius: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMinorRadius: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerQualityRadiiAccuracy: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                 }\
+                 break;\
+@@ -2616,10 +2616,10 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerTiltX: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.tilt.x = (typeof(((IOHIDDigitizerEventData*)event)->orientation.tilt.x)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.tilt.x = (typeof(((IOHIDDigitizerEventData*)event)->orientation.tilt.x)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerTiltY: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.tilt.y = (typeof(((IOHIDDigitizerEventData*)event)->orientation.tilt.y)) CAST_INTEGER_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.tilt.y = (typeof(((IOHIDDigitizerEventData*)event)->orientation.tilt.y)) CAST_INTEGER_TO_DOUBLE(value); \
+                         break; \
+                 }\
+                 break;\
+@@ -2648,13 +2648,13 @@ case kIOHIDEventTypeDigitizer:\
+             value = (typeof(value))CAST_INTEGER_TO_INTEGER(((IOHIDDigitizerEventData*)event)->options.displayIntegrated); \
+             break; \
+         case kIOHIDEventFieldDigitizerX: \
+-            value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->position.x); \
++            value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->position.x); \
+             break; \
+         case kIOHIDEventFieldDigitizerY: \
+-            value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->position.y); \
++            value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->position.y); \
+             break; \
+         case kIOHIDEventFieldDigitizerZ: \
+-            value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->position.z); \
++            value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->position.z); \
+             break; \
+         case kIOHIDEventFieldDigitizerIndex: \
+             value = (typeof(value))CAST_INTEGER_TO_INTEGER(((IOHIDDigitizerEventData*)event)->transducerIndex); \
+@@ -2675,13 +2675,13 @@ case kIOHIDEventTypeDigitizer:\
+             value = (typeof(value))CAST_INTEGER_TO_INTEGER(((IOHIDDigitizerEventData*)event)->buttonMask); \
+             break; \
+         case kIOHIDEventFieldDigitizerPressure: \
+-            value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->pressure); \
++            value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->pressure); \
+             break; \
+         case kIOHIDEventFieldDigitizerAuxiliaryPressure: \
+-            value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->auxPressure); \
++            value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->auxPressure); \
+             break; \
+         case kIOHIDEventFieldDigitizerTwist: \
+-            value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->twist); \
++            value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->twist); \
+             break; \
+         case kIOHIDEventFieldDigitizerOrientationType: \
+             value = (typeof(value))CAST_INTEGER_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientationType); \
+@@ -2709,22 +2709,22 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerAltitude: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.polar.altitude); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.polar.altitude); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerAzimuth: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerQuality: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.polar.quality); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.polar.quality); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerDensity: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.polar.density); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.polar.density); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMajorRadius: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMinorRadius: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius); \
+                         break; \
+                 }\
+                 break;\
+@@ -2733,22 +2733,22 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerQuality: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.quality.quality); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.quality.quality); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerDensity: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.quality.density); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.quality.density); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerIrregularity: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMajorRadius: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMinorRadius: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerQualityRadiiAccuracy: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy); \
+                         break; \
+                 }\
+                 break;\
+@@ -2757,10 +2757,10 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerTiltX: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.tilt.x); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.tilt.x); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerTiltY: \
+-                        value = (typeof(value))CAST_FIXED_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.tilt.y); \
++                        value = (typeof(value))CAST_DOUBLE_TO_INTEGER(((IOHIDDigitizerEventData*)event)->orientation.tilt.y); \
+                         break; \
+                 }\
+                 break;\
+@@ -2789,13 +2789,13 @@ case kIOHIDEventTypeDigitizer:\
+             ((IOHIDDigitizerEventData*)event)->options.displayIntegrated = value ? 1 : 0; \
+             break; \
+         case kIOHIDEventFieldDigitizerX: \
+-            ((IOHIDDigitizerEventData*)event)->position.x = (typeof(((IOHIDDigitizerEventData*)event)->position.x)) CAST_DOUBLE_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->position.x = (typeof(((IOHIDDigitizerEventData*)event)->position.x)) CAST_DOUBLE_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerY: \
+-            ((IOHIDDigitizerEventData*)event)->position.y = (typeof(((IOHIDDigitizerEventData*)event)->position.y)) CAST_DOUBLE_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->position.y = (typeof(((IOHIDDigitizerEventData*)event)->position.y)) CAST_DOUBLE_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerZ: \
+-            ((IOHIDDigitizerEventData*)event)->position.z = (typeof(((IOHIDDigitizerEventData*)event)->position.z)) CAST_DOUBLE_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->position.z = (typeof(((IOHIDDigitizerEventData*)event)->position.z)) CAST_DOUBLE_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerIndex: \
+             ((IOHIDDigitizerEventData*)event)->transducerIndex = (typeof(((IOHIDDigitizerEventData*)event)->transducerIndex)) CAST_DOUBLE_TO_INTEGER(value); \
+@@ -2816,13 +2816,13 @@ case kIOHIDEventTypeDigitizer:\
+             ((IOHIDDigitizerEventData*)event)->buttonMask = (typeof(((IOHIDDigitizerEventData*)event)->buttonMask)) CAST_DOUBLE_TO_INTEGER(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerPressure: \
+-            ((IOHIDDigitizerEventData*)event)->pressure = (typeof(((IOHIDDigitizerEventData*)event)->pressure)) CAST_DOUBLE_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->pressure = (typeof(((IOHIDDigitizerEventData*)event)->pressure)) CAST_DOUBLE_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerAuxiliaryPressure: \
+-            ((IOHIDDigitizerEventData*)event)->auxPressure = (typeof(((IOHIDDigitizerEventData*)event)->auxPressure)) CAST_DOUBLE_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->auxPressure = (typeof(((IOHIDDigitizerEventData*)event)->auxPressure)) CAST_DOUBLE_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerTwist: \
+-            ((IOHIDDigitizerEventData*)event)->twist = (typeof(((IOHIDDigitizerEventData*)event)->twist)) CAST_DOUBLE_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->twist = (typeof(((IOHIDDigitizerEventData*)event)->twist)) CAST_DOUBLE_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerGenerationCount: \
+             ((IOHIDDigitizerEventData*)event)->generationCount = (typeof(((IOHIDDigitizerEventData*)event)->generationCount)) CAST_DOUBLE_TO_INTEGER(value); \
+@@ -2847,22 +2847,22 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerAltitude: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.altitude = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.altitude)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.altitude = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.altitude)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerAzimuth: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerQuality: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.quality = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.quality)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.quality = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.quality)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerDensity: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.density = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.density)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.density = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.density)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMajorRadius: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMinorRadius: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                 }\
+                 break;\
+@@ -2871,22 +2871,22 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerQuality: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.quality = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.quality)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.quality = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.quality)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerDensity: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.density = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.density)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.density = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.density)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerIrregularity: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMajorRadius: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMinorRadius: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerQualityRadiiAccuracy: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                 }\
+                 break;\
+@@ -2895,10 +2895,10 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerTiltX: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.tilt.x = (typeof(((IOHIDDigitizerEventData*)event)->orientation.tilt.x)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.tilt.x = (typeof(((IOHIDDigitizerEventData*)event)->orientation.tilt.x)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerTiltY: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.tilt.y = (typeof(((IOHIDDigitizerEventData*)event)->orientation.tilt.y)) CAST_DOUBLE_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.tilt.y = (typeof(((IOHIDDigitizerEventData*)event)->orientation.tilt.y)) CAST_DOUBLE_TO_DOUBLE(value); \
+                         break; \
+                 }\
+                 break;\
+@@ -2927,13 +2927,13 @@ case kIOHIDEventTypeDigitizer:\
+             value = (typeof(value))CAST_INTEGER_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->options.displayIntegrated); \
+             break; \
+         case kIOHIDEventFieldDigitizerX: \
+-            value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->position.x); \
++            value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->position.x); \
+             break; \
+         case kIOHIDEventFieldDigitizerY: \
+-            value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->position.y); \
++            value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->position.y); \
+             break; \
+         case kIOHIDEventFieldDigitizerZ: \
+-            value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->position.z); \
++            value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->position.z); \
+             break; \
+         case kIOHIDEventFieldDigitizerIndex: \
+             value = (typeof(value))CAST_INTEGER_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->transducerIndex); \
+@@ -2954,13 +2954,13 @@ case kIOHIDEventTypeDigitizer:\
+             value = (typeof(value))CAST_INTEGER_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->buttonMask); \
+             break; \
+         case kIOHIDEventFieldDigitizerPressure: \
+-            value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->pressure); \
++            value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->pressure); \
+             break; \
+         case kIOHIDEventFieldDigitizerAuxiliaryPressure: \
+-            value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->auxPressure); \
++            value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->auxPressure); \
+             break; \
+         case kIOHIDEventFieldDigitizerTwist: \
+-            value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->twist); \
++            value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->twist); \
+             break; \
+         case kIOHIDEventFieldDigitizerOrientationType: \
+             value = (typeof(value))CAST_INTEGER_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientationType); \
+@@ -2988,22 +2988,22 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerAltitude: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.polar.altitude); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.polar.altitude); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerAzimuth: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerQuality: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.polar.quality); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.polar.quality); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerDensity: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.polar.density); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.polar.density); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMajorRadius: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMinorRadius: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius); \
+                         break; \
+                 }\
+                 break;\
+@@ -3012,22 +3012,22 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerQuality: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.quality.quality); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.quality.quality); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerDensity: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.quality.density); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.quality.density); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerIrregularity: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMajorRadius: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMinorRadius: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerQualityRadiiAccuracy: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy); \
+                         break; \
+                 }\
+                 break;\
+@@ -3036,10 +3036,10 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerTiltX: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.tilt.x); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.tilt.x); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerTiltY: \
+-                        value = (typeof(value))CAST_FIXED_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.tilt.y); \
++                        value = (typeof(value))CAST_DOUBLE_TO_DOUBLE(((IOHIDDigitizerEventData*)event)->orientation.tilt.y); \
+                         break; \
+                 }\
+                 break;\
+@@ -3068,13 +3068,13 @@ case kIOHIDEventTypeDigitizer:\
+             ((IOHIDDigitizerEventData*)event)->options.displayIntegrated = value ? 1 : 0; \
+             break; \
+         case kIOHIDEventFieldDigitizerX: \
+-            ((IOHIDDigitizerEventData*)event)->position.x = (typeof(((IOHIDDigitizerEventData*)event)->position.x)) CAST_FIXED_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->position.x = (typeof(((IOHIDDigitizerEventData*)event)->position.x)) CAST_FIXED_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerY: \
+-            ((IOHIDDigitizerEventData*)event)->position.y = (typeof(((IOHIDDigitizerEventData*)event)->position.y)) CAST_FIXED_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->position.y = (typeof(((IOHIDDigitizerEventData*)event)->position.y)) CAST_FIXED_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerZ: \
+-            ((IOHIDDigitizerEventData*)event)->position.z = (typeof(((IOHIDDigitizerEventData*)event)->position.z)) CAST_FIXED_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->position.z = (typeof(((IOHIDDigitizerEventData*)event)->position.z)) CAST_FIXED_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerIndex: \
+             ((IOHIDDigitizerEventData*)event)->transducerIndex = (typeof(((IOHIDDigitizerEventData*)event)->transducerIndex)) CAST_FIXED_TO_INTEGER(value); \
+@@ -3095,13 +3095,13 @@ case kIOHIDEventTypeDigitizer:\
+             ((IOHIDDigitizerEventData*)event)->buttonMask = (typeof(((IOHIDDigitizerEventData*)event)->buttonMask)) CAST_FIXED_TO_INTEGER(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerPressure: \
+-            ((IOHIDDigitizerEventData*)event)->pressure = (typeof(((IOHIDDigitizerEventData*)event)->pressure)) CAST_FIXED_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->pressure = (typeof(((IOHIDDigitizerEventData*)event)->pressure)) CAST_FIXED_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerAuxiliaryPressure: \
+-            ((IOHIDDigitizerEventData*)event)->auxPressure = (typeof(((IOHIDDigitizerEventData*)event)->auxPressure)) CAST_FIXED_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->auxPressure = (typeof(((IOHIDDigitizerEventData*)event)->auxPressure)) CAST_FIXED_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerTwist: \
+-            ((IOHIDDigitizerEventData*)event)->twist = (typeof(((IOHIDDigitizerEventData*)event)->twist)) CAST_FIXED_TO_FIXED(value); \
++            ((IOHIDDigitizerEventData*)event)->twist = (typeof(((IOHIDDigitizerEventData*)event)->twist)) CAST_FIXED_TO_DOUBLE(value); \
+             break; \
+         case kIOHIDEventFieldDigitizerGenerationCount: \
+             ((IOHIDDigitizerEventData*)event)->generationCount = (typeof(((IOHIDDigitizerEventData*)event)->generationCount)) CAST_FIXED_TO_INTEGER(value); \
+@@ -3126,22 +3126,22 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerAltitude: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.altitude = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.altitude)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.altitude = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.altitude)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerAzimuth: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerQuality: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.quality = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.quality)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.quality = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.quality)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerDensity: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.density = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.density)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.density = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.density)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMajorRadius: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMinorRadius: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                 }\
+                 break;\
+@@ -3150,22 +3150,22 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerQuality: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.quality = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.quality)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.quality = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.quality)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerDensity: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.density = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.density)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.density = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.density)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerIrregularity: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMajorRadius: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMinorRadius: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerQualityRadiiAccuracy: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy = (typeof(((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                 }\
+                 break;\
+@@ -3174,10 +3174,10 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerTiltX: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.tilt.x = (typeof(((IOHIDDigitizerEventData*)event)->orientation.tilt.x)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.tilt.x = (typeof(((IOHIDDigitizerEventData*)event)->orientation.tilt.x)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerTiltY: \
+-                        ((IOHIDDigitizerEventData*)event)->orientation.tilt.y = (typeof(((IOHIDDigitizerEventData*)event)->orientation.tilt.y)) CAST_FIXED_TO_FIXED(value); \
++                        ((IOHIDDigitizerEventData*)event)->orientation.tilt.y = (typeof(((IOHIDDigitizerEventData*)event)->orientation.tilt.y)) CAST_FIXED_TO_DOUBLE(value); \
+                         break; \
+                 }\
+                 break;\
+@@ -3206,13 +3206,13 @@ case kIOHIDEventTypeDigitizer:\
+             value = (typeof(value))CAST_SHORTINTEGER_TO_FIXED(((IOHIDDigitizerEventData*)event)->options.displayIntegrated); \
+             break; \
+         case kIOHIDEventFieldDigitizerX: \
+-            value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->position.x); \
++            value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->position.x); \
+             break; \
+         case kIOHIDEventFieldDigitizerY: \
+-            value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->position.y); \
++            value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->position.y); \
+             break; \
+         case kIOHIDEventFieldDigitizerZ: \
+-            value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->position.z); \
++            value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->position.z); \
+             break; \
+         case kIOHIDEventFieldDigitizerIndex: \
+             value = (typeof(value))CAST_INTEGER_TO_FIXED(((IOHIDDigitizerEventData*)event)->transducerIndex); \
+@@ -3233,13 +3233,13 @@ case kIOHIDEventTypeDigitizer:\
+             value = (typeof(value))CAST_INTEGER_TO_FIXED(((IOHIDDigitizerEventData*)event)->buttonMask); \
+             break; \
+         case kIOHIDEventFieldDigitizerPressure: \
+-            value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->pressure); \
++            value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->pressure); \
+             break; \
+         case kIOHIDEventFieldDigitizerAuxiliaryPressure: \
+-            value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->auxPressure); \
++            value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->auxPressure); \
+             break; \
+         case kIOHIDEventFieldDigitizerTwist: \
+-            value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->twist); \
++            value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->twist); \
+             break; \
+         case kIOHIDEventFieldDigitizerOrientationType: \
+             value = (typeof(value))CAST_INTEGER_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientationType); \
+@@ -3267,22 +3267,22 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerAltitude: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.polar.altitude); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.polar.altitude); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerAzimuth: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.polar.azimuth); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerQuality: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.polar.quality); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.polar.quality); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerDensity: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.polar.density); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.polar.density); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMajorRadius: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.polar.majorRadius); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMinorRadius: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.polar.minorRadius); \
+                         break; \
+                 }\
+                 break;\
+@@ -3291,22 +3291,22 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerQuality: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.quality.quality); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.quality.quality); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerDensity: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.quality.density); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.quality.density); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerIrregularity: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.quality.irregularity); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMajorRadius: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.quality.majorRadius); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerMinorRadius: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.quality.minorRadius); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerQualityRadiiAccuracy: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.quality.accuracy); \
+                         break; \
+                 }\
+                 break;\
+@@ -3315,10 +3315,10 @@ case kIOHIDEventTypeDigitizer:\
+                 switch (field) \
+                 {\
+                     case kIOHIDEventFieldDigitizerTiltX: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.tilt.x); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.tilt.x); \
+                         break; \
+                     case kIOHIDEventFieldDigitizerTiltY: \
+-                        value = (typeof(value))CAST_FIXED_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.tilt.y); \
++                        value = (typeof(value))CAST_DOUBLE_TO_FIXED(((IOHIDDigitizerEventData*)event)->orientation.tilt.y); \
+                         break; \
+                 }\
+                 break;\
+diff --git a/iokit/Kernel/arm/hid/IOHIDEventStructDefs.h b/iokit/Kernel/arm/hid/IOHIDEventStructDefs.h
+index d500c1b..879e22c 100644
+--- a/iokit/Kernel/arm/hid/IOHIDEventStructDefs.h
++++ b/iokit/Kernel/arm/hid/IOHIDEventStructDefs.h
+@@ -321,6 +321,16 @@ typedef struct {
+     IOHIDTranslationEventData base;
+ } __IOHIDTranslationEventData;
+ 
++/*
++ * HUSKY: the iOS 26 digitizer layout (IOHIDFamily 2222+), 0xa0 bytes with
++ * double coordinates. iOS 26's IOHIDLib rejects a digitizer event smaller
++ * than this. Offsets read from the iOS 26 shared cache: x/y/z 0x10/0x18/0x20,
++ * transducerIndex 0x28, transducerType 0x2c, identity 0x30, eventMask 0x34,
++ * buttonMask 0x3c, pressure 0x40, auxPressure 0x50 (IOKit
++ * IOHIDEventCreateDigitizerEvent); orientationType 0x58, quality union 0x60..0x88
++ * (HID +[HIDEvent qualityDigitizerEvent:...]). childEventMask 0x38, twist 0x48
++ * and the trailing counters fill the remaining slots in 1915's order (inferred).
++ */
+ typedef struct {
+     uint32_t size;
+     IOHIDEventType type;
+@@ -336,9 +346,9 @@ typedef struct {
+     uint8_t depth;
+     uint8_t reserved[3];
+     struct {
+-        IOFixed x;
+-        IOFixed y;
+-        IOFixed z;
++        double x;
++        double y;
++        double z;
+     } position;
+     uint32_t transducerIndex;
+     uint32_t transducerType;
+@@ -346,30 +356,30 @@ typedef struct {
+     uint32_t eventMask;
+     uint32_t childEventMask;
+     uint32_t buttonMask;
+-    IOFixed pressure;
+-    IOFixed auxPressure;
+-    IOFixed twist;
++    double pressure;
++    double twist;
++    double auxPressure;
+     uint32_t orientationType;
+     union  {
+         struct {
+-            IOFixed x;
+-            IOFixed y;
++            double x;
++            double y;
+         } tilt;
+         struct {
+-            IOFixed altitude;
+-            IOFixed azimuth;
+-            IOFixed quality;
+-            IOFixed density;
+-            IOFixed majorRadius;
+-            IOFixed minorRadius;
++            double altitude;
++            double azimuth;
++            double quality;
++            double density;
++            double majorRadius;
++            double minorRadius;
+         } polar;
+         struct {
+-            IOFixed quality;
+-            IOFixed density;
+-            IOFixed irregularity;
+-            IOFixed majorRadius;
+-            IOFixed minorRadius;
+-            IOFixed accuracy;
++            double quality;
++            double density;
++            double irregularity;
++            double majorRadius;
++            double minorRadius;
++            double accuracy;
+         } quality;
+     } orientation;
+     uint32_t generationCount;
+@@ -377,6 +387,16 @@ typedef struct {
+     uint32_t didUpdateMask;
+ } IOHIDDigitizerEventData;
+ 
++_Static_assert(sizeof(IOHIDDigitizerEventData) == 0xa0, "iOS 26 digitizer size");
++_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, position.x) == 0x10, "x");
++_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, transducerIndex) == 0x28, "index");
++_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, eventMask) == 0x34, "eventMask");
++_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, buttonMask) == 0x3c, "buttonMask");
++_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, pressure) == 0x40, "pressure");
++_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, auxPressure) == 0x50, "auxPressure");
++_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, orientationType) == 0x58, "orientationType");
++_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, orientation.quality.majorRadius) == 0x78, "majorRadius");
++
+ typedef struct {
+     IOHIDDigitizerEventData base;
+ } __IOHIDDigitizerEventData;
