@@ -1,0 +1,92 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 3a8a71c..0236ead 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -46,6 +46,13 @@
+  *   0x700 = AUTO (2); boot = JOB_IRQ_RAWSTAT 0x1000 bit 31 and GLB_VERSION != 0.
+  * - global interface (shared+0): version, features, input VA, output VA;
+  *   requests toggle GLB_REQ bits against GLB_ACK, then doorbell 0 (0x80000).
++ * - S2MPU: the G3D stage-2 MPU (google,s2mpu-v9 at 0x1EE70000, in pd_g3d)
++ *   resets to blocking all GPU DMA; on Android the pKVM hypervisor programs
++ *   it (google-modules soc/gs pkvm-s2mpu, hyp/s2mpu.c __set_control_regs_v9:
++ *   protection per VID via CTRL_PROT_EN_PER_VID_SET 0x50 / _CLR 0x54, 8
++ *   VIDs; "otherwise all traffic would be allowed through"). There is no
++ *   hypervisor here, so protection is cleared for every VID. Boot 0091 first
++ *   faulted on the MCU's first page-table walk with a bus error.
+  * Firmware and page-table pages are written through the cacheable mapping and
+  * cleaned to DRAM (non-coherent walks); the shared section is accessed only
+  * through a non-cacheable alias.
+@@ -241,6 +248,55 @@ struct fw_section {
+ };
+ 
+ static vm_offset_t gpu_regs;
++static vm_offset_t s2mpu_regs;
++
++#define S2MPU_G3D_PA            0x1EE70000ULL
++#define S2MPU_SIZE              0x10000ULL
++#define S2MPU_CTRL0             0x0000u
++#define S2MPU_INTERRUPT_CLEAR   0x002cu
++#define S2MPU_PROT_EN_SET       0x0050u
++#define S2MPU_PROT_EN_CLR       0x0054u
++#define S2MPU_VERSION           0x0060u
++#define S2MPU_FAULT_STATUS      0x2000u
++#define S2MPU_FAULT_PA_LOW(v)   (0x2004u + (v) * 0x20u)
++#define S2MPU_FAULT_PA_HIGH(v)  (0x2008u + (v) * 0x20u)
++#define S2MPU_FAULT_INFO(v)     (0x2010u + (v) * 0x20u)
++#define S2MPU_ALL_VIDS          0xffu
++
++static void
++s2mpu_dump(const char *when)
++{
++	if (!s2mpu_regs) {
++		return;
++	}
++	uint32_t st = rd32(s2mpu_regs, S2MPU_FAULT_STATUS);
++	HU_LOG("HUSKY GPU: S2MPU %s: VERSION 0x%x CTRL0 0x%x PROT_EN 0x%x FAULT_STATUS 0x%x\n", when,
++	    rd32(s2mpu_regs, S2MPU_VERSION), rd32(s2mpu_regs, S2MPU_CTRL0),
++	    rd32(s2mpu_regs, S2MPU_PROT_EN_SET), st);
++	for (unsigned v = 0; v < 8; v++) {
++		if (st & (1u << v)) {
++			HU_LOG("HUSKY GPU: S2MPU fault vid %u pa 0x%x%08x info 0x%x\n", v,
++			    rd32(s2mpu_regs, S2MPU_FAULT_PA_HIGH(v)), rd32(s2mpu_regs, S2MPU_FAULT_PA_LOW(v)),
++			    rd32(s2mpu_regs, S2MPU_FAULT_INFO(v)));
++		}
++	}
++}
++
++/* No hypervisor: let the GPU's DMA through the G3D S2MPU (pd_g3d is on). */
++static bool
++s2mpu_g3d_open(void)
++{
++	s2mpu_regs = ml_io_map(S2MPU_G3D_PA, S2MPU_SIZE);
++	if (!s2mpu_regs) {
++		HU_LOG("HUSKY GPU: S2MPU map failed\n");
++		return false;
++	}
++	s2mpu_dump("as left by the bootloader");
++	wr32(s2mpu_regs, S2MPU_PROT_EN_CLR, S2MPU_ALL_VIDS);
++	wr32(s2mpu_regs, S2MPU_INTERRUPT_CLEAR, S2MPU_ALL_VIDS);
++	s2mpu_dump("protection cleared");
++	return true;
++}
+ 
+ static inline uint32_t
+ grd(uint32_t off)
+@@ -288,6 +344,7 @@ gpu_fault_dump(const char *why)
+ 	    why, grd(GPU_IRQ_RAWSTAT), grd(GPU_FAULTSTATUS), grd(GPU_FAULTADDR_HI), grd(GPU_FAULTADDR_LO),
+ 	    grd(MCU_STATUS), grd(JOB_IRQ_RAWSTAT), grd(MMU_IRQ_RAWSTAT), grd(AS0 + AS_FAULTSTATUS),
+ 	    grd(AS0 + AS_FAULTADDR + 4), grd(AS0 + AS_FAULTADDR), grd(AS0 + AS_STATUS));
++	s2mpu_dump(why);
+ }
+ 
+ /* Simple word copies: the targets may be Device/NC mappings (no dc zva). */
+@@ -510,6 +567,9 @@ husky_gpu_mcu_boot(void)
+ 		HU_LOG("HUSKY GPU: register map failed\n");
+ 		return;
+ 	}
++	if (!s2mpu_g3d_open()) {
++		return;
++	}
+ 	HU_LOG("HUSKY GPU: IRQ masks off, soft reset\n");
+ 	gwr(GPU_IRQ_MASK, 0);
+ 	gwr(JOB_IRQ_MASK, 0);
