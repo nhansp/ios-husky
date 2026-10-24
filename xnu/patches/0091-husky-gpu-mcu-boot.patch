@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
-index a1194cd..ec47b61 100644
+index a1194cd..3a8a71c 100644
 --- a/bsd/dev/husky_gpu.c
 +++ b/bsd/dev/husky_gpu.c
 @@ -6,6 +6,7 @@
@@ -42,7 +42,7 @@ index a1194cd..ec47b61 100644
   * Every step is logged (kprintf too) before it runs, so an SError leaves a
   * trail in pmsg.
   */
-@@ -35,8 +61,13 @@
+@@ -35,8 +61,14 @@
  #include <kern/clock.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
@@ -53,10 +53,11 @@ index a1194cd..ec47b61 100644
  
  extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
  
  #define HU_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
  
-@@ -113,6 +144,489 @@ husky_gpu_dump(void)
+@@ -113,6 +145,489 @@ husky_gpu_dump(void)
  	    (id >> 12) & 0xf, (id >> 4) & 0xf, (id >> 16) & 0xff);
  }
  
@@ -546,7 +547,7 @@ index a1194cd..ec47b61 100644
  void
  husky_gpu_probe(void)
  {
-@@ -159,6 +673,9 @@ husky_gpu_probe(void)
+@@ -159,6 +674,9 @@ husky_gpu_probe(void)
  		}
  	}
  	husky_gpu_dump();
