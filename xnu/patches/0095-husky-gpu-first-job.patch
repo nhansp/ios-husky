@@ -1,0 +1,366 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 64d14df..d69a653 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -6,7 +6,8 @@
+  *   1  read-only: the G3D power domains' state; GPU_ID and friends only if
+  *      the top domain is already on.
+  *   2  also power the top domain on (if off) and then read the registers.
+- *   3  also boot the CSF firmware on the MCU and ping it (see below).
++ *   3  also boot the CSF firmware on the MCU, ping it and run a first
++ *      command-stream job on group 0 (husky_gpu_first_job).
+  *
+  * Facts (zuma-gpu.dtsi, zuma-pm-domains.dtsi, cal-if zuma
+  * flexpmu_cal_local_zuma.h, exynos-pd_el3.c, Arm Mali CSF register map as in
+@@ -162,7 +163,7 @@ husky_gpu_dump(void)
+ 
+ /* ---- CSF firmware boot (huskygpu=3) ---- */
+ 
+-#define GPU_MAP_SIZE            0x81000ULL      /* up to doorbell 0 */
++#define GPU_MAP_SIZE            0x91000ULL      /* up to doorbell 1 */
+ #define GPU_IRQ_RAWSTAT         0x020u
+ #define GPU_IRQ_CLEAR           0x024u
+ #define GPU_IRQ_MASK            0x028u
+@@ -192,7 +193,9 @@ husky_gpu_dump(void)
+ #define AS_FAULTADDR            0x20u
+ #define AS_STATUS               0x28u
+ #define AS_TRANSCFG             0x30u
++#define AS_STRIDE               0x40u
+ #define DOORBELL0               0x80000u
++#define DOORBELL(i)             (DOORBELL0 + (i) * 0x10000u)
+ 
+ #define GPU_IRQ_RESET_COMPLETED (1u << 8)
+ #define GPU_CMD_SOFT_RESET      0x0101u
+@@ -247,6 +250,96 @@ static const uint32_t gpu_l2_hash[3] = {0x0036DB6D, 0x005B6DB6, 0x0};
+ #define GLB_REQ_PING            (1u << 8)
+ #define GLB_REQ_IDLE_EN         (1u << 10)
+ #define GLB_REQ_IDLE            (1u << 26)
++#define GLB_GROUP_STRIDE        0x14u
++#define GLB_IN_DB_REQ           0x08u
++#define GLB_OUT_DB_ACK          0x08u
++
++/*
++ * Group (CSG) and stream (CS) interfaces (panthor_fw.h, kbase
++ * mali_kbase_csf_registers.h). Control blocks: group i at shared + 0x1000 +
++ * i * GLB_GROUP_STRIDE, its stream j at group + 0x40 + j * GROUP_STREAM_STRIDE.
++ */
++#define CSF_GROUP_CONTROL       0x1000u
++#define CSF_STREAM_CONTROL      0x40u
++#define GROUP_FEATURES          0x00u
++#define GROUP_INPUT_VA          0x04u
++#define GROUP_OUTPUT_VA         0x08u
++#define GROUP_SUSPEND_SIZE      0x0cu
++#define GROUP_STREAM_NUM        0x14u
++#define GROUP_STREAM_STRIDE     0x18u
++#define STREAM_FEATURES         0x00u
++#define STREAM_INPUT_VA         0x04u
++#define STREAM_OUTPUT_VA        0x08u
++#define CSG_IN_REQ              0x00u
++#define CSG_IN_ACK_IRQ_MASK     0x04u
++#define CSG_IN_DB_REQ           0x08u
++#define CSG_IN_ALLOW_COMPUTE    0x20u
++#define CSG_IN_ALLOW_FRAGMENT   0x28u
++#define CSG_IN_ALLOW_OTHER      0x30u
++#define CSG_IN_EP_REQ           0x34u
++#define CSG_IN_SUSPEND_BUF      0x40u
++#define CSG_IN_PROTM_SUSPEND    0x48u
++#define CSG_IN_CONFIG           0x50u
++#define CSG_OUT_ACK             0x00u
++#define CSG_OUT_DB_ACK          0x08u
++#define CSG_OUT_EP_CURRENT      0x10u
++#define CSG_OUT_STATUS_STATE    0x18u
++#define CSG_STATE_MASK          7u
++#define CSG_STATE_START         1u
++#define CSG_ENDPOINT_CONFIG     (1u << 4)
++#define CS_IN_REQ               0x00u
++#define CS_IN_CONFIG            0x04u
++#define CS_IN_ACK_IRQ_MASK      0x0cu
++#define CS_IN_RING_BASE         0x10u
++#define CS_IN_RING_SIZE         0x18u
++#define CS_IN_RING_INPUT        0x30u
++#define CS_IN_RING_OUTPUT       0x38u
++#define CS_OUT_ACK              0x00u
++#define CS_OUT_CMD_PTR          0x40u
++#define CS_OUT_STATUS_WAIT      0x48u
++#define CS_OUT_BLOCKED_REASON   0x60u
++#define CS_OUT_FAULT            0x80u
++#define CS_OUT_FATAL            0x84u
++#define CS_OUT_FAULT_INFO       0x88u
++#define CS_OUT_FATAL_INFO       0x90u
++#define CS_STATE_MASK           7u
++#define CS_STATE_START          1u
++#define CS_IDLE_SYNC_WAIT       (1u << 8)
++#define CS_IDLE_EMPTY           (1u << 10)
++#define CS_DOORBELL_ID          1u
++
++/*
++ * First-job scratch area, mapped (non-cacheable) in the MCU page tables at
++ * TEST_VA before the MCU boots; AS1, the group's address space, shares
++ * those tables. Layout: ring buffer, ring input page (insert, extract), ring
++ * output page (extract, active), data page, then the group suspend buffer.
++ */
++#define TEST_VA                 0x06000000u
++#define TEST_RING               0x0000u
++#define TEST_RING_SIZE          0x1000u
++#define TEST_RING_IN            0x1000u
++#define TEST_RING_OUT           0x2000u
++#define TEST_DATA               0x3000u
++#define TEST_SYNC               0x3040u
++#define TEST_SUSPEND            0x10000u
++#define TEST_SUSPEND_MAX        0x80000u
++#define TEST_SIZE               (TEST_SUSPEND + TEST_SUSPEND_MAX)
++#define TEST_MAGIC              0x600DCAFEu
++
++/* CS instructions (Mesa genxml v10/v11 "CS ..." structs; opcode in 63:56). */
++#define CS_MOVE48(r, imm)       ((1ULL << 56) | ((uint64_t)(r) << 48) | ((uint64_t)(imm) & 0xffffffffffffULL))
++#define CS_MOVE32(r, imm)       ((2ULL << 56) | ((uint64_t)(r) << 48) | (uint32_t)(imm))
++#define CS_WAIT(mask)           ((3ULL << 56) | ((uint64_t)(mask) << 16))
++#define CS_STORE_MULTIPLE(src, addr, mask, off) \
++	((21ULL << 56) | ((uint64_t)(src) << 48) | ((uint64_t)(addr) << 40) | \
++	((uint64_t)(mask) << 16) | (uint16_t)(off))
++#define CS_FLUSH_CACHE2(id_reg) /* L2 + LSC clean-invalidate, other invalidate */ \
++	((36ULL << 56) | ((uint64_t)(id_reg) << 40) | 0x233ULL)
++#define CS_STORE_STATE_TS(addr, off) \
++	((40ULL << 56) | ((uint64_t)(addr) << 40) | (uint16_t)(off))
++#define CS_SYNC_ADD64(addr, val) /* system scope, propagate errors */ \
++	((51ULL << 56) | ((uint64_t)(addr) << 40) | ((uint64_t)(val) << 32) | 1ULL)
++#define CS_ERROR_BARRIER        (47ULL << 56)
+ 
+ struct fw_section {
+ 	uint32_t flags, va_start, va_end, data_start, data_end;
+@@ -388,6 +481,8 @@ copy_bytes(volatile uint8_t *dst, const uint8_t *src, size_t n)
+ static uint64_t pt_pa;          /* pool base */
+ static vm_offset_t pt_kva;
+ static unsigned pt_used;
++static uint64_t test_pa;        /* job area (TEST_VA) */
++static uint64_t mcu_root;       /* AS0 TRANSTAB, shared with AS1 */
+ 
+ static uint64_t *
+ pt_entry_table(uint64_t table_pa)
+@@ -455,6 +550,179 @@ glb_timeout(uint64_t us)
+ 	return (uint32_t)((us * freq) / (1000000ULL << 10));
+ }
+ 
++static inline void
++wr64(vm_offset_t base, uint32_t off, uint64_t val)
++{
++	wr32(base, off, (uint32_t)val);
++	wr32(base, off + 4, (uint32_t)(val >> 32));
++}
++
++static inline uint64_t
++rd64(vm_offset_t base, uint32_t off)
++{
++	return rd32(base, off) | ((uint64_t)rd32(base, off + 4) << 32);
++}
++
++static void
++cs_state_dump(const char *when, vm_offset_t csout, vm_offset_t csgout, vm_offset_t t)
++{
++	HU_LOG("HUSKY GPU: %s: CSG ack 0x%x state 0x%x ep 0x%x | CS ack 0x%x cmd_ptr 0x%llx wait 0x%x "
++	    "blocked %u fault 0x%x/0x%llx fatal 0x%x/0x%llx | ring extract %llu active %u | JOB_IRQ 0x%x\n",
++	    when, rd32(csgout, CSG_OUT_ACK), rd32(csgout, CSG_OUT_STATUS_STATE), rd32(csgout, CSG_OUT_EP_CURRENT),
++	    rd32(csout, CS_OUT_ACK), rd64(csout, CS_OUT_CMD_PTR), rd32(csout, CS_OUT_STATUS_WAIT),
++	    rd32(csout, CS_OUT_BLOCKED_REASON), rd32(csout, CS_OUT_FAULT), rd64(csout, CS_OUT_FAULT_INFO),
++	    rd32(csout, CS_OUT_FATAL), rd64(csout, CS_OUT_FATAL_INFO), rd64(t, TEST_RING_OUT),
++	    rd32(t, TEST_RING_OUT + 8), grd(JOB_IRQ_RAWSTAT));
++}
++
++/*
++ * First job (panthor_sched.c cs_slot_prog_locked / csg_slot_prog_locked /
++ * queue_run_job): group 0, stream 0, address space 1 (same tables as the
++ * MCU's AS0), a kernel ring buffer that stores a magic word and a GPU
++ * timestamp, flushes the caches and bumps a 64-bit sync object, the way
++ * panthor ends every job.
++ */
++static void
++husky_gpu_first_job(vm_offset_t shared, uint32_t shared_size, vm_offset_t gin, vm_offset_t gout)
++{
++	vm_offset_t csg_ctl = shared + CSF_GROUP_CONTROL;
++	vm_offset_t cs_ctl = csg_ctl + CSF_STREAM_CONTROL;
++	uint32_t csg_in_va = rd32(csg_ctl, GROUP_INPUT_VA), csg_out_va = rd32(csg_ctl, GROUP_OUTPUT_VA);
++	uint32_t suspend = rd32(csg_ctl, GROUP_SUSPEND_SIZE);
++	uint32_t cs_feat = rd32(cs_ctl, STREAM_FEATURES);
++	uint32_t cs_in_va = rd32(cs_ctl, STREAM_INPUT_VA), cs_out_va = rd32(cs_ctl, STREAM_OUTPUT_VA);
++	HU_LOG("HUSKY GPU: group stride 0x%x; CSG0 features 0x%x in 0x%x out 0x%x suspend 0x%x streams %u "
++	    "stride 0x%x; CS0 features 0x%x in 0x%x out 0x%x\n", rd32(shared, GLB_GROUP_STRIDE),
++	    rd32(csg_ctl, GROUP_FEATURES), csg_in_va, csg_out_va, suspend, rd32(csg_ctl, GROUP_STREAM_NUM),
++	    rd32(csg_ctl, GROUP_STREAM_STRIDE), cs_feat, cs_in_va, cs_out_va);
++	uint32_t vas[4] = {csg_in_va, csg_out_va, cs_in_va, cs_out_va};
++	for (unsigned i = 0; i < 4; i++) {
++		if (vas[i] < FW_SHARED_VA || vas[i] + 0x100 > FW_SHARED_VA + shared_size) {
++			HU_LOG("HUSKY GPU: group/stream block 0x%x outside the shared section\n", vas[i]);
++			return;
++		}
++	}
++	unsigned regs = (cs_feat & 0xff) + 1, sbs = (cs_feat >> 8) & 0xff;
++	if (regs < 8 || sbs == 0 || sbs > 16) {
++		HU_LOG("HUSKY GPU: unexpected CS features\n");
++		return;
++	}
++	/* panthor's job registers: the last four are unpreserved */
++	unsigned ra = regs - 4, rv = ra + 2;
++	uint32_t waitall = (1u << sbs) - 1;
++	uint64_t suspend_va = TEST_VA + TEST_SUSPEND;
++	if (suspend > TEST_SUSPEND_MAX) {
++		HU_LOG("HUSKY GPU: suspend buffer 0x%x > 0x%x, passing none\n", suspend, TEST_SUSPEND_MAX);
++		suspend_va = 0;
++	}
++	vm_offset_t csgin = shared + (csg_in_va - FW_SHARED_VA), csgout = shared + (csg_out_va - FW_SHARED_VA);
++	vm_offset_t csin = shared + (cs_in_va - FW_SHARED_VA), csout = shared + (cs_out_va - FW_SHARED_VA);
++
++	vm_offset_t t = ml_io_map_wcomb((vm_offset_t)test_pa, TEST_SIZE);
++	if (!t) {
++		HU_LOG("HUSKY GPU: job area map failed\n");
++		return;
++	}
++
++	/* AS1: the group's address space, same tables as the MCU. */
++	uint32_t as1 = AS0 + AS_STRIDE;
++	if (!gpoll(as1 + AS_STATUS, 3, 0, 100000, NULL)) {
++		gpu_fault_dump("AS1 busy before update");
++		return;
++	}
++	gwr64(as1 + AS_TRANSTAB, mcu_root);
++	gwr64(as1 + AS_MEMATTR, AS_MEMATTR_VALUE);
++	gwr64(as1 + AS_TRANSCFG, AS_TRANSCFG_VALUE);
++	gwr(as1 + AS_COMMAND, AS_CMD_UPDATE);
++	if (!gpoll(as1 + AS_STATUS, 3, 0, 100000, NULL)) {
++		gpu_fault_dump("AS1 update timeout");
++		return;
++	}
++
++	const uint64_t prog[] = {
++		CS_MOVE48(ra, TEST_VA + TEST_DATA),
++		CS_MOVE32(rv, TEST_MAGIC),
++		CS_STORE_MULTIPLE(rv, ra, 1, 0),
++		CS_STORE_STATE_TS(ra, 8),
++		CS_WAIT(waitall),
++		CS_MOVE32(rv, 0),               /* flush ID 0: flush unconditionally */
++		CS_FLUSH_CACHE2(rv),
++		CS_WAIT(waitall),
++		CS_MOVE48(ra, TEST_VA + TEST_SYNC),
++		CS_MOVE48(rv, 1),
++		CS_SYNC_ADD64(ra, rv),
++		CS_ERROR_BARRIER,
++	};
++	unsigned n = sizeof(prog) / sizeof(prog[0]);
++	unsigned padded = (n + 7) & ~7u;        /* whole 64-byte lines; the rest is NOP (0) */
++	for (unsigned i = 0; i < padded; i++) {
++		*(volatile uint64_t *)(t + TEST_RING + 8 * i) = i < n ? prog[i] : 0;
++	}
++	wr64(t, TEST_RING_IN, 8 * padded);      /* insert */
++	wr64(t, TEST_RING_IN + 8, 0);           /* extract */
++	HU_LOG("HUSKY GPU: %u-instruction ring (regs %u, scoreboards %u, r%u/r%u); programming CS0/CSG0\n",
++	    n, regs, sbs, ra, rv);
++
++	wr64(csin, CS_IN_RING_BASE, TEST_VA + TEST_RING);
++	wr32(csin, CS_IN_RING_SIZE, TEST_RING_SIZE);
++	wr64(csin, CS_IN_RING_INPUT, TEST_VA + TEST_RING_IN);
++	wr64(csin, CS_IN_RING_OUTPUT, TEST_VA + TEST_RING_OUT);
++	wr32(csin, CS_IN_CONFIG, 1u | (CS_DOORBELL_ID << 8));  /* priority 1, doorbell 1 */
++	wr32(csin, CS_IN_ACK_IRQ_MASK, ~0u);
++	uint32_t cs_mask = CS_IDLE_SYNC_WAIT | CS_IDLE_EMPTY | CS_STATE_MASK;
++	wr32(csin, CS_IN_REQ, (rd32(csin, CS_IN_REQ) & ~cs_mask) | CS_IDLE_SYNC_WAIT | CS_IDLE_EMPTY | CS_STATE_START);
++
++	unsigned cores = (unsigned)__builtin_popcountll(GPU_SHADER_PRESENT);
++	wr64(csgin, CSG_IN_ALLOW_COMPUTE, GPU_SHADER_PRESENT);
++	wr64(csgin, CSG_IN_ALLOW_FRAGMENT, GPU_SHADER_PRESENT);
++	wr32(csgin, CSG_IN_ALLOW_OTHER, 1);     /* TILER_PRESENT */
++	/* interface 2.8 < 4.0: the 32-bit endpoint request */
++	wr32(csgin, CSG_IN_EP_REQ, cores | (cores << 8) | (1u << 16) | (0xfu << 28));
++	wr32(csgin, CSG_IN_CONFIG, 1);          /* AS1 */
++	wr64(csgin, CSG_IN_SUSPEND_BUF, suspend_va);
++	wr64(csgin, CSG_IN_PROTM_SUSPEND, 0);
++	wr32(csgin, CSG_IN_ACK_IRQ_MASK, ~0u);
++	/* kick stream 0 with the group (panthor_fw_toggle_reqs doorbell_req) */
++	wr32(csgin, CSG_IN_DB_REQ, (rd32(csgin, CSG_IN_DB_REQ) & ~1u) | (~rd32(csgout, CSG_OUT_DB_ACK) & 1u));
++	uint32_t csg_mask = CSG_STATE_MASK | CSG_ENDPOINT_CONFIG;
++	uint32_t csg_req = (rd32(csgin, CSG_IN_REQ) & ~csg_mask) | CSG_STATE_START |
++	    ((rd32(csgout, CSG_OUT_ACK) ^ CSG_ENDPOINT_CONFIG) & CSG_ENDPOINT_CONFIG);
++	wr32(csgin, CSG_IN_REQ, csg_req);
++	/* ring group 0's doorbell through the global interface */
++	wr32(gin, GLB_IN_DB_REQ, (rd32(gin, GLB_IN_DB_REQ) & ~1u) | (~rd32(gout, GLB_OUT_DB_ACK) & 1u));
++	gwr(DOORBELL0, 1);
++
++	unsigned us;
++	for (us = 0; us < 100000; us += 10) {
++		if ((rd32(csgout, CSG_OUT_ACK) & csg_mask) == (csg_req & csg_mask)) {
++			break;
++		}
++		delay(10);
++	}
++	HU_LOG("HUSKY GPU: CSG0 start %s after %u us (req 0x%x)\n", us < 100000 ? "acked" : "NOT acked", us,
++	    csg_req);
++	cs_state_dump("group started", csout, csgout, t);
++	if (us >= 100000) {
++		gpu_fault_dump("CSG start");
++		return;
++	}
++
++	gwr(DOORBELL(CS_DOORBELL_ID), 1);
++	for (us = 0; us < 200000; us += 10) {
++		if (rd32(t, TEST_DATA) == TEST_MAGIC && rd64(t, TEST_SYNC) == 1) {
++			break;
++		}
++		delay(10);
++	}
++	HU_LOG("HUSKY GPU: FIRST JOB %s after %u us: data 0x%x timestamp 0x%llx sync %llu\n",
++	    us < 200000 ? "COMPLETED" : "did not complete", us, rd32(t, TEST_DATA), rd64(t, TEST_DATA + 8),
++	    rd64(t, TEST_SYNC));
++	cs_state_dump("after the job", csout, csgout, t);
++	if (us >= 200000) {
++		gpu_fault_dump("first job");
++	}
++}
++
+ static void
+ husky_gpu_mcu_boot(void)
+ {
+@@ -526,9 +794,9 @@ husky_gpu_mcu_boot(void)
+ 		return;
+ 	}
+ 
+-	/* One contiguous region: sections, then the page-table pool. */
++	/* One contiguous region: sections, the page-table pool, the job area. */
+ 	vm_offset_t kva = 0;
+-	vm_size_t region = round_page(total + PT_PAGES * GPU_PAGE);
++	vm_size_t region = round_page(total + PT_PAGES * GPU_PAGE + TEST_SIZE);
+ 	if (kmem_alloc_contig(kernel_map, &kva, region, PAGE_MASK,
+ 	    (ppnum_t)atop_64(1ULL << 40) - 1, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+ 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+@@ -568,7 +836,15 @@ husky_gpu_mcu_boot(void)
+ 			}
+ 		}
+ 	}
+-	HU_LOG("HUSKY GPU: %u sections mapped, %u page-table pages\n", nsec, pt_used);
++	test_pa = pt_pa + PT_PAGES * GPU_PAGE;
++	for (uint32_t off = 0; off < TEST_SIZE; off += GPU_PAGE) {
++		if (!pt_map_page(root, TEST_VA + off, test_pa + off, leaf_attrs_for(FW_IFACE_RD | FW_IFACE_WR))) {
++			HU_LOG("HUSKY GPU: page-table pool exhausted (job area)\n");
++			return;
++		}
++	}
++	HU_LOG("HUSKY GPU: %u sections mapped, job area at va 0x%x pa 0x%llx, %u page-table pages\n", nsec,
++	    TEST_VA, test_pa, pt_used);
+ 	/* Push everything to DRAM: the GPU walks and reads non-coherently. */
+ 	husky_dcache_flush(kva, region);
+ 
+@@ -638,6 +914,7 @@ husky_gpu_mcu_boot(void)
+ 	}
+ 	HU_LOG("HUSKY GPU: L2 ready in %u us\n", took);
+ 
++	mcu_root = root;
+ 	HU_LOG("HUSKY GPU: AS0 TRANSTAB 0x%llx\n", root);
+ 	if (!gpoll(AS0 + AS_STATUS, 3, 0, 100000, NULL)) {
+ 		gpu_fault_dump("AS0 busy before update");
+@@ -718,7 +995,9 @@ husky_gpu_mcu_boot(void)
+ 	    us < 100000 ? "ANSWERED" : "unanswered", us, grd(MCU_STATUS));
+ 	if (us >= 100000) {
+ 		gpu_fault_dump("ping");
++		return;
+ 	}
++	husky_gpu_first_job(shared_nc, shared_size, gin, gout);
+ }
+ 
+ void
