@@ -47,6 +47,18 @@ each tweak re-checked against the real 23G90 / 26.6.2 image:
                   runtime). If neither is present the ark is seeded at the
                   legacy path /private/var/mobile/Library/mad/data_ark.plist,
                   which mobileactivationd migrates into the container itself.
+  ui              Reduce Transparency (com.apple.Accessibility
+                  EnhancedBackgroundContrastEnabled) and Reduce Motion
+                  (ReduceMotionEnabled), keys checked in iOS 26's
+                  libAccessibility: without a GPU, CoreAnimation renders on the
+                  CPU, and its backdrop/blur path (CA::OGL::AsynchronousNode)
+                  asserted in backboardd (boot 0084) and is the costliest part.
+  timezone        /private/var/db/timezone/localtime ->
+                  /var/db/timezone/zoneinfo/<--timezone> (default
+                  Asia/Ho_Chi_Minh; the image ships US/Pacific).
+
+The ui and timezone tweaks can also be applied to the phone directly, without
+pulling the root back: tools/ios-tweak-ondevice.py.
 """
 import argparse, glob, os, plistlib, sys
 
@@ -55,6 +67,20 @@ MOBILE = 501
 SETUP_VERSION = 11          # iOS 16 value; the key still exists on iOS 26, current value unverified
 
 DRY = False
+
+# Shared with tools/ios-tweak-ondevice.py.
+UI_PREFS = {
+    'com.apple.Accessibility': {
+        'EnhancedBackgroundContrastEnabled': True,     # Reduce Transparency
+        'ReduceMotionEnabled': True,
+    },
+}
+TIMEZONE = 'Asia/Ho_Chi_Minh'
+LOCALTIME = 'private/var/db/timezone/localtime'
+
+
+def zone_target(tz):
+    return '/var/db/timezone/zoneinfo/' + tz
 
 
 def say(msg):
@@ -310,12 +336,36 @@ def migration(root, platform_uuid):
 
 # ----------------------------------------------------------------------- main
 
+def ui(root):
+    for name, values in UI_PREFS.items():
+        merge_pref(root, name, values)
+
+
+def timezone(root, tz):
+    if not os.path.exists(os.path.join(root, 'usr/share/zoneinfo.default', tz)):
+        sys.exit(f'no zone {tz} in usr/share/zoneinfo.default')
+    link = os.path.join(root, LOCALTIME)
+    want = zone_target(tz)
+    if os.path.islink(link) and os.readlink(link) == want:
+        say(f'unchanged {LOCALTIME} -> {want}')
+        return
+    say(f'{LOCALTIME} -> {want}')
+    if not DRY:
+        tmp = link + '.husky-tmp'
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        os.symlink(want, tmp)
+        os.lchown(tmp, 0, 0)
+        os.replace(tmp, link)
+
+
 def main():
     global DRY
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('root', metavar='MOUNTED_ROOT')
     ap.add_argument('--dry-run', action='store_true', help='print every change, write nothing')
     ap.add_argument('--platform-uuid', help='IOPlatformUUID: create ByHost migration plists for it')
+    ap.add_argument('--timezone', default=TIMEZONE, help=f'zoneinfo name (default {TIMEZONE})')
     args = ap.parse_args()
     root = args.root
     if not os.path.isdir(os.path.join(root, 'System/Library/xpc')):
@@ -334,6 +384,8 @@ def main():
     user_dirs(root)
     audio(root)
     migration(root, args.platform_uuid)
+    ui(root)
+    timezone(root, args.timezone)
     merge_pref(root, 'com.apple.springboard', {
         'BKNoWatchdogs': True,
         'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},
