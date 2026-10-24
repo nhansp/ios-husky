@@ -19,7 +19,8 @@ jobs:
           for sdk in macosx iphoneos driverkit; do
             p=$(xcrun --sdk $sdk --show-sdk-path 2>/dev/null) || continue
             echo "$sdk $p" >> out/sdks.txt
-            find "$p" \( -name 'IOHIDEvent*.h' -o -name 'IOHIDUsageTables.h' -o -name 'IOHIDKeys.h' \) 2>/dev/null | while read -r f; do
+            ls -la "$p/System/Library/Frameworks/Kernel.framework/Headers/IOKit/hid" "$p/System/DriverKit/System/Library/Frameworks/HIDDriverKit.framework/Headers" "$p/System/Library/Frameworks/HIDDriverKit.framework/Headers" 2>&1 | head -80 || true
+            find -L "$p" \( -name 'IOHIDEvent*.h' -o -name 'IOHIDUsageTables.h' -o -name 'IOHIDKeys.h' \) 2>/dev/null | while read -r f; do
               d="out/$sdk/$(dirname "${f#$p/}")"
               mkdir -p "$d" && cp "$f" "$d/"
             done
