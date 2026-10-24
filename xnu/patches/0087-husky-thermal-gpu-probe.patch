@@ -1,0 +1,385 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 597fbbf..0da9fbd 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/husky_spi.c			standard
+ bsd/dev/husky_gpio.c			standard
+ bsd/dev/husky_fts.c			standard
+ bsd/dev/husky_acpm.c			standard
++bsd/dev/husky_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/husky_acpm.c b/bsd/dev/husky_acpm.c
+index 4492a20..8003cfb 100644
+--- a/bsd/dev/husky_acpm.c
++++ b/bsd/dev/husky_acpm.c
+@@ -24,6 +24,9 @@
+  *   speedy channel << 12; cmd[1] bits 7:0 function (0 read, 2 update), 15:8
+  *   value, 23:16 mask; the reply has the value in cmd[1] bits 15:8 and the
+  *   status (0 = OK) in bits 31:24.
++ * - TMU (channel 9, acpm_tmu): byte 4 = request type (2 READ_TEMP), byte 6 =
++ *   zone (BIG 0, MID 1, LITTLE 2, G3D 3, ISP 4, TPU 5, AUR 6); the reply has
++ *   the return code in byte 5 and the temperature (degrees C) in byte 7.
+  * - DVFS (channel 0, cal_if acpm-ipc-channel): cmd[0] = domain index,
+  *   cmd[1] = rate in kHz (FREQ_REQ) or 0, cmd[2] = 0 FREQ_REQ / 1 FREQ_GET;
+  *   a FREQ_GET reply carries the rate in cmd[1] (cmd[3] when nonzero). Linux
+@@ -39,6 +42,8 @@
+ #include <sys/errno.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include "husky_acpm.h"
+@@ -86,6 +91,10 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define DVFS_FREQ_REQ           0u
+ #define DVFS_FREQ_GET           1u
+ 
++/* TMU: acpm_tmu acpm-ipc-channel 9 (zuma.dtsi), exynos_acpm_tmu.h */
++#define TMU_IPC_CHANNEL         9u
++#define TMU_IPC_READ_TEMP       0x02u
++
+ #define ACPM_TIMEOUT_US         100000u
+ 
+ /* One AP channel: send queue (APM rx_*) and receive queue (APM tx_*). */
+@@ -103,6 +112,7 @@ static vm_offset_t acpm_sram;
+ static bool acpm_mapped;
+ static struct acpm_ch ch_pmic = {.id = PMIC_IPC_CHANNEL};
+ static struct acpm_ch ch_dvfs = {.id = DVFS_IPC_CHANNEL};
++static struct acpm_ch ch_tmu = {.id = TMU_IPC_CHANNEL};
+ 
+ static LCK_GRP_DECLARE(husky_acpm_grp, "husky_acpm");
+ static LCK_MTX_DECLARE(husky_acpm_lock, &husky_acpm_grp);
+@@ -186,7 +196,7 @@ husky_acpm_init(void)
+ {
+ 	lck_mtx_lock(&husky_acpm_lock);
+ 	if (acpm_mapped) {
+-		int ret = (ch_pmic.ready || ch_dvfs.ready) ? 0 : ENODEV;
++		int ret = (ch_pmic.ready || ch_dvfs.ready || ch_tmu.ready) ? 0 : ENODEV;
+ 		lck_mtx_unlock(&husky_acpm_lock);
+ 		return ret;
+ 	}
+@@ -214,7 +224,8 @@ husky_acpm_init(void)
+ 
+ 	(void)acpm_ch_setup(&ch_pmic, channels, ap_max);
+ 	(void)acpm_ch_setup(&ch_dvfs, channels, ap_max);
+-	int ret = (ch_pmic.ready || ch_dvfs.ready) ? 0 : ENODEV;
++	(void)acpm_ch_setup(&ch_tmu, channels, ap_max);
++	int ret = (ch_pmic.ready || ch_dvfs.ready || ch_tmu.ready) ? 0 : ENODEV;
+ 	lck_mtx_unlock(&husky_acpm_lock);
+ 	return ret;
+ }
+@@ -372,6 +383,77 @@ husky_dvfs_set(uint32_t domain, uint32_t khz)
+ 	return acpm_send(&ch_dvfs, cmd, NULL);
+ }
+ 
++int
++husky_tmu_read(uint32_t zone, int *celsius)
++{
++	uint32_t cmd[4] = {0, TMU_IPC_READ_TEMP | ((zone & 0xffu) << 16), 0, 0};
++	uint32_t reply[4] = {0, 0, 0, 0};
++	int err = acpm_send(&ch_tmu, cmd, reply);
++	if (err) {
++		return err;
++	}
++	int8_t ret = (int8_t)((reply[1] >> 8) & 0xffu);
++	if (ret) {
++		return EIO;
++	}
++	*celsius = (int)((reply[1] >> 24) & 0xffu);
++	return 0;
++}
++
++/*
++ * Thermal watch: nothing else manages temperature here. Every 10 s read the
++ * CPU and GPU zones, log them every 30 s, and when a CPU zone reaches
++ * huskytemphot (default 85 C) step the A715 and X3 clusters down to
++ * HUSKY_THROTTLE_KHZ; back to the requested rates 10 C below.
++ */
++#define HUSKY_THROTTLE_KHZ      1500000u
++
++static uint32_t dvfs_req_cl1, dvfs_req_cl2;
++
++static void
++husky_thermal_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static const char *names[] = {"BIG", "MID", "LITTLE", "G3D"};
++	uint32_t hot = 85;
++	bool throttled = false;
++	int chan;
++
++	(void)PE_parse_boot_argn("huskytemphot", &hot, sizeof(hot));
++	for (unsigned tick = 0;; tick++) {
++		int t[4] = {0, 0, 0, 0};
++		int cpu_max = 0;
++		for (unsigned z = 0; z < 4; z++) {
++			if (husky_tmu_read(z, &t[z])) {
++				t[z] = -1;
++			}
++			if (z < 3 && t[z] > cpu_max) {
++				cpu_max = t[z];
++			}
++		}
++		if (tick % 3 == 0) {
++			HU_LOG("HUSKY TEMP: %s %d %s %d %s %d %s %d C%s\n", names[0], t[0], names[1], t[1],
++			    names[2], t[2], names[3], t[3], throttled ? " (throttled)" : "");
++		}
++		if (!throttled && cpu_max >= (int)hot) {
++			throttled = true;
++			(void)husky_dvfs_set(HUSKY_DVFS_CPUCL1, HUSKY_THROTTLE_KHZ);
++			(void)husky_dvfs_set(HUSKY_DVFS_CPUCL2, HUSKY_THROTTLE_KHZ);
++			HU_LOG("HUSKY TEMP: %d C >= %u: A715/X3 to %u kHz\n", cpu_max, hot, HUSKY_THROTTLE_KHZ);
++		} else if (throttled && cpu_max < (int)hot - 10) {
++			throttled = false;
++			if (dvfs_req_cl1) {
++				(void)husky_dvfs_set(HUSKY_DVFS_CPUCL1, dvfs_req_cl1);
++			}
++			if (dvfs_req_cl2) {
++				(void)husky_dvfs_set(HUSKY_DVFS_CPUCL2, dvfs_req_cl2);
++			}
++			HU_LOG("HUSKY TEMP: %d C: A715/X3 back to the requested rates\n", cpu_max);
++		}
++		(void)assert_wait_timeout((event_t)&chan, THREAD_UNINT, 10, NSEC_PER_SEC);
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
+ static const struct {
+ 	uint32_t domain;
+ 	const char *name;
+@@ -415,6 +497,11 @@ husky_dvfs_report(void)
+ 			continue;
+ 		}
+ 		int err = husky_dvfs_set(dvfs_domains[i].domain, khz);
++		if (dvfs_domains[i].domain == HUSKY_DVFS_CPUCL1) {
++			dvfs_req_cl1 = khz;
++		} else if (dvfs_domains[i].domain == HUSKY_DVFS_CPUCL2) {
++			dvfs_req_cl2 = khz;
++		}
+ 		HU_LOG("HUSKY DVFS: request %s %u kHz (err %d)\n", dvfs_domains[i].name, khz, err);
+ 		changed = true;
+ 	}
+@@ -422,6 +509,13 @@ husky_dvfs_report(void)
+ 		delay(50000);
+ 		dvfs_log("after request");
+ 	}
++
++	if (ch_tmu.ready) {
++		thread_t thread;
++		if (kernel_thread_start(husky_thermal_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	}
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/bsd/dev/husky_acpm.h b/bsd/dev/husky_acpm.h
+index 9f68178..0246001 100644
+--- a/bsd/dev/husky_acpm.h
++++ b/bsd/dev/husky_acpm.h
+@@ -45,6 +45,13 @@ int husky_dvfs_set(uint32_t domain, uint32_t khz);
+  */
+ void husky_dvfs_report(void);
+ 
++/* ACPM TMU zones and a temperature read in degrees C. */
++#define HUSKY_TMU_BIG           0u
++#define HUSKY_TMU_MID           1u
++#define HUSKY_TMU_LITTLE        2u
++#define HUSKY_TMU_G3D           3u
++int husky_tmu_read(uint32_t zone, int *celsius);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/husky_fts.c b/bsd/dev/husky_fts.c
+index 39ddebf..b275ed5 100644
+--- a/bsd/dev/husky_fts.c
++++ b/bsd/dev/husky_fts.c
+@@ -46,6 +46,7 @@ extern kern_return_t thread_terminate(thread_t);
+ extern void husky_hid_touch(int id, int x, int y, int touching);
+ extern void husky_hid_touch_release_all(void);
+ extern int husky_hid_touch_ready(void);
++extern void husky_gpu_probe(void);
+ 
+ #define HU_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
+ 
+@@ -248,6 +249,7 @@ husky_fts_thread(__unused void *arg, __unused wait_result_t wr)
+ 
+ 	/* CPU/memory clocks as ABL left them (and opt-in requests), every boot. */
+ 	husky_dvfs_report();
++	husky_gpu_probe();
+ 
+ 	if (enabled == 0) {
+ 		HU_LOG("HUSKY TOUCH: idle (opt-in via boot-arg huskytouch=1 or huskytouch=2)\n");
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+new file mode 100644
+index 0000000..a1194cd
+--- /dev/null
++++ b/bsd/dev/husky_gpu.c
+@@ -0,0 +1,164 @@
++/*
++ * HUSKY: Mali-G715 (Valhall CSF, arch 11.8, 7 cores; Android gpuinfo
++ * "Mali-G715 7 cores r1p2 0x0B080A02") bring-up probe, Google Tensor G3.
++ *
++ * Boot-arg huskygpu:
++ *   1  read-only: the G3D power domains' state; GPU_ID and friends only if
++ *      the top domain is already on.
++ *   2  also power the top domain on (if off) and then read the registers.
++ *
++ * Facts (zuma-gpu.dtsi, zuma-pm-domains.dtsi, cal-if zuma
++ * flexpmu_cal_local_zuma.h, exynos-pd_el3.c, Arm Mali CSF register map as in
++ * Linux panthor_regs.h):
++ * - GPU registers at 0x1F000000 (0x480000). Two power domains: "top" pd_g3d
++ *   (PMU 0x15461A80 CONFIGURATION / +4 STATUS, bit 0; need_smc 0x1EE10204)
++ *   and "cores" pd_embedded_g3d (0x15461C80, child of top). CMU_G3D is at
++ *   0x1EE00000, inside the top domain: never touched while it is off.
++ * - top power-on = CONFIGURATION bit 0, wait STATUS bit 0, then the EL3 call
++ *   SMC_CMD_PREPARE_PD_ONOFF (0x82000410, EXYNOS_WAKEUP_PD_DOWN 1, need_smc
++ *   address, RUNTIME_PM_TZPC_GROUP 2) that restores the block's TZPC setup.
++ *   After power-on CMU_G3D is at reset values (core-clock muxes on OSCCLK);
++ *   the cores domain also needs the G3D PLLs and is left alone here.
++ * - GPU_CONTROL: GPU_ID 0x00, L2_FEATURES 0x04, CORE_FEATURES 0x08,
++ *   TILER_FEATURES 0x0C, MEM_FEATURES 0x10, MMU_FEATURES 0x14, AS_PRESENT
++ *   0x18, CSF_ID 0x1C, SHADER_PRESENT 0x100/0x104, TILER_PRESENT 0x110,
++ *   L2_PRESENT 0x120, GPU_STATUS 0x34.
++ *
++ * Every step is logged (kprintf too) before it runs, so an SError leaves a
++ * trail in pmsg.
++ */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define HU_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
++
++#define PMU_PA                  0x15460000ULL
++#define PMU_SIZE                0x4000ULL
++#define PMU_G3D_CONFIG          0x1a80u
++#define PMU_G3D_STATUS          0x1a84u
++#define PMU_EMB_G3D_CONFIG      0x1c80u
++#define PMU_EMB_G3D_STATUS      0x1c84u
++#define PMU_PWR_ON              0x1u
++
++#define G3D_NEED_SMC            0x1EE10204u
++#define SMC_CMD_PREPARE_PD_ONOFF 0x82000410u
++#define EXYNOS_WAKEUP_PD_DOWN   1u
++#define RUNTIME_PM_TZPC_GROUP   2u
++
++#define GPU_PA                  0x1F000000ULL
++#define GPU_SIZE                0x1000ULL
++
++static inline uint32_t
++rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++wr32(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static int64_t
++husky_smc4(uint64_t fid, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = fid;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++	    "x16", "x17", "memory");
++	return (int64_t)x0;
++}
++
++static void
++husky_gpu_dump(void)
++{
++	static const struct {
++		uint32_t off;
++		const char *name;
++	} regs[] = {
++		{0x000, "GPU_ID"}, {0x004, "L2_FEATURES"}, {0x008, "CORE_FEATURES"},
++		{0x00c, "TILER_FEATURES"}, {0x010, "MEM_FEATURES"}, {0x014, "MMU_FEATURES"},
++		{0x018, "AS_PRESENT"}, {0x01c, "CSF_ID"}, {0x034, "GPU_STATUS"},
++		{0x100, "SHADER_PRESENT_LO"}, {0x104, "SHADER_PRESENT_HI"},
++		{0x110, "TILER_PRESENT_LO"}, {0x120, "L2_PRESENT_LO"},
++	};
++	HU_LOG("HUSKY GPU: mapping registers at 0x%llx\n", GPU_PA);
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!gpu) {
++		HU_LOG("HUSKY GPU: map failed\n");
++		return;
++	}
++	HU_LOG("HUSKY GPU: reading GPU_ID\n");
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		HU_LOG("HUSKY GPU: %s = 0x%08x\n", regs[i].name, rd32(gpu, regs[i].off));
++	}
++	uint32_t id = rd32(gpu, 0x000);
++	HU_LOG("HUSKY GPU: arch %u.%u rev r%up%u product 0x%x\n", (id >> 28) & 0xf, (id >> 24) & 0xf,
++	    (id >> 12) & 0xf, (id >> 4) & 0xf, (id >> 16) & 0xff);
++}
++
++void
++husky_gpu_probe(void)
++{
++	uint32_t mode = 0;
++
++	if (!PE_parse_boot_argn("huskygpu", &mode, sizeof(mode)) || mode == 0) {
++		return;
++	}
++	HU_LOG("HUSKY GPU: probe mode %u\n", mode);
++	vm_offset_t pmu = ml_io_map(PMU_PA, PMU_SIZE);
++	if (!pmu) {
++		HU_LOG("HUSKY GPU: PMU map failed\n");
++		return;
++	}
++	uint32_t top_cfg = rd32(pmu, PMU_G3D_CONFIG), top_st = rd32(pmu, PMU_G3D_STATUS);
++	uint32_t emb_cfg = rd32(pmu, PMU_EMB_G3D_CONFIG), emb_st = rd32(pmu, PMU_EMB_G3D_STATUS);
++	HU_LOG("HUSKY GPU: pd_g3d CFG 0x%x STATUS 0x%x, pd_embedded_g3d CFG 0x%x STATUS 0x%x\n",
++	    top_cfg, top_st, emb_cfg, emb_st);
++
++	if (!(top_st & PMU_PWR_ON)) {
++		if (mode < 2) {
++			HU_LOG("HUSKY GPU: top domain off; huskygpu=2 powers it on\n");
++			return;
++		}
++		HU_LOG("HUSKY GPU: powering on pd_g3d\n");
++		wr32(pmu, PMU_G3D_CONFIG, rd32(pmu, PMU_G3D_CONFIG) | PMU_PWR_ON);
++		unsigned us;
++		for (us = 0; us < 10000 && !(rd32(pmu, PMU_G3D_STATUS) & PMU_PWR_ON); us += 10) {
++			delay(10);
++		}
++		top_st = rd32(pmu, PMU_G3D_STATUS);
++		HU_LOG("HUSKY GPU: pd_g3d STATUS 0x%x after %u us\n", top_st, us);
++		if (!(top_st & PMU_PWR_ON)) {
++			HU_LOG("HUSKY GPU: pd_g3d did not come up; stopping\n");
++			return;
++		}
++		HU_LOG("HUSKY GPU: TZPC restore SMC (0x%x)\n", G3D_NEED_SMC);
++		int64_t rc = husky_smc4(SMC_CMD_PREPARE_PD_ONOFF, EXYNOS_WAKEUP_PD_DOWN, G3D_NEED_SMC,
++		    RUNTIME_PM_TZPC_GROUP);
++		HU_LOG("HUSKY GPU: TZPC restore rc %lld\n", (long long)rc);
++		if (rc != 0) {
++			HU_LOG("HUSKY GPU: TZPC restore failed; not touching the block\n");
++			return;
++		}
++	}
++	husky_gpu_dump();
++}
++
++#endif /* ARM64_BOARD_CONFIG_HUSKY */
