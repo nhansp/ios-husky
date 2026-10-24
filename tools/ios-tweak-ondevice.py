@@ -121,7 +121,13 @@ def mount_rw(ro=False):
 
 
 def unmount():
-    su(f'sync; umount {MNT} 2>/dev/null; dmctl delete iosrw 2>/dev/null; true')
+    """Unmount and drop the mapping; retried (a umount right after writes can
+    report busy) and verified, never left mounted for the next xnu boot."""
+    out = su(f'sync; for i in 1 2 3 4 5 6 7 8 9 10; do grep -q " {MNT} " /proc/mounts || break; '
+             f'umount {MNT} 2>/dev/null || sleep 1; done; grep " {MNT} " /proc/mounts; '
+             f'dmctl delete iosrw >/dev/null 2>&1; true')
+    if MNT in out:
+        sys.exit(f'STILL MOUNTED, unmount {MNT} by hand before booting xnu: {out.strip()}')
     print('unmounted')
 
 
@@ -174,13 +180,24 @@ def main():
     ap.add_argument('--timezone', default=tweaks.TIMEZONE)
     args = ap.parse_args()
     check_clean()
-    mount_rw(ro=args.dry_run)
+    # New files on the unlabeled hfsplus mount fail SELinux "associate", even
+    # for KernelSU root: permissive only while writing, Enforcing restored.
+    enforcing = not args.dry_run and su('getenforce').strip() == 'Enforcing'
+    if enforcing:
+        su('setenforce 0')
+        print('SELinux permissive while writing')
     try:
-        for name, values in tweaks.UI_PREFS.items():
-            merge_pref(name, values, args.dry_run)
-        set_timezone(args.timezone, args.dry_run)
+        mount_rw(ro=args.dry_run)
+        try:
+            for name, values in tweaks.UI_PREFS.items():
+                merge_pref(name, values, args.dry_run)
+            set_timezone(args.timezone, args.dry_run)
+        finally:
+            unmount()
     finally:
-        unmount()
+        if enforcing:
+            su('setenforce 1')
+            print(f'SELinux {su("getenforce").strip()}')
 
 
 if __name__ == '__main__':
