@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 0236ead..2b546d1 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -53,6 +53,13 @@
+  *   VIDs; "otherwise all traffic would be allowed through"). There is no
+  *   hypervisor here, so protection is cleared for every VID. Boot 0091 first
+  *   faulted on the MCU's first page-table walk with a bus error.
++ * - G3D bus security: Pixel's kbase enables "protected" mode for the G3D
++ *   master after every power-on and disables it before power-off
++ *   (exynos_smc(SMC_PROTECTION_SET 0x82002010, 0, PROT_G3D 12, 1/0),
++ *   pixel_gpu_power.c); ABL leaves pd_g3d on, possibly in that state from
++ *   the Android session before the reboot, and boots 0091/0092 got a bus
++ *   error on the MCU's first page-table read. Protection is set to disabled
++ *   and the domain's TZPC restore (power-on SMC) is repeated before reset.
+  * Firmware and page-table pages are written through the cacheable mapping and
+  * cleaned to DRAM (non-coherent walks); the shared section is accessed only
+  * through a non-cacheable alias.
+@@ -567,6 +574,13 @@ husky_gpu_mcu_boot(void)
+ 		HU_LOG("HUSKY GPU: register map failed\n");
+ 		return;
+ 	}
++	{
++		int64_t rc_prot = husky_smc4(0x82002010u, 0, 12, 0);     /* PROT_G3D off */
++		int64_t rc_tzpc = husky_smc4(SMC_CMD_PREPARE_PD_ONOFF, EXYNOS_WAKEUP_PD_DOWN, G3D_NEED_SMC,
++		    RUNTIME_PM_TZPC_GROUP);
++		HU_LOG("HUSKY GPU: SMC protection-disable rc %lld, TZPC restore rc %lld\n",
++		    (long long)rc_prot, (long long)rc_tzpc);
++	}
+ 	if (!s2mpu_g3d_open()) {
+ 		return;
+ 	}
