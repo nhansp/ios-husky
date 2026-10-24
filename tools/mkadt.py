@@ -100,7 +100,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
+def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE, gamut='sRGB'):
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -251,6 +251,14 @@ def build(seed=None, highmem=False, boot_mpidr=BOOT_MPIDR, timebase=TIMEBASE):
     ] + ([('dma-region', u64(*UFS_DMA_REGION))] if highmem else []))
 
     product_props = d431ap_product()
+    # artwork-display-gamut: D431AP says P3, and on P3 SpringBoard renders
+    # full-screen 10-bit 'w30r' surfaces and backboardd asks for AGX-compressed
+    # '&w3r' ones for EDR layers, which the CPU renderer cannot use (xnu 0089
+    # refuses them). Without a GPU present the panel as sRGB (8-bit BGRA);
+    # --gamut P3 keeps Apple's value.
+    if product_props:
+        product_props = [(k, cstr(gamut) if k == 'artwork-display-gamut' else v)
+                         for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Identity of the iPhone 11 Pro Max whose userland runs here: compatible[0]
@@ -276,10 +284,11 @@ if __name__ == '__main__':
         bm = int(args[args.index('--boot-mpidr') + 1], 0)
     if '--timebase' in args:
         tb = int(args[args.index('--timebase') + 1], 0)
-    root = build(highmem='--highmem' in args, boot_mpidr=bm, timebase=tb)
+    gamut = args[args.index('--gamut') + 1] if '--gamut' in args else 'sRGB'
+    root = build(highmem='--highmem' in args, boot_mpidr=bm, timebase=tb, gamut=gamut)
     blob = adt.serialize(root)
     out = args[0]
     open(out, 'wb').write(blob)
     if '--dump' in args:
         adt.dump(adt.parse(blob)[0])
-    print(f'{out}: {len(blob)} bytes  (boot_mpidr={hex(bm)} timebase={tb})', file=sys.stderr)
+    print(f'{out}: {len(blob)} bytes  (boot_mpidr={hex(bm)} timebase={tb} gamut={gamut})', file=sys.stderr)
