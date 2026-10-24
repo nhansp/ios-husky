@@ -1,0 +1,227 @@
+diff --git a/bsd/dev/husky_ufs.c b/bsd/dev/husky_ufs.c
+index add0793..07ed3cf 100644
+--- a/bsd/dev/husky_ufs.c
++++ b/bsd/dev/husky_ufs.c
+@@ -40,6 +40,7 @@
+ #include <sys/errno.h>
+ #include <sys/proc.h>
+ #include <sys/uio.h>
++#include <sys/reboot.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+@@ -63,6 +64,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void husky_log_start(void);
++static void husky_reboot_start(void);
+ extern void husky_sample_start(void);
+ extern void husky_fts_init(void);
+ 
+@@ -687,6 +689,7 @@ husky_ufs_init(void)
+ 		HU_LOG("HUSKY UFS: DMA through the fixed low dma-region\n");
+ 	}
+ 	husky_log_start();
++	husky_reboot_start();
+ 	husky_sample_start();
+ 	husky_fts_init();
+ 	return 0;
+@@ -735,56 +738,113 @@ struct husky_log_header {
+ 	uint64_t total, seq;
+ };
+ 
+-static void
+-husky_log_thread(__unused void *arg, __unused wait_result_t wr)
++static uint64_t husky_log_flushed, husky_log_seq;
++static bool husky_log_running;
++
++/* Copy new ring bytes and the header to the partition tail; 0 or an errno. */
++static int
++husky_log_flush(void)
+ {
+ 	uint64_t base = hu.log_block;
+-	uint64_t flushed = 0, seq = 0;
+ 	void *bounce = (void *)(hu.dma + DMA_BOUNCE);
++	int error = 0;
+ 
++	lck_mtx_lock(&husky_ufs_lock);
++	uint64_t total = os_atomic_load(&husky_log_total, relaxed);
++	uint64_t flushed = husky_log_flushed;
++	if (total == flushed) {
++		lck_mtx_unlock(&husky_ufs_lock);
++		return 0;
++	}
++	uint64_t pos = total - flushed >= HUSKY_LOG_SIZE ? total - HUSKY_LOG_SIZE : flushed;
++	while (pos < total && !error) {
++		uint32_t off = (uint32_t)(pos % HUSKY_LOG_SIZE);
++		uint32_t blk = off / UFS_BLOCK;
++		uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(HUSKY_LOG_SIZE / UFS_BLOCK - blk)),
++		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		memcpy(bounce, husky_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++		error = ufs_write_blocks(base + 1 + blk, n, true);
++		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++	}
++	if (!error) {
++		struct husky_log_header h = {
++			.magic = { 'H', 'U', 'S', 'K', 'Y', 'L', 'O', 'G' },
++			.version = 1, .size = HUSKY_LOG_SIZE, .total = total, .seq = ++husky_log_seq,
++		};
++		bzero(bounce, UFS_BLOCK);
++		memcpy(bounce, &h, sizeof(h));
++		error = ufs_write_blocks(base, 1, true);
++	}
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	if (!error) {
++		husky_log_flushed = total;
++	}
++	lck_mtx_unlock(&husky_ufs_lock);
++	return error;
++}
++
++static void
++husky_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
+ 	HU_LOG("HUSKY LOG: console log to the partition tail (block 0x%llx, %u KiB) every %us\n",
+-	    base, HUSKY_LOG_BLOCKS * UFS_BLOCK >> 10, husky_log_secs);
++	    hu.log_block, HUSKY_LOG_BLOCKS * UFS_BLOCK >> 10, husky_log_secs);
+ 	/* First flush right away (boot output so far), then every husky_log_secs. */
+ 	for (bool first = true;; first = false) {
+ 		if (!first) {
+ 			(void)tsleep(&husky_log_chan, PZERO, "huskylog", hz * (int)husky_log_secs);
+ 		}
+-		uint64_t total = os_atomic_load(&husky_log_total, relaxed);
+-		if (total == flushed) {
+-			continue;
+-		}
+-		uint64_t pos = total - flushed >= HUSKY_LOG_SIZE ? total - HUSKY_LOG_SIZE : flushed;
+-		int error = 0;
+-
+-		lck_mtx_lock(&husky_ufs_lock);
+-		while (pos < total && !error) {
+-			uint32_t off = (uint32_t)(pos % HUSKY_LOG_SIZE);
+-			uint32_t blk = off / UFS_BLOCK;
+-			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
+-			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(HUSKY_LOG_SIZE / UFS_BLOCK - blk)),
+-			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+-			memcpy(bounce, husky_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-			error = ufs_write_blocks(base + 1 + blk, n, true);
+-			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+-		}
+-		if (!error) {
+-			struct husky_log_header h = {
+-				.magic = { 'H', 'U', 'S', 'K', 'Y', 'L', 'O', 'G' },
+-				.version = 1, .size = HUSKY_LOG_SIZE, .total = total, .seq = ++seq,
+-			};
+-			bzero(bounce, UFS_BLOCK);
+-			memcpy(bounce, &h, sizeof(h));
+-			error = ufs_write_blocks(base, 1, true);
+-		}
+-		if (!error) {
+-			error = ufs_sync_cache();
+-		}
+-		lck_mtx_unlock(&husky_ufs_lock);
++		int error = husky_log_flush();
+ 		if (error) {
++			husky_log_running = false;
+ 			HU_LOG("HUSKY LOG: write failed (%d), stopping\n", error);
+ 			return;
+ 		}
+-		flushed = total;
++	}
++}
++
++/* Last flush before a clean restart (HuskyPlatformExpert's restart hook). */
++void husky_log_final_flush(void);
++
++void
++husky_log_final_flush(void)
++{
++	if (husky_log_running) {
++		(void)husky_log_flush();
++	}
++}
++
++/*
++ * Boot-arg huskyreboot=N: after N seconds, a clean reboot through XNU's own
++ * path (processes exit, disks sync, every volume including the root is
++ * unmounted, so the HFS+ journal is empty), then HuskyPlatformExpert resets
++ * the SoC with PSCI SYSTEM_RESET and ABL starts Android. No force-reboot.
++ */
++static void
++husky_reboot_thread(void *arg, __unused wait_result_t wr)
++{
++	uint32_t secs = (uint32_t)(uintptr_t)arg;
++
++	(void)tsleep(&husky_log_chan, PZERO, "huskyreboot", hz * (int)secs);
++	HU_LOG("HUSKY REBOOT: clean reboot after %u s (huskyreboot)\n", secs);
++	(void)reboot_kernel(RB_AUTOBOOT, NULL);
++	HU_LOG("HUSKY REBOOT: reboot_kernel returned\n");
++}
++
++static void
++husky_reboot_start(void)
++{
++	uint32_t secs = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("huskyreboot", &secs, sizeof(secs)) || secs == 0) {
++		return;
++	}
++	HU_LOG("HUSKY REBOOT: clean reboot scheduled in %u s\n", secs);
++	if (kernel_thread_start(husky_reboot_thread, (void *)(uintptr_t)secs, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
+ 	}
+ }
+ 
+@@ -803,6 +863,7 @@ husky_log_start(void)
+ 		husky_log_secs = HUSKY_LOG_SECS;
+ 	}
+ 	if (kernel_thread_start(husky_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		husky_log_running = true;
+ 		thread_deallocate(thread);
+ 	}
+ }
+diff --git a/iokit/Kernel/arm/HuskyPlatformExpert.cpp b/iokit/Kernel/arm/HuskyPlatformExpert.cpp
+index acf74b8..96ae7ba 100644
+--- a/iokit/Kernel/arm/HuskyPlatformExpert.cpp
++++ b/iokit/Kernel/arm/HuskyPlatformExpert.cpp
+@@ -46,6 +46,28 @@ husky_uptime_secs(uint64_t since)
+ 	return (long)(ns / NSEC_PER_SEC);
+ }
+ 
++/*
++ * Restart and halt (XNU's reboot path, after processes exit and the volumes
++ * are unmounted): last console-log flush, then PSCI SYSTEM_RESET to BL31 and
++ * ABL boots Android. Panic restarts are left alone: the watchdog resets the
++ * phone and pmsg survives, as before.
++ */
++extern "C" void husky_log_final_flush(void);
++
++static int
++husky_halt_restart(unsigned int type)
++{
++	if (type != kPERestartCPU && type != kPEHaltCPU) {
++		return -1;
++	}
++	kprintf("HUSKY: PSCI SYSTEM_RESET (halt/restart type %u)\n", type);
++	husky_log_final_flush();
++	register uint64_t x0 __asm__("x0") = 0x84000009ULL;   /* SYSTEM_RESET */
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	kprintf("HUSKY: PSCI SYSTEM_RESET returned %lld\n", (long long)x0);
++	return -1;
++}
++
+ OSDefineMetaClassAndStructors(HuskyPlatformExpert, IODTPlatformExpert);
+ 
+ bool
+@@ -57,6 +79,7 @@ HuskyPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("HUSKY: platform expert registered\n");
++	PE_halt_restart = husky_halt_restart;
+ 
+ 	unsigned long long t = 0;
+ 	(void)PE_parse_boot_argn("huskytime", &t, sizeof(t));
