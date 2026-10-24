@@ -12,10 +12,10 @@ index 93a5e4e..597fbbf 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/husky_acpm.c b/bsd/dev/husky_acpm.c
 new file mode 100644
-index 0000000..0adddbd
+index 0000000..a2d4636
 --- /dev/null
 +++ b/bsd/dev/husky_acpm.c
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,319 @@
 +/*
 + * HUSKY: polled ACPM IPC client for Google Tensor G3 ("zuma", Pixel 8 Pro).
 + *
@@ -50,6 +50,7 @@ index 0000000..0adddbd
 +#include <sys/systm.h>
 +#include <sys/errno.h>
 +#include <kern/locks.h>
++#include <kern/clock.h>
 +#include <machine/machine_routines.h>
 +#include "husky_acpm.h"
 +
