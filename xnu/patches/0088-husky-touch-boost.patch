@@ -1,0 +1,194 @@
+diff --git a/bsd/dev/husky_acpm.c b/bsd/dev/husky_acpm.c
+index 8003cfb..c731eea 100644
+--- a/bsd/dev/husky_acpm.c
++++ b/bsd/dev/husky_acpm.c
+@@ -45,6 +45,7 @@
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
++#include <machine/atomic.h>
+ #include <pexpert/pexpert.h>
+ #include "husky_acpm.h"
+ 
+@@ -409,6 +410,8 @@ husky_tmu_read(uint32_t zone, int *celsius)
+ #define HUSKY_THROTTLE_KHZ      1500000u
+ 
+ static uint32_t dvfs_req_cl1, dvfs_req_cl2;
++static bool boost_enabled;              /* touch boost below */
++static bool boost_thermal_cap;          /* set by the thermal guard */
+ 
+ static void
+ husky_thermal_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -436,15 +439,17 @@ husky_thermal_thread(__unused void *arg, __unused wait_result_t wr)
+ 		}
+ 		if (!throttled && cpu_max >= (int)hot) {
+ 			throttled = true;
++			boost_thermal_cap = true;
+ 			(void)husky_dvfs_set(HUSKY_DVFS_CPUCL1, HUSKY_THROTTLE_KHZ);
+ 			(void)husky_dvfs_set(HUSKY_DVFS_CPUCL2, HUSKY_THROTTLE_KHZ);
+ 			HU_LOG("HUSKY TEMP: %d C >= %u: A715/X3 to %u kHz\n", cpu_max, hot, HUSKY_THROTTLE_KHZ);
+ 		} else if (throttled && cpu_max < (int)hot - 10) {
+ 			throttled = false;
+-			if (dvfs_req_cl1) {
++			boost_thermal_cap = false;
++			if (!boost_enabled && dvfs_req_cl1) {
+ 				(void)husky_dvfs_set(HUSKY_DVFS_CPUCL1, dvfs_req_cl1);
+ 			}
+-			if (dvfs_req_cl2) {
++			if (!boost_enabled && dvfs_req_cl2) {
+ 				(void)husky_dvfs_set(HUSKY_DVFS_CPUCL2, dvfs_req_cl2);
+ 			}
+ 			HU_LOG("HUSKY TEMP: %d C: A715/X3 back to the requested rates\n", cpu_max);
+@@ -454,6 +459,108 @@ husky_thermal_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * Touch boost (boot-arg huskyboost=1), after Pixel's power HAL: no load-based
++ * governor here, so idle at a modest base and jump to launch-like levels on
++ * touch, back to base HUSKY_BOOST_MS after the last touch event. Levels are
++ * OPPs from the phone's /vendor/etc/powerhint.json (cpufreq/devfreq tables;
++ * LAUNCH raises every cluster and MIF to max and DSU to >= 1.8 GHz). The
++ * boot-arg rates (huskycl0.., huskymif) become the boost levels when given.
++ * The thermal guard caps A715/X3 independently.
++ */
++#define HUSKY_BOOST_MS          1500u
++
++static const struct {
++	uint32_t domain;
++	uint32_t base_khz;
++	uint32_t boost_khz;
++} boost_levels[] = {
++	{HUSKY_DVFS_CPUCL0, 1197000, 1704000},
++	{HUSKY_DVFS_CPUCL1, 1328000, 2130000},
++	{HUSKY_DVFS_CPUCL2, 1557000, 2363000},
++	{HUSKY_DVFS_DSU, 1197000, 1800000},
++	{HUSKY_DVFS_MIF, 1014000, 3172000},
++};
++
++static uint64_t _Atomic boost_until;     /* mach_absolute_time deadline */
++static int boost_chan;
++
++static uint32_t
++boost_rate(unsigned i, bool boost)
++{
++	uint32_t khz = boost ? boost_levels[i].boost_khz : boost_levels[i].base_khz;
++	if (boost) {
++		uint32_t req = 0;
++		if (boost_levels[i].domain == HUSKY_DVFS_CPUCL1 && dvfs_req_cl1) {
++			req = dvfs_req_cl1;
++		} else if (boost_levels[i].domain == HUSKY_DVFS_CPUCL2 && dvfs_req_cl2) {
++			req = dvfs_req_cl2;
++		}
++		khz = req ? req : khz;
++	}
++	if (boost_thermal_cap && (boost_levels[i].domain == HUSKY_DVFS_CPUCL1 ||
++	    boost_levels[i].domain == HUSKY_DVFS_CPUCL2) && khz > HUSKY_THROTTLE_KHZ) {
++		khz = HUSKY_THROTTLE_KHZ;
++	}
++	return khz;
++}
++
++static void
++boost_apply(bool boost)
++{
++	for (unsigned i = 0; i < sizeof(boost_levels) / sizeof(boost_levels[0]); i++) {
++		(void)husky_dvfs_set(boost_levels[i].domain, boost_rate(i, boost));
++	}
++}
++
++static void
++husky_boost_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	bool boosted = false;
++	unsigned boosts = 0;
++
++	boost_apply(false);
++	HU_LOG("HUSKY BOOST: touch boost on (base A510/A715/X3 %u/%u/%u kHz, MIF %u)\n",
++	    boost_levels[0].base_khz, boost_levels[1].base_khz, boost_levels[2].base_khz,
++	    boost_levels[4].base_khz);
++	for (;;) {
++		uint64_t until = os_atomic_load(&boost_until, relaxed);
++		uint64_t now = mach_absolute_time();
++		if (until > now) {
++			if (!boosted) {
++				boosted = true;
++				boost_apply(true);
++				if ((boosts++ % 50) == 0) {
++					HU_LOG("HUSKY BOOST: boost #%u\n", boosts);
++				}
++			}
++			(void)assert_wait_deadline((event_t)&boost_chan, THREAD_UNINT, until);
++		} else {
++			if (boosted) {
++				boosted = false;
++				boost_apply(false);
++			}
++			(void)assert_wait((event_t)&boost_chan, THREAD_UNINT);
++		}
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++void
++husky_boost_kick(void)
++{
++	if (!boost_enabled) {
++		return;
++	}
++	uint64_t interval;
++	nanoseconds_to_absolutetime((uint64_t)HUSKY_BOOST_MS * NSEC_PER_MSEC, &interval);
++	uint64_t until = mach_absolute_time() + interval;
++	uint64_t old = os_atomic_xchg(&boost_until, until, relaxed);
++	if (old < mach_absolute_time()) {
++		thread_wakeup((event_t)&boost_chan);
++	}
++}
++
+ static const struct {
+ 	uint32_t domain;
+ 	const char *name;
+@@ -516,6 +623,17 @@ husky_dvfs_report(void)
+ 			thread_deallocate(thread);
+ 		}
+ 	}
++
++	uint32_t boost = 0;
++	if (PE_parse_boot_argn("huskyboost", &boost, sizeof(boost)) && boost) {
++		thread_t thread;
++		boost_enabled = true;
++		if (kernel_thread_start(husky_boost_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			boost_enabled = false;
++		}
++	}
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/bsd/dev/husky_acpm.h b/bsd/dev/husky_acpm.h
+index 0246001..62039b5 100644
+--- a/bsd/dev/husky_acpm.h
++++ b/bsd/dev/husky_acpm.h
+@@ -52,6 +52,9 @@ void husky_dvfs_report(void);
+ #define HUSKY_TMU_G3D           3u
+ int husky_tmu_read(uint32_t zone, int *celsius);
+ 
++/* Touch boost (huskyboost=1): call on every touch event; never blocks. */
++void husky_boost_kick(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/husky_fts.c b/bsd/dev/husky_fts.c
+index b275ed5..acab702 100644
+--- a/bsd/dev/husky_fts.c
++++ b/bsd/dev/husky_fts.c
+@@ -309,6 +309,7 @@ husky_fts_thread(__unused void *arg, __unused wait_result_t wr)
+ 				break;
+ 			}
+ 
++			husky_boost_kick();
+ 			int touch_id = (ev[1] >> 4) & 0x0f;
+ 			if (ev[0] == FTM5_EVT_ENTER_POINT || ev[0] == FTM5_EVT_MOTION_POINT) {
+ 				int x = ((ev[3] & 0x0f) << 8) | ev[2];
