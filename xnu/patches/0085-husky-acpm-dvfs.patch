@@ -1,0 +1,455 @@
+diff --git a/bsd/dev/husky_acpm.c b/bsd/dev/husky_acpm.c
+index a2d4636..4492a20 100644
+--- a/bsd/dev/husky_acpm.c
++++ b/bsd/dev/husky_acpm.c
+@@ -1,10 +1,11 @@
+ /*
+  * HUSKY: polled ACPM IPC client for Google Tensor G3 ("zuma", Pixel 8 Pro).
+  *
+- * The PMICs (S2MPG14 main, S2MPG15 sub) sit behind the APM core: the AP asks
+- * the ACPM firmware to do speedy register accesses through a queue in APM SRAM
+- * and a mailbox doorbell. Facts from the zuma DT and Google's acpm_ipc.c /
+- * acpm_mfd.c / framework.h (gs-6.1 google-modules):
++ * The PMICs (S2MPG14 main, S2MPG15 sub) and the DVFS domains sit behind the
++ * APM core: the AP asks the ACPM firmware for speedy register accesses or
++ * clock changes through queues in APM SRAM and a mailbox doorbell. Facts from
++ * the zuma DT and Google's acpm_ipc.c / acpm_mfd.c / acpm_dvfs.c /
++ * framework.h (gs-6.1 google-modules):
+  *
+  * - mailbox AP<->APM at 0x15110000; APM SRAM at 0x15700000 (0x58000);
+  *   firmware initdata at SRAM + 0xA000.
+@@ -19,9 +20,14 @@
+  *   slot front, front advances, doorbell = 1 << channel id at mailbox + 0x40.
+  *   The answer comes back in the AP's receive queue with the same sequence
+  *   number; the AP moves its rear up and clears mailbox + 0x24 bit id.
+- * - MFD command: cmd[0] = reg | type << 8 | speedy channel << 12; cmd[1] bits
+- *   7:0 function (0 read, 2 update), 15:8 value, 23:16 mask; the reply has the
+- *   value in cmd[1] bits 15:8 and the status (0 = OK) in bits 31:24.
++ * - MFD (channel 2, S2MPG14 on speedy 0): cmd[0] = reg | type << 8 |
++ *   speedy channel << 12; cmd[1] bits 7:0 function (0 read, 2 update), 15:8
++ *   value, 23:16 mask; the reply has the value in cmd[1] bits 15:8 and the
++ *   status (0 = OK) in bits 31:24.
++ * - DVFS (channel 0, cal_if acpm-ipc-channel): cmd[0] = domain index,
++ *   cmd[1] = rate in kHz (FREQ_REQ) or 0, cmd[2] = 0 FREQ_REQ / 1 FREQ_GET;
++ *   a FREQ_GET reply carries the rate in cmd[1] (cmd[3] when nonzero). Linux
++ *   sends CPU/MIF/INT FREQ_REQ without waiting for a reply.
+  *
+  * Polled only: no mailbox interrupt is taken. Every SRAM-derived offset is
+  * range-checked before use, and timeouts return errors instead of panicking.
+@@ -34,6 +40,7 @@
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
+ #include "husky_acpm.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -74,17 +81,28 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define MFD_FUNC_READ           0u
+ #define MFD_FUNC_UPDATE         2u
+ 
++/* DVFS: cal_if acpm-ipc-channel 0 (zuma.dtsi); acpm_dvfs.h request types */
++#define DVFS_IPC_CHANNEL        0u
++#define DVFS_FREQ_REQ           0u
++#define DVFS_FREQ_GET           1u
++
+ #define ACPM_TIMEOUT_US         100000u
+ 
++/* One AP channel: send queue (APM rx_*) and receive queue (APM tx_*). */
++struct acpm_ch {
++	uint32_t id;
++	bool ready;
++	uint32_t seq;
++	uint32_t snd_front, snd_rear, snd_base;
++	uint32_t rcv_front, rcv_rear, rcv_base;
++	uint32_t q_len, q_elem;
++};
++
+ static vm_offset_t acpm_mbox;
+ static vm_offset_t acpm_sram;
+-static bool acpm_ready;
+-static uint32_t acpm_seq;
+-
+-/* AP send queue (APM rx_*) and AP receive queue (APM tx_*), SRAM offsets */
+-static uint32_t snd_front, snd_rear, snd_base;
+-static uint32_t rcv_front, rcv_rear, rcv_base;
+-static uint32_t q_len, q_elem;
++static bool acpm_mapped;
++static struct acpm_ch ch_pmic = {.id = PMIC_IPC_CHANNEL};
++static struct acpm_ch ch_dvfs = {.id = DVFS_IPC_CHANNEL};
+ 
+ static LCK_GRP_DECLARE(husky_acpm_grp, "husky_acpm");
+ static LCK_MTX_DECLARE(husky_acpm_lock, &husky_acpm_grp);
+@@ -119,14 +137,60 @@ sram_range_ok(uint32_t off, uint32_t len)
+ 	return off < ACPM_SRAM_SIZE && len <= ACPM_SRAM_SIZE - off;
+ }
+ 
++/* Find channel c->id in the firmware's table and validate its queues. */
++static int
++acpm_ch_setup(struct acpm_ch *c, uint32_t channels, uint32_t ap_max)
++{
++	uint32_t ch = 0;
++	bool found = false;
++
++	for (uint32_t i = 0; i < ap_max; i++) {
++		if (sram_rd(channels + i * IPC_CH_SIZE + IPC_CH_ID) == c->id) {
++			ch = channels + i * IPC_CH_SIZE;
++			found = true;
++			break;
++		}
++	}
++	if (!found) {
++		HU_LOG("HUSKY ACPM: no channel %u\n", c->id);
++		return ENODEV;
++	}
++
++	c->snd_rear = sram_rd(ch + IPC_CH_RX_REAR);
++	c->snd_front = sram_rd(ch + IPC_CH_RX_FRONT);
++	c->snd_base = sram_rd(ch + IPC_CH_RX_BASE);
++	c->rcv_rear = sram_rd(ch + IPC_CH_TX_REAR);
++	c->rcv_front = sram_rd(ch + IPC_CH_TX_FRONT);
++	c->rcv_base = sram_rd(ch + IPC_CH_TX_BASE);
++	c->q_len = sram_rd(ch + IPC_CH_Q_LEN);
++	c->q_elem = sram_rd(ch + IPC_CH_Q_ELEM_SIZE);
++	HU_LOG("HUSKY ACPM: ch %u snd rear/front/base 0x%x/0x%x/0x%x rcv 0x%x/0x%x/0x%x "
++	    "len %u elem %u ap_poll %u\n", c->id, c->snd_rear, c->snd_front, c->snd_base,
++	    c->rcv_rear, c->rcv_front, c->rcv_base, c->q_len, c->q_elem,
++	    sram_rd(ch + IPC_CH_AP_POLL));
++
++	if (c->q_len < 3 || c->q_len > 64 || c->q_elem < 16 || c->q_elem > 64 || (c->q_elem & 3) ||
++	    !sram_range_ok(c->snd_base, c->q_len * c->q_elem) ||
++	    !sram_range_ok(c->rcv_base, c->q_len * c->q_elem) ||
++	    !sram_range_ok(c->snd_rear, 4) || !sram_range_ok(c->snd_front, 4) ||
++	    !sram_range_ok(c->rcv_rear, 4) || !sram_range_ok(c->rcv_front, 4)) {
++		HU_LOG("HUSKY ACPM: channel %u layout implausible; not using it\n", c->id);
++		return ENODEV;
++	}
++	c->ready = true;
++	return 0;
++}
++
+ int
+ husky_acpm_init(void)
+ {
+ 	lck_mtx_lock(&husky_acpm_lock);
+-	if (acpm_ready) {
++	if (acpm_mapped) {
++		int ret = (ch_pmic.ready || ch_dvfs.ready) ? 0 : ENODEV;
+ 		lck_mtx_unlock(&husky_acpm_lock);
+-		return 0;
++		return ret;
+ 	}
++	acpm_mapped = true;
+ 
+ 	acpm_mbox = ml_io_map(ACPM_MBOX_PA, ACPM_MBOX_SIZE);
+ 	acpm_sram = ml_io_map(ACPM_SRAM_PA, ACPM_SRAM_SIZE);
+@@ -148,60 +212,26 @@ husky_acpm_init(void)
+ 		return ENODEV;
+ 	}
+ 
+-	uint32_t ch = 0;
+-	bool found = false;
+-	for (uint32_t i = 0; i < ap_max; i++) {
+-		if (sram_rd(channels + i * IPC_CH_SIZE + IPC_CH_ID) == PMIC_IPC_CHANNEL) {
+-			ch = channels + i * IPC_CH_SIZE;
+-			found = true;
+-			break;
+-		}
+-	}
+-	if (!found) {
+-		HU_LOG("HUSKY ACPM: no channel %u\n", PMIC_IPC_CHANNEL);
+-		lck_mtx_unlock(&husky_acpm_lock);
+-		return ENODEV;
+-	}
+-
+-	snd_rear = sram_rd(ch + IPC_CH_RX_REAR);
+-	snd_front = sram_rd(ch + IPC_CH_RX_FRONT);
+-	snd_base = sram_rd(ch + IPC_CH_RX_BASE);
+-	rcv_rear = sram_rd(ch + IPC_CH_TX_REAR);
+-	rcv_front = sram_rd(ch + IPC_CH_TX_FRONT);
+-	rcv_base = sram_rd(ch + IPC_CH_TX_BASE);
+-	q_len = sram_rd(ch + IPC_CH_Q_LEN);
+-	q_elem = sram_rd(ch + IPC_CH_Q_ELEM_SIZE);
+-	HU_LOG("HUSKY ACPM: ch %u snd rear/front/base 0x%x/0x%x/0x%x rcv 0x%x/0x%x/0x%x "
+-	    "len %u elem %u ap_poll %u\n", PMIC_IPC_CHANNEL, snd_rear, snd_front, snd_base,
+-	    rcv_rear, rcv_front, rcv_base, q_len, q_elem, sram_rd(ch + IPC_CH_AP_POLL));
+-
+-	if (q_len < 3 || q_len > 64 || q_elem < 8 || q_elem > 64 || (q_elem & 3) ||
+-	    !sram_range_ok(snd_base, q_len * q_elem) || !sram_range_ok(rcv_base, q_len * q_elem) ||
+-	    !sram_range_ok(snd_rear, 4) || !sram_range_ok(snd_front, 4) ||
+-	    !sram_range_ok(rcv_rear, 4) || !sram_range_ok(rcv_front, 4)) {
+-		HU_LOG("HUSKY ACPM: channel layout implausible; not using ACPM\n");
+-		lck_mtx_unlock(&husky_acpm_lock);
+-		return ENODEV;
+-	}
+-
+-	acpm_ready = true;
++	(void)acpm_ch_setup(&ch_pmic, channels, ap_max);
++	(void)acpm_ch_setup(&ch_dvfs, channels, ap_max);
++	int ret = (ch_pmic.ready || ch_dvfs.ready) ? 0 : ENODEV;
+ 	lck_mtx_unlock(&husky_acpm_lock);
+-	return 0;
++	return ret;
+ }
+ 
+-/* Consume everything in the receive queue; copy out the element tagged seq. */
++/* Consume everything in c's receive queue; copy out the element tagged seq. */
+ static bool
+-acpm_drain(uint32_t seq, uint32_t *reply)
++acpm_drain(struct acpm_ch *c, uint32_t seq, uint32_t *reply)
+ {
+ 	bool got = false;
+-	uint32_t front = sram_rd(rcv_front);
+-	uint32_t i = sram_rd(rcv_rear);
++	uint32_t front = sram_rd(c->rcv_front);
++	uint32_t i = sram_rd(c->rcv_rear);
+ 
+-	if (front >= q_len || i >= q_len) {
++	if (front >= c->q_len || i >= c->q_len) {
+ 		return false;
+ 	}
+ 	while (i != front) {
+-		uint32_t slot = rcv_base + i * q_elem;
++		uint32_t slot = c->rcv_base + i * c->q_elem;
+ 		uint32_t w0 = sram_rd(slot);
+ 		if (seq && ((w0 >> ACPM_SEQ_SHIFT) & ACPM_SEQ_MASK) == seq) {
+ 			for (uint32_t w = 0; w < 4; w++) {
+@@ -209,19 +239,20 @@ acpm_drain(uint32_t seq, uint32_t *reply)
+ 			}
+ 			got = true;
+ 		}
+-		i = (i + 1) % q_len;
++		i = (i + 1) % c->q_len;
+ 	}
+-	sram_wr(rcv_rear, front);
+-	mbox_wr(MBOX_AP_INTCR, 1u << PMIC_IPC_CHANNEL);
++	sram_wr(c->rcv_rear, front);
++	mbox_wr(MBOX_AP_INTCR, 1u << c->id);
+ 	return got;
+ }
+ 
++/* Send cmd on c; with reply != NULL, poll for the answer. */
+ static int
+-acpm_send(uint32_t cmd[4], uint32_t reply[4])
++acpm_send(struct acpm_ch *c, uint32_t cmd[4], uint32_t reply[4])
+ {
+ 	unsigned waited;
+ 
+-	if (!acpm_ready) {
++	if (!c->ready) {
+ 		return ENXIO;
+ 	}
+ 	lck_mtx_lock(&husky_acpm_lock);
+@@ -229,47 +260,51 @@ acpm_send(uint32_t cmd[4], uint32_t reply[4])
+ 	/* Keep two slots free, as Google's driver does. */
+ 	uint32_t front;
+ 	for (waited = 0;; waited += 10) {
+-		front = sram_rd(snd_front);
+-		if (front < q_len && (front + 2) % q_len != sram_rd(rcv_front)) {
++		front = sram_rd(c->snd_front);
++		if (front < c->q_len && (front + 2) % c->q_len != sram_rd(c->rcv_front)) {
+ 			break;
+ 		}
+ 		if (waited >= ACPM_TIMEOUT_US) {
+-			HU_LOG("HUSKY ACPM: send queue stuck (front %u)\n", front);
++			HU_LOG("HUSKY ACPM: ch %u send queue stuck (front %u)\n", c->id, front);
+ 			lck_mtx_unlock(&husky_acpm_lock);
+ 			return EBUSY;
+ 		}
+ 		delay(10);
+ 	}
+-	if ((front + 1) % q_len == sram_rd(snd_rear)) {
+-		HU_LOG("HUSKY ACPM: send queue full\n");
++	if ((front + 1) % c->q_len == sram_rd(c->snd_rear)) {
++		HU_LOG("HUSKY ACPM: ch %u send queue full\n", c->id);
+ 		lck_mtx_unlock(&husky_acpm_lock);
+ 		return EBUSY;
+ 	}
+ 
+-	(void)acpm_drain(0, NULL);
++	(void)acpm_drain(c, 0, NULL);
+ 
+-	acpm_seq = (acpm_seq % ACPM_SEQ_MASK) + 1;      /* 1..63 */
+-	uint32_t seq = acpm_seq;
++	c->seq = (c->seq % ACPM_SEQ_MASK) + 1;      /* 1..63 */
++	uint32_t seq = c->seq;
+ 	cmd[0] = (cmd[0] & ~(ACPM_SEQ_MASK << ACPM_SEQ_SHIFT)) | (seq << ACPM_SEQ_SHIFT);
+ 
+-	uint32_t slot = snd_base + front * q_elem;
+-	for (uint32_t w = 0; w < q_elem / 4; w++) {
++	uint32_t slot = c->snd_base + front * c->q_elem;
++	for (uint32_t w = 0; w < c->q_elem / 4; w++) {
+ 		sram_wr(slot + w * 4, w < 4 ? cmd[w] : 0);
+ 	}
+-	sram_wr(snd_front, (front + 1) % q_len);
+-	mbox_wr(MBOX_APM_INTGR, 1u << PMIC_IPC_CHANNEL);
+-
+-	int err = ETIMEDOUT;
+-	for (waited = 0; waited < ACPM_TIMEOUT_US; waited += 10) {
+-		if (acpm_drain(seq, reply)) {
+-			err = 0;
+-			break;
++	sram_wr(c->snd_front, (front + 1) % c->q_len);
++	mbox_wr(MBOX_APM_INTGR, 1u << c->id);
++
++	int err = 0;
++	if (reply) {
++		err = ETIMEDOUT;
++		for (waited = 0; waited < ACPM_TIMEOUT_US; waited += 10) {
++			if (acpm_drain(c, seq, reply)) {
++				err = 0;
++				break;
++			}
++			delay(10);
+ 		}
+-		delay(10);
+ 	}
+ 	lck_mtx_unlock(&husky_acpm_lock);
+ 	if (err) {
+-		HU_LOG("HUSKY ACPM: no reply to seq %u (cmd %08x %08x)\n", seq, cmd[0], cmd[1]);
++		HU_LOG("HUSKY ACPM: ch %u no reply to seq %u (cmd %08x %08x)\n", c->id, seq,
++		    cmd[0], cmd[1]);
+ 	}
+ 	return err;
+ }
+@@ -285,7 +320,7 @@ husky_pmic_read(uint8_t type, uint8_t reg, uint8_t *val)
+ {
+ 	uint32_t cmd[4] = {mfd_cmd0(type, reg), MFD_FUNC_READ, 0, 0};
+ 	uint32_t reply[4] = {0, 0, 0, 0};
+-	int err = acpm_send(cmd, reply);
++	int err = acpm_send(&ch_pmic, cmd, reply);
+ 	if (err) {
+ 		return err;
+ 	}
+@@ -304,7 +339,7 @@ husky_pmic_update(uint8_t type, uint8_t reg, uint8_t val, uint8_t mask)
+ 	uint32_t cmd[4] = {mfd_cmd0(type, reg),
+ 		           MFD_FUNC_UPDATE | ((uint32_t)val << 8) | ((uint32_t)mask << 16), 0, 0};
+ 	uint32_t reply[4] = {0, 0, 0, 0};
+-	int err = acpm_send(cmd, reply);
++	int err = acpm_send(&ch_pmic, cmd, reply);
+ 	if (err) {
+ 		return err;
+ 	}
+@@ -316,4 +351,77 @@ husky_pmic_update(uint8_t type, uint8_t reg, uint8_t val, uint8_t mask)
+ 	return 0;
+ }
+ 
++int
++husky_dvfs_get(uint32_t domain, uint32_t *khz)
++{
++	uint32_t cmd[4] = {domain & 0xffffu, 0, DVFS_FREQ_GET, 0};
++	uint32_t reply[4] = {0, 0, 0, 0};
++	int err = acpm_send(&ch_dvfs, cmd, reply);
++	if (err) {
++		return err;
++	}
++	*khz = reply[3] ? reply[3] : reply[1];
++	return 0;
++}
++
++int
++husky_dvfs_set(uint32_t domain, uint32_t khz)
++{
++	uint32_t cmd[4] = {domain & 0xffffu, khz, DVFS_FREQ_REQ, 0};
++	/* Fire and forget, like Linux for CPU/MIF/INT; the next send drains. */
++	return acpm_send(&ch_dvfs, cmd, NULL);
++}
++
++static const struct {
++	uint32_t domain;
++	const char *name;
++	const char *bootarg;
++} dvfs_domains[] = {
++	{HUSKY_DVFS_MIF, "MIF", "huskymif"},
++	{HUSKY_DVFS_INT, "INT", NULL},
++	{HUSKY_DVFS_CPUCL0, "CPUCL0 A510", "huskycl0"},
++	{HUSKY_DVFS_CPUCL1, "CPUCL1 A715", "huskycl1"},
++	{HUSKY_DVFS_CPUCL2, "CPUCL2 X3", "huskycl2"},
++	{HUSKY_DVFS_DSU, "DSU", "huskydsu"},
++	{HUSKY_DVFS_G3D, "G3D", NULL},
++};
++
++static void
++dvfs_log(const char *when)
++{
++	for (unsigned i = 0; i < sizeof(dvfs_domains) / sizeof(dvfs_domains[0]); i++) {
++		uint32_t khz = 0;
++		int err = husky_dvfs_get(dvfs_domains[i].domain, &khz);
++		HU_LOG("HUSKY DVFS: %s %s %u kHz (err %d)\n", when, dvfs_domains[i].name, khz, err);
++	}
++}
++
++void
++husky_dvfs_report(void)
++{
++	bool changed = false;
++
++	if (husky_acpm_init() || !ch_dvfs.ready) {
++		HU_LOG("HUSKY DVFS: ACPM DVFS channel unavailable\n");
++		return;
++	}
++	dvfs_log("boot");
++
++	/* Opt-in rate requests, kHz: huskycl0/huskycl1/huskycl2/huskydsu/huskymif. */
++	for (unsigned i = 0; i < sizeof(dvfs_domains) / sizeof(dvfs_domains[0]); i++) {
++		uint32_t khz = 0;
++		if (!dvfs_domains[i].bootarg ||
++		    !PE_parse_boot_argn(dvfs_domains[i].bootarg, &khz, sizeof(khz)) || khz == 0) {
++			continue;
++		}
++		int err = husky_dvfs_set(dvfs_domains[i].domain, khz);
++		HU_LOG("HUSKY DVFS: request %s %u kHz (err %d)\n", dvfs_domains[i].name, khz, err);
++		changed = true;
++	}
++	if (changed) {
++		delay(50000);
++		dvfs_log("after request");
++	}
++}
++
+ #endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/bsd/dev/husky_acpm.h b/bsd/dev/husky_acpm.h
+index d8f5268..9f68178 100644
+--- a/bsd/dev/husky_acpm.h
++++ b/bsd/dev/husky_acpm.h
+@@ -25,6 +25,26 @@ int husky_acpm_init(void);
+ int husky_pmic_read(uint8_t type, uint8_t reg, uint8_t *val);
+ int husky_pmic_update(uint8_t type, uint8_t reg, uint8_t val, uint8_t mask);
+ 
++/* ACPM DVFS domains (zuma acpm_dvfs_id order) */
++#define HUSKY_DVFS_MIF          0u
++#define HUSKY_DVFS_INT          1u
++#define HUSKY_DVFS_CPUCL0       2u      /* 4x Cortex-A510 */
++#define HUSKY_DVFS_CPUCL1       3u      /* 4x Cortex-A715 */
++#define HUSKY_DVFS_CPUCL2       4u      /* 1x Cortex-X3 */
++#define HUSKY_DVFS_DSU          5u
++#define HUSKY_DVFS_BCI          6u
++#define HUSKY_DVFS_G3D          7u
++
++/* Current rate of a DVFS domain in kHz, and a rate request (no reply). */
++int husky_dvfs_get(uint32_t domain, uint32_t *khz);
++int husky_dvfs_set(uint32_t domain, uint32_t khz);
++
++/*
++ * Log every DVFS domain's rate, apply the opt-in boot-args huskycl0,
++ * huskycl1, huskycl2, huskydsu, huskymif (kHz) and log the rates again.
++ */
++void husky_dvfs_report(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/husky_fts.c b/bsd/dev/husky_fts.c
+index 33143c5..39ddebf 100644
+--- a/bsd/dev/husky_fts.c
++++ b/bsd/dev/husky_fts.c
+@@ -246,6 +246,9 @@ husky_fts_thread(__unused void *arg, __unused wait_result_t wr)
+ 	(void)PE_parse_boot_argn("huskytouchdebug", &debug_log, sizeof(debug_log));
+ 	(void)PE_parse_boot_argn("huskytouchpwr", &power, sizeof(power));
+ 
++	/* CPU/memory clocks as ABL left them (and opt-in requests), every boot. */
++	husky_dvfs_report();
++
+ 	if (enabled == 0) {
+ 		HU_LOG("HUSKY TOUCH: idle (opt-in via boot-arg huskytouch=1 or huskytouch=2)\n");
+ 		goto out;
