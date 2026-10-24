@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply small iOS root tweaks (UI prefs, timezone) to husky directly over adb.
+"""Apply small iOS root tweaks (UI prefs, system plists, timezone) to husky over adb.
 
   tools/ios-tweak-ondevice.py [--dry-run] [--timezone NAME]
 
@@ -132,7 +132,10 @@ def unmount():
 
 
 def merge_pref(name, values, dry):
-    path = f'{MNT}/private/var/mobile/Library/Preferences/{name}.plist'
+    merge_plist(f'{MNT}/private/var/mobile/Library/Preferences/{name}.plist', name, values, dry)
+
+
+def merge_plist(path, name, values, dry):
     exists = su(f'test -f {path} && echo yes').strip() == 'yes'
     if exists:
         raw = su_bytes(f'cat {path}')
@@ -191,6 +194,11 @@ def main():
         try:
             for name, values in tweaks.UI_PREFS.items():
                 merge_pref(name, values, args.dry_run)
+            for rel, values in tweaks.SYSTEM_PLISTS.items():
+                if su(f'test -f {MNT}/{rel} && echo yes').strip() != 'yes':
+                    print(f'warning: no {rel}')
+                    continue
+                merge_plist(f'{MNT}/{rel}', rel, values, args.dry_run)
             set_timezone(args.timezone, args.dry_run)
         finally:
             unmount()

@@ -53,6 +53,12 @@ each tweak re-checked against the real 23G90 / 26.6.2 image:
                   libAccessibility: without a GPU, CoreAnimation renders on the
                   CPU, and its backdrop/blur path (CA::OGL::AsynchronousNode)
                   asserted in backboardd (boot 0084) and is the costliest part.
+  ifnamer         configd InterfaceNamer.bundle Info.plist WaitStackTimeout /
+                  WaitQuietTimeout 20 s (defaults 300/240): SystemConfiguration's
+                  __wait_for_IOKit_to_quiesce blocks every SCNetworkInterface
+                  caller (Settings' main thread, boot 0089b) until IOKit goes
+                  quiet or this timer fires, and without an IONetworkStack the
+                  300 s stack timeout applies.
   timezone        /private/var/db/timezone/localtime ->
                   /var/db/timezone/zoneinfo/<--timezone> (default
                   Asia/Ho_Chi_Minh; the image ships US/Pacific).
@@ -76,6 +82,13 @@ UI_PREFS = {
     },
 }
 TIMEZONE = 'Asia/Ho_Chi_Minh'
+# Root-owned system plists: path relative to the root -> keys merged in.
+SYSTEM_PLISTS = {
+    'System/Library/SystemConfiguration/InterfaceNamer.bundle/Info.plist': {
+        'WaitStackTimeout': 20.0,
+        'WaitQuietTimeout': 20.0,
+    },
+}
 LOCALTIME = 'private/var/db/timezone/localtime'
 
 
@@ -336,6 +349,19 @@ def migration(root, platform_uuid):
 
 # ----------------------------------------------------------------------- main
 
+def system_plists(root):
+    for rel, values in SYSTEM_PLISTS.items():
+        path = os.path.join(root, rel)
+        if not os.path.exists(path):
+            say(f'warning: no {rel}')
+            continue
+        st = os.stat(path)
+        new = dict(load(path))
+        new.update(values)
+        write_plist(path, new, st.st_uid, st.st_gid, st.st_mode & 0o7777, file_fmt(path),
+                    f'{rel} {sorted(values)}')
+
+
 def ui(root):
     for name, values in UI_PREFS.items():
         merge_pref(root, name, values)
@@ -385,6 +411,7 @@ def main():
     audio(root)
     migration(root, args.platform_uuid)
     ui(root)
+    system_plists(root)
     timezone(root, args.timezone)
     merge_pref(root, 'com.apple.springboard', {
         'BKNoWatchdogs': True,
