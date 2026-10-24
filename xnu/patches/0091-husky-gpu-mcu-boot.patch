@@ -1,0 +1,558 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index a1194cd..ec47b61 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -6,6 +6,7 @@
+  *   1  read-only: the G3D power domains' state; GPU_ID and friends only if
+  *      the top domain is already on.
+  *   2  also power the top domain on (if off) and then read the registers.
++ *   3  also boot the CSF firmware on the MCU and ping it (see below).
+  *
+  * Facts (zuma-gpu.dtsi, zuma-pm-domains.dtsi, cal-if zuma
+  * flexpmu_cal_local_zuma.h, exynos-pd_el3.c, Arm Mali CSF register map as in
+@@ -24,6 +25,31 @@
+  *   0x18, CSF_ID 0x1C, SHADER_PRESENT 0x100/0x104, TILER_PRESENT 0x110,
+  *   L2_PRESENT 0x120, GPU_STATUS 0x34.
+  *
++ * MCU firmware boot (huskygpu=3), following Linux panthor (panthor_fw.c,
++ * panthor_gpu.c, panthor_mmu.c) and Google's zuma kbase r54p3 for the Pixel
++ * specifics:
++ * - firmware: mali_csffw-r54p3.bin from the phone's /vendor/firmware, handed
++ *   over by the boot payload as /chosen/memory-map HuskyGPUFW. Header: magic
++ *   0xC3F13A6E, version minor/major at +4/+5, entry-stream size at +0x10,
++ *   entries from +0x14: u32 header (type 7:0, size 15:8, OPTIONAL bit 31);
++ *   type 0 = IFACE section: flags, va start/end, data start/end. Flags: RD 0,
++ *   WR 1, EX 2, cache mode 4:3 (1 = cached), PROT 5 (skipped: protected
++ *   memory), SHARED 30, ZERO 31. The SHARED section at VA 0x04000000 is the
++ *   global interface.
++ * - order: IRQ masks 0; soft reset (GPU_COMMAND 0x0101, GPU_IRQ_RAWSTAT bit
++ *   8); COHERENCY_ENABLE 0x304 = 31 (none; zuma's GPU is not coherent); L2
++ *   slice hash ASN_HASH 0x2C0.. = DT l2-hash-values, L2_CONFIG 0x48 bit 24;
++ *   L2_PWRON 0x1A0 / L2_READY 0x160; MCU page tables (4 KiB granule, 4 levels,
++ *   48-bit VA) in AS0: TRANSTAB 0x2400, MEMATTR 0x2408 = 0x4C4C4C4C8C4C8F4C
++ *   (index 0 non-cacheable, 1 write-back), TRANSCFG 0x2430 = 0x420001C6,
++ *   AS_COMMAND 0x2418 = UPDATE, AS_STATUS 0x2428; JOB_IRQ clear, MCU_CONTROL
++ *   0x700 = AUTO (2); boot = JOB_IRQ_RAWSTAT 0x1000 bit 31 and GLB_VERSION != 0.
++ * - global interface (shared+0): version, features, input VA, output VA;
++ *   requests toggle GLB_REQ bits against GLB_ACK, then doorbell 0 (0x80000).
++ * Firmware and page-table pages are written through the cacheable mapping and
++ * cleaned to DRAM (non-coherent walks); the shared section is accessed only
++ * through a non-cacheable alias.
++ *
+  * Every step is logged (kprintf too) before it runs, so an SError leaves a
+  * trail in pmsg.
+  */
+@@ -35,8 +61,13 @@
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern_xnu.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #define HU_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
+ 
+@@ -113,6 +144,489 @@ husky_gpu_dump(void)
+ 	    (id >> 12) & 0xf, (id >> 4) & 0xf, (id >> 16) & 0xff);
+ }
+ 
++
++/* ---- CSF firmware boot (huskygpu=3) ---- */
++
++#define GPU_MAP_SIZE            0x81000ULL      /* up to doorbell 0 */
++#define GPU_IRQ_RAWSTAT         0x020u
++#define GPU_IRQ_CLEAR           0x024u
++#define GPU_IRQ_MASK            0x028u
++#define GPU_COMMAND             0x030u
++#define GPU_FAULTSTATUS         0x03cu
++#define GPU_FAULTADDR_LO        0x040u
++#define GPU_FAULTADDR_HI        0x044u
++#define L2_CONFIG               0x048u
++#define L2_READY_LO             0x160u
++#define L2_PWRON_LO             0x1a0u
++#define L2_PWRTRANS_LO          0x220u
++#define GPU_ASN_HASH0           0x2c0u
++#define COHERENCY_ENABLE        0x304u
++#define MCU_CONTROL             0x700u
++#define MCU_STATUS              0x704u
++#define JOB_IRQ_RAWSTAT         0x1000u
++#define JOB_IRQ_CLEAR           0x1004u
++#define JOB_IRQ_MASK            0x1008u
++#define MMU_IRQ_RAWSTAT         0x2000u
++#define MMU_IRQ_CLEAR           0x2004u
++#define MMU_IRQ_MASK            0x2008u
++#define AS0                     0x2400u
++#define AS_TRANSTAB             0x00u
++#define AS_MEMATTR              0x08u
++#define AS_COMMAND              0x18u
++#define AS_FAULTSTATUS          0x1cu
++#define AS_FAULTADDR            0x20u
++#define AS_STATUS               0x28u
++#define AS_TRANSCFG             0x30u
++#define DOORBELL0               0x80000u
++
++#define GPU_IRQ_RESET_COMPLETED (1u << 8)
++#define GPU_CMD_SOFT_RESET      0x0101u
++#define GPU_CMD_HARD_RESET      0x0201u
++#define JOB_IRQ_GLB             (1u << 31)
++#define COHERENCY_NONE          31u
++#define L2_CONFIG_ASN_HASH_EN   (1u << 24)
++#define MCU_CONTROL_AUTO        2u
++#define AS_CMD_UPDATE           1u
++#define AS_MEMATTR_VALUE        0x4C4C4C4C8C4C8F4CULL
++#define AS_TRANSCFG_VALUE       0x420001C6ULL
++
++/* zuma-gpu.dtsi l2-hash-values */
++static const uint32_t gpu_l2_hash[3] = {0x0036DB6D, 0x005B6DB6, 0x0};
++#define GPU_SHADER_PRESENT      0x01110055ULL
++
++#define FW_MAGIC                0xC3F13A6Eu
++#define FW_ENTRY_IFACE          0u
++#define FW_IFACE_RD             (1u << 0)
++#define FW_IFACE_WR             (1u << 1)
++#define FW_IFACE_EX             (1u << 2)
++#define FW_IFACE_CACHE(f)       (((f) >> 3) & 3u)
++#define FW_IFACE_PROT           (1u << 5)
++#define FW_IFACE_SHARED         (1u << 30)
++#define FW_IFACE_ZERO           (1u << 31)
++#define FW_SHARED_VA            0x04000000u
++#define FW_MAX_SECTIONS         16
++#define FW_MEM_MAX              (2u << 20)
++#define PT_PAGES                32u
++/* GPU MMU granule (4 KiB); xnu's own PAGE_SIZE is 16 KiB here. */
++#define GPU_PAGE                0x1000u
++#define GPU_PAGE_MASK           (GPU_PAGE - 1)
++#define gpu_round(x)            (((x) + GPU_PAGE_MASK) & ~(uint64_t)GPU_PAGE_MASK)
++
++/* GLB interface (panthor_fw.h / kbase csf_registers.h) */
++#define GLB_VERSION             0x00u
++#define GLB_FEATURES            0x04u
++#define GLB_INPUT_VA            0x08u
++#define GLB_OUTPUT_VA           0x0cu
++#define GLB_GROUP_NUM           0x10u
++#define GLB_IN_REQ              0x00u
++#define GLB_IN_ACK_IRQ_MASK     0x04u
++#define GLB_IN_PROGRESS_TIMER   0x10u
++#define GLB_IN_POWEROFF_TIMER   0x14u
++#define GLB_IN_CORE_EN_MASK     0x18u
++#define GLB_IN_IDLE_TIMER       0x80u
++#define GLB_OUT_ACK             0x00u
++#define GLB_REQ_PROGRESS_TIMER  (1u << 1)
++#define GLB_REQ_ALLOC_EN        (1u << 2)
++#define GLB_REQ_POWEROFF_TIMER  (1u << 3)
++#define GLB_REQ_COUNTER_EN      (1u << 7)
++#define GLB_REQ_PING            (1u << 8)
++#define GLB_REQ_IDLE_EN         (1u << 10)
++#define GLB_REQ_IDLE            (1u << 26)
++
++struct fw_section {
++	uint32_t flags, va_start, va_end, data_start, data_end;
++	uint64_t pa;            /* backing pages */
++	vm_offset_t kva;        /* cacheable kernel view */
++};
++
++static vm_offset_t gpu_regs;
++
++static inline uint32_t
++grd(uint32_t off)
++{
++	return rd32(gpu_regs, off);
++}
++
++static inline void
++gwr(uint32_t off, uint32_t val)
++{
++	wr32(gpu_regs, off, val);
++}
++
++static inline void
++gwr64(uint32_t off, uint64_t val)
++{
++	gwr(off, (uint32_t)val);
++	gwr(off + 4, (uint32_t)(val >> 32));
++}
++
++static bool
++gpoll(uint32_t off, uint32_t mask, uint32_t want, unsigned timeout_us, unsigned *took)
++{
++	unsigned us;
++	for (us = 0; us < timeout_us; us += 10) {
++		if ((grd(off) & mask) == want) {
++			if (took) {
++				*took = us;
++			}
++			return true;
++		}
++		delay(10);
++	}
++	if (took) {
++		*took = us;
++	}
++	return false;
++}
++
++static void
++gpu_fault_dump(const char *why)
++{
++	HU_LOG("HUSKY GPU: %s: GPU_IRQ_RAWSTAT 0x%x GPU_FAULTSTATUS 0x%x addr 0x%x%08x MCU_STATUS 0x%x "
++	    "JOB_IRQ_RAWSTAT 0x%x MMU_IRQ_RAWSTAT 0x%x AS0 FAULTSTATUS 0x%x FAULTADDR 0x%x%08x STATUS 0x%x\n",
++	    why, grd(GPU_IRQ_RAWSTAT), grd(GPU_FAULTSTATUS), grd(GPU_FAULTADDR_HI), grd(GPU_FAULTADDR_LO),
++	    grd(MCU_STATUS), grd(JOB_IRQ_RAWSTAT), grd(MMU_IRQ_RAWSTAT), grd(AS0 + AS_FAULTSTATUS),
++	    grd(AS0 + AS_FAULTADDR + 4), grd(AS0 + AS_FAULTADDR), grd(AS0 + AS_STATUS));
++}
++
++/* Simple word copies: the targets may be Device/NC mappings (no dc zva). */
++static void
++copy_bytes(volatile uint8_t *dst, const uint8_t *src, size_t n)
++{
++	for (size_t i = 0; i < n; i++) {
++		dst[i] = src[i];
++	}
++}
++
++/* ---- page tables ---- */
++
++static uint64_t pt_pa;          /* pool base */
++static vm_offset_t pt_kva;
++static unsigned pt_used;
++
++static uint64_t *
++pt_entry_table(uint64_t table_pa)
++{
++	return (uint64_t *)(pt_kva + (table_pa - pt_pa));
++}
++
++static uint64_t
++pt_alloc(void)
++{
++	if (pt_used >= PT_PAGES) {
++		return 0;
++	}
++	return pt_pa + (uint64_t)(pt_used++) * GPU_PAGE;
++}
++
++/* Map one 4 KiB page va -> pa with leaf attribute bits. */
++static bool
++pt_map_page(uint64_t root, uint64_t va, uint64_t pa, uint64_t leaf_attrs)
++{
++	uint64_t table = root;
++	for (int level = 0; level < 3; level++) {
++		unsigned idx = (unsigned)((va >> (39 - 9 * level)) & 0x1ff);
++		uint64_t *t = pt_entry_table(table);
++		if ((t[idx] & 3) != 3) {
++			uint64_t next = pt_alloc();
++			if (next == 0) {
++				return false;
++			}
++			/* table descriptor; kbase also sets AF on table entries */
++			t[idx] = (next & 0x0000fffffffff000ULL) | (1ULL << 10) | 3;
++		}
++		table = t[idx] & 0x0000fffffffff000ULL;
++	}
++	uint64_t *l3 = pt_entry_table(table);
++	l3[(va >> 12) & 0x1ff] = (pa & 0x0000fffffffff000ULL) | leaf_attrs | 3;
++	return true;
++}
++
++static uint64_t
++leaf_attrs_for(uint32_t flags)
++{
++	uint64_t a = (1ULL << 10) | (1ULL << 11);      /* AF, nG */
++	a |= 1ULL << 6;                                 /* AP[1] */
++	if (!(flags & FW_IFACE_WR)) {
++		a |= 1ULL << 7;                         /* read-only */
++	}
++	if (!(flags & FW_IFACE_EX)) {
++		a |= (1ULL << 53) | (1ULL << 54);       /* no-exec */
++	}
++	if (FW_IFACE_CACHE(flags) == 1) {
++		a |= (1ULL << 2) | (3ULL << 8);         /* AttrIndx 1 (WB), inner shareable */
++	} else {
++		a |= (0ULL << 2) | (2ULL << 8);         /* AttrIndx 0 (NC), outer shareable */
++	}
++	return a;
++}
++
++/* Arch timer ticks to the firmware's timer units (panthor conv_timeout). */
++static uint32_t
++glb_timeout(uint64_t us)
++{
++	uint64_t freq;
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
++	return (uint32_t)((us * freq) / (1000000ULL << 10));
++}
++
++static void
++husky_gpu_mcu_boot(void)
++{
++	DTEntry mm;
++	uint64_t const *blob = NULL;
++	unsigned int sz = 0;
++	struct fw_section sec[FW_MAX_SECTIONS];
++	unsigned nsec = 0;
++	unsigned took;
++
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess ||
++	    SecureDTGetProperty(mm, "HuskyGPUFW", (void const **)&blob, &sz) != kSuccess ||
++	    sz != 2 * sizeof(uint64_t)) {
++		HU_LOG("HUSKY GPU: no HuskyGPUFW in /chosen/memory-map (mkxnuboot GPUFW)\n");
++		return;
++	}
++	const uint8_t *fw = (const uint8_t *)ml_static_ptovirt((vm_offset_t)blob[0]);
++	uint32_t fw_size = (uint32_t)blob[1];
++	const uint32_t *fw32 = (const uint32_t *)fw;
++	if (fw == NULL || fw_size < 0x14) {
++		HU_LOG("HUSKY GPU: firmware at 0x%llx not mapped (%u bytes)\n", blob[0], fw_size);
++		return;
++	}
++	HU_LOG("HUSKY GPU: firmware at 0x%llx, %u bytes, magic 0x%x version %u.%u\n",
++	    blob[0], fw_size, fw32[0], fw[5], fw[4]);
++	if (fw32[0] != FW_MAGIC || fw[5] != 0) {
++		HU_LOG("HUSKY GPU: unexpected firmware header\n");
++		return;
++	}
++
++	/* Parse IFACE sections. */
++	uint32_t end = fw32[4];
++	if (end > fw_size) {
++		HU_LOG("HUSKY GPU: entry stream past the file\n");
++		return;
++	}
++	uint32_t total = 0;
++	for (uint32_t off = 0x14; off + 4 <= end;) {
++		uint32_t hdr = *(const uint32_t *)(fw + off);
++		uint32_t esize = (hdr >> 8) & 0xff;
++		if (esize < 4 || (esize & 3) || off + esize > end) {
++			HU_LOG("HUSKY GPU: bad entry at 0x%x (0x%x)\n", off, hdr);
++			return;
++		}
++		if ((hdr & 0xff) == FW_ENTRY_IFACE && esize >= 24) {
++			const uint32_t *e = (const uint32_t *)(fw + off + 4);
++			struct fw_section s0 = {e[0], e[1], e[2], e[3], e[4], 0, 0};
++			HU_LOG("HUSKY GPU: section va 0x%x-0x%x flags 0x%x data 0x%x-0x%x\n",
++			    s0.va_start, s0.va_end, s0.flags, s0.data_start, s0.data_end);
++			if (s0.flags & ~(FW_IFACE_RD | FW_IFACE_WR | FW_IFACE_EX | (3u << 3) | FW_IFACE_PROT |
++			    FW_IFACE_SHARED | FW_IFACE_ZERO)) {
++				HU_LOG("HUSKY GPU: unknown section flags\n");
++				return;
++			}
++			if (s0.va_end <= s0.va_start || (s0.va_start & GPU_PAGE_MASK) || s0.data_end < s0.data_start ||
++			    s0.data_end > fw_size || s0.data_end - s0.data_start > s0.va_end - s0.va_start) {
++				HU_LOG("HUSKY GPU: bad section\n");
++				return;
++			}
++			if (!(s0.flags & FW_IFACE_PROT) && nsec < FW_MAX_SECTIONS) {
++				sec[nsec++] = s0;
++				total += (uint32_t)round_page(s0.va_end - s0.va_start);
++			}
++		}
++		off += esize;
++	}
++	if (total == 0 || total > FW_MEM_MAX) {
++		HU_LOG("HUSKY GPU: firmware memory %u bytes out of range\n", total);
++		return;
++	}
++
++	/* One contiguous region: sections, then the page-table pool. */
++	vm_offset_t kva = 0;
++	vm_size_t region = round_page(total + PT_PAGES * GPU_PAGE);
++	if (kmem_alloc_contig(kernel_map, &kva, region, PAGE_MASK,
++	    (ppnum_t)atop_64(1ULL << 40) - 1, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		HU_LOG("HUSKY GPU: no contiguous memory (%lu bytes)\n", (unsigned long)region);
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	uint64_t base_pa = ptoa_64(pn);
++	HU_LOG("HUSKY GPU: firmware memory %u + page tables %u bytes at pa 0x%llx\n", total,
++	    PT_PAGES * GPU_PAGE, base_pa);
++
++	uint64_t cursor = 0;
++	vm_offset_t shared_nc = 0;
++	uint32_t shared_size = 0;
++	for (unsigned i = 0; i < nsec; i++) {
++		struct fw_section *s0 = &sec[i];
++		s0->pa = base_pa + cursor;
++		s0->kva = kva + cursor;
++		uint32_t len = s0->data_end - s0->data_start;
++		copy_bytes((volatile uint8_t *)s0->kva, fw + s0->data_start, len);      /* rest is zero */
++		cursor += round_page(s0->va_end - s0->va_start);
++		if (s0->va_start == FW_SHARED_VA && (s0->flags & FW_IFACE_SHARED)) {
++			shared_size = s0->va_end - s0->va_start;
++		}
++	}
++	pt_pa = base_pa + total;
++	pt_kva = kva + total;
++	pt_used = 0;
++	uint64_t root = pt_alloc();
++	for (unsigned i = 0; i < nsec; i++) {
++		struct fw_section *s0 = &sec[i];
++		uint64_t attrs = leaf_attrs_for(s0->flags);
++		for (uint64_t va = s0->va_start; va < gpu_round(s0->va_end); va += GPU_PAGE) {
++			if (!pt_map_page(root, va, s0->pa + (va - s0->va_start), attrs)) {
++				HU_LOG("HUSKY GPU: page-table pool exhausted\n");
++				return;
++			}
++		}
++	}
++	HU_LOG("HUSKY GPU: %u sections mapped, %u page-table pages\n", nsec, pt_used);
++	/* Push everything to DRAM: the GPU walks and reads non-coherently. */
++	flush_dcache64((addr64_t)kva, (unsigned)region, FALSE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	struct fw_section *sh = NULL;
++	for (unsigned i = 0; i < nsec; i++) {
++		if (sec[i].va_start == FW_SHARED_VA) {
++			sh = &sec[i];
++		}
++	}
++	if (sh == NULL || shared_size == 0) {
++		HU_LOG("HUSKY GPU: no shared section at 0x%x\n", FW_SHARED_VA);
++		return;
++	}
++	shared_nc = ml_io_map_wcomb((vm_offset_t)sh->pa, round_page(shared_size));
++	if (!shared_nc) {
++		HU_LOG("HUSKY GPU: shared section map failed\n");
++		return;
++	}
++
++	gpu_regs = ml_io_map(GPU_PA, GPU_MAP_SIZE);
++	if (!gpu_regs) {
++		HU_LOG("HUSKY GPU: register map failed\n");
++		return;
++	}
++	HU_LOG("HUSKY GPU: IRQ masks off, soft reset\n");
++	gwr(GPU_IRQ_MASK, 0);
++	gwr(JOB_IRQ_MASK, 0);
++	gwr(MMU_IRQ_MASK, 0);
++	gwr(GPU_IRQ_CLEAR, 0xffffffffu);
++	gwr(JOB_IRQ_CLEAR, 0xffffffffu);
++	gwr(MMU_IRQ_CLEAR, 0xffffffffu);
++	gwr(GPU_COMMAND, GPU_CMD_SOFT_RESET);
++	if (!gpoll(GPU_IRQ_RAWSTAT, GPU_IRQ_RESET_COMPLETED, GPU_IRQ_RESET_COMPLETED, 500000, &took)) {
++		gpu_fault_dump("soft reset timeout, trying hard reset");
++		gwr(GPU_IRQ_CLEAR, 0xffffffffu);
++		gwr(GPU_COMMAND, GPU_CMD_HARD_RESET);
++		if (!gpoll(GPU_IRQ_RAWSTAT, GPU_IRQ_RESET_COMPLETED, GPU_IRQ_RESET_COMPLETED, 500000, &took)) {
++			gpu_fault_dump("hard reset timeout");
++			return;
++		}
++	}
++	HU_LOG("HUSKY GPU: reset done in %u us\n", took);
++	gwr(GPU_IRQ_CLEAR, 0xffffffffu);
++
++	gwr(COHERENCY_ENABLE, COHERENCY_NONE);
++	for (unsigned i = 0; i < 3; i++) {
++		gwr(GPU_ASN_HASH0 + 4 * i, gpu_l2_hash[i]);
++	}
++	gwr(L2_CONFIG, grd(L2_CONFIG) | L2_CONFIG_ASN_HASH_EN);
++	HU_LOG("HUSKY GPU: coherency none, L2 hash set (L2_CONFIG 0x%x); L2 power on\n", grd(L2_CONFIG));
++	(void)gpoll(L2_PWRTRANS_LO, 1, 0, 20000, NULL);
++	gwr(L2_PWRON_LO, 1);
++	gwr(L2_PWRON_LO + 4, 0);
++	if (!gpoll(L2_READY_LO, 1, 1, 20000, &took)) {
++		gpu_fault_dump("L2 power-on timeout");
++		return;
++	}
++	HU_LOG("HUSKY GPU: L2 ready in %u us\n", took);
++
++	HU_LOG("HUSKY GPU: AS0 TRANSTAB 0x%llx\n", root);
++	if (!gpoll(AS0 + AS_STATUS, 3, 0, 100000, NULL)) {
++		gpu_fault_dump("AS0 busy before update");
++		return;
++	}
++	gwr64(AS0 + AS_TRANSTAB, root);
++	gwr64(AS0 + AS_MEMATTR, AS_MEMATTR_VALUE);
++	gwr64(AS0 + AS_TRANSCFG, AS_TRANSCFG_VALUE);
++	gwr(AS0 + AS_COMMAND, AS_CMD_UPDATE);
++	if (!gpoll(AS0 + AS_STATUS, 3, 0, 100000, &took)) {
++		gpu_fault_dump("AS0 update timeout");
++		return;
++	}
++	HU_LOG("HUSKY GPU: AS0 enabled in %u us; starting MCU\n", took);
++
++	gwr(JOB_IRQ_CLEAR, 0xffffffffu);
++	gwr(MCU_CONTROL, MCU_CONTROL_AUTO);
++	bool booted = gpoll(JOB_IRQ_RAWSTAT, JOB_IRQ_GLB, JOB_IRQ_GLB, 1000000, &took);
++	uint32_t version = rd32(shared_nc, GLB_VERSION);
++	HU_LOG("HUSKY GPU: MCU %s after %u us: MCU_STATUS 0x%x GLB_VERSION 0x%x (%u.%u.%u)\n",
++	    booted ? "signalled" : "SILENT", took, grd(MCU_STATUS), version, version >> 24,
++	    (version >> 16) & 0xff, version & 0xffff);
++	if (!booted || version == 0) {
++		gpu_fault_dump("firmware did not boot");
++		return;
++	}
++	gwr(JOB_IRQ_CLEAR, JOB_IRQ_GLB);
++
++	uint32_t in_va = rd32(shared_nc, GLB_INPUT_VA), out_va = rd32(shared_nc, GLB_OUTPUT_VA);
++	HU_LOG("HUSKY GPU: GLB features 0x%x input 0x%x output 0x%x groups %u\n",
++	    rd32(shared_nc, GLB_FEATURES), in_va, out_va, rd32(shared_nc, GLB_GROUP_NUM));
++	if (in_va < FW_SHARED_VA || in_va + 0x100 > FW_SHARED_VA + shared_size ||
++	    out_va < FW_SHARED_VA || out_va + 0x20 > FW_SHARED_VA + shared_size) {
++		HU_LOG("HUSKY GPU: GLB input/output outside the shared section\n");
++		return;
++	}
++	vm_offset_t gin = shared_nc + (in_va - FW_SHARED_VA);
++	vm_offset_t gout = shared_nc + (out_va - FW_SHARED_VA);
++
++	/* Global init (panthor_fw_init_global_iface). */
++	wr32(gin, GLB_IN_CORE_EN_MASK, (uint32_t)GPU_SHADER_PRESENT);
++	wr32(gin, GLB_IN_CORE_EN_MASK + 4, (uint32_t)(GPU_SHADER_PRESENT >> 32));
++	wr32(gin, GLB_IN_POWEROFF_TIMER, glb_timeout(10000));
++	wr32(gin, GLB_IN_PROGRESS_TIMER, (5u * 500u * 1024u * 1024u) >> 10);
++	wr32(gin, GLB_IN_IDLE_TIMER, glb_timeout(800));
++	wr32(gin, GLB_IN_ACK_IRQ_MASK, GLB_REQ_ALLOC_EN | GLB_REQ_PING | GLB_REQ_PROGRESS_TIMER |
++	    GLB_REQ_POWEROFF_TIMER | GLB_REQ_IDLE_EN | GLB_REQ_IDLE);
++	uint32_t ack = rd32(gout, GLB_OUT_ACK);
++	uint32_t toggle = GLB_REQ_ALLOC_EN | GLB_REQ_POWEROFF_TIMER | GLB_REQ_PROGRESS_TIMER;
++	uint32_t req = rd32(gin, GLB_IN_REQ);
++	req = (req & ~toggle) | (~ack & toggle);
++	req |= GLB_REQ_IDLE_EN | GLB_REQ_COUNTER_EN;
++	wr32(gin, GLB_IN_REQ, req);
++	gwr(DOORBELL0, 1);
++	unsigned us;
++	for (us = 0; us < 100000; us += 10) {
++		if ((rd32(gout, GLB_OUT_ACK) & toggle) == (req & toggle)) {
++			break;
++		}
++		delay(10);
++	}
++	HU_LOG("HUSKY GPU: global init %s after %u us (req 0x%x ack 0x%x)\n",
++	    us < 100000 ? "acked" : "NOT acked", us, req, rd32(gout, GLB_OUT_ACK));
++
++	/* Ping. */
++	ack = rd32(gout, GLB_OUT_ACK);
++	req = rd32(gin, GLB_IN_REQ);
++	req = (req & ~GLB_REQ_PING) | (~ack & GLB_REQ_PING);
++	wr32(gin, GLB_IN_REQ, req);
++	gwr(DOORBELL0, 1);
++	for (us = 0; us < 100000; us += 10) {
++		if ((rd32(gout, GLB_OUT_ACK) & GLB_REQ_PING) == (req & GLB_REQ_PING)) {
++			break;
++		}
++		delay(10);
++	}
++	HU_LOG("HUSKY GPU: PING %s after %u us; MCU_STATUS 0x%x\n",
++	    us < 100000 ? "ANSWERED" : "unanswered", us, grd(MCU_STATUS));
++	if (us >= 100000) {
++		gpu_fault_dump("ping");
++	}
++}
++
+ void
+ husky_gpu_probe(void)
+ {
+@@ -159,6 +673,9 @@ husky_gpu_probe(void)
+ 		}
+ 	}
+ 	husky_gpu_dump();
++	if (mode >= 3) {
++		husky_gpu_mcu_boot();
++	}
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_HUSKY */
