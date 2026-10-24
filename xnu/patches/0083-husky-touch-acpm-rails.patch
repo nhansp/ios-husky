@@ -1,0 +1,507 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 93a5e4e..597fbbf 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/husky_sample.c			standard
+ bsd/dev/husky_spi.c			standard
+ bsd/dev/husky_gpio.c			standard
+ bsd/dev/husky_fts.c			standard
++bsd/dev/husky_acpm.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/husky_acpm.c b/bsd/dev/husky_acpm.c
+new file mode 100644
+index 0000000..0adddbd
+--- /dev/null
++++ b/bsd/dev/husky_acpm.c
+@@ -0,0 +1,318 @@
++/*
++ * HUSKY: polled ACPM IPC client for Google Tensor G3 ("zuma", Pixel 8 Pro).
++ *
++ * The PMICs (S2MPG14 main, S2MPG15 sub) sit behind the APM core: the AP asks
++ * the ACPM firmware to do speedy register accesses through a queue in APM SRAM
++ * and a mailbox doorbell. Facts from the zuma DT and Google's acpm_ipc.c /
++ * acpm_mfd.c / framework.h (gs-6.1 google-modules):
++ *
++ * - mailbox AP<->APM at 0x15110000; APM SRAM at 0x15700000 (0x58000);
++ *   firmware initdata at SRAM + 0xA000.
++ * - initdata: +0x08 ipc_channels (SRAM offset), +0x18 ipc_ap_max. Each
++ *   ipc_channel is 72 bytes: id, field bits, owner, type, then channel_info
++ *   (rx_rear, rx_front, rx_base, rx_indr_buf, rx_indr_buf_base,
++ *   rx_indr_buf_size, tx_rear, tx_front, tx_base, q_len, q_elem_size, credit,
++ *   mbox_addr), then ap_poll. Names are APM-side: the AP sends through the
++ *   rx_* queue and receives through the tx_* queue. All pointers are SRAM
++ *   offsets; front/rear are slot indices.
++ * - send: cmd[0] gets a 6-bit sequence number at bit 16, the element goes in
++ *   slot front, front advances, doorbell = 1 << channel id at mailbox + 0x40.
++ *   The answer comes back in the AP's receive queue with the same sequence
++ *   number; the AP moves its rear up and clears mailbox + 0x24 bit id.
++ * - MFD command: cmd[0] = reg | type << 8 | speedy channel << 12; cmd[1] bits
++ *   7:0 function (0 read, 2 update), 15:8 value, 23:16 mask; the reply has the
++ *   value in cmd[1] bits 15:8 and the status (0 = OK) in bits 31:24.
++ *
++ * Polled only: no mailbox interrupt is taken. Every SRAM-derived offset is
++ * range-checked before use, and timeouts return errors instead of panicking.
++ */
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include "husky_acpm.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define HU_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
++
++#define ACPM_MBOX_PA            0x15110000ULL
++#define ACPM_MBOX_SIZE          0x1000ULL
++#define ACPM_SRAM_PA            0x15700000ULL
++#define ACPM_SRAM_SIZE          0x58000u
++#define ACPM_INITDATA_OFF       0xa000u
++
++#define MBOX_AP_INTCR           0x24u   /* INTCR0: clear APM -> AP pending */
++#define MBOX_APM_INTGR          0x40u   /* INTGR1: AP -> APM doorbell */
++
++#define INIT_IPC_CHANNELS       0x08u
++#define INIT_NUM_IPC_CHANNELS   0x0cu
++#define INIT_IPC_AP_MAX         0x18u
++
++#define IPC_CH_SIZE             72u
++#define IPC_CH_ID               0x00u
++#define IPC_CH_RX_REAR          0x10u
++#define IPC_CH_RX_FRONT         0x14u
++#define IPC_CH_RX_BASE          0x18u
++#define IPC_CH_TX_REAR          0x28u
++#define IPC_CH_TX_FRONT         0x2cu
++#define IPC_CH_TX_BASE          0x30u
++#define IPC_CH_Q_LEN            0x34u
++#define IPC_CH_Q_ELEM_SIZE      0x38u
++#define IPC_CH_AP_POLL          0x44u
++
++#define ACPM_SEQ_SHIFT          16u
++#define ACPM_SEQ_MASK           0x3fu
++
++/* S2MPG14: acpm-ipc-channel 2, acpm-speedy-channel 0 (zuma-pmic.dtsi) */
++#define PMIC_IPC_CHANNEL        2u
++#define PMIC_SPEEDY_CHANNEL     0u
++#define MFD_FUNC_READ           0u
++#define MFD_FUNC_UPDATE         2u
++
++#define ACPM_TIMEOUT_US         100000u
++
++static vm_offset_t acpm_mbox;
++static vm_offset_t acpm_sram;
++static bool acpm_ready;
++static uint32_t acpm_seq;
++
++/* AP send queue (APM rx_*) and AP receive queue (APM tx_*), SRAM offsets */
++static uint32_t snd_front, snd_rear, snd_base;
++static uint32_t rcv_front, rcv_rear, rcv_base;
++static uint32_t q_len, q_elem;
++
++static LCK_GRP_DECLARE(husky_acpm_grp, "husky_acpm");
++static LCK_MTX_DECLARE(husky_acpm_lock, &husky_acpm_grp);
++
++static inline uint32_t
++sram_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(acpm_sram + off);
++	__asm__ volatile("dmb osh" ::: "memory");
++	return v;
++}
++
++static inline void
++sram_wr(uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb osh" ::: "memory");
++	*(volatile uint32_t *)(acpm_sram + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static inline void
++mbox_wr(uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dsb osh" ::: "memory");
++	*(volatile uint32_t *)(acpm_mbox + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static bool
++sram_range_ok(uint32_t off, uint32_t len)
++{
++	return off < ACPM_SRAM_SIZE && len <= ACPM_SRAM_SIZE - off;
++}
++
++int
++husky_acpm_init(void)
++{
++	lck_mtx_lock(&husky_acpm_lock);
++	if (acpm_ready) {
++		lck_mtx_unlock(&husky_acpm_lock);
++		return 0;
++	}
++
++	acpm_mbox = ml_io_map(ACPM_MBOX_PA, ACPM_MBOX_SIZE);
++	acpm_sram = ml_io_map(ACPM_SRAM_PA, ACPM_SRAM_SIZE);
++	if (!acpm_mbox || !acpm_sram) {
++		HU_LOG("HUSKY ACPM: map failed\n");
++		lck_mtx_unlock(&husky_acpm_lock);
++		return ENXIO;
++	}
++
++	uint32_t channels = sram_rd(ACPM_INITDATA_OFF + INIT_IPC_CHANNELS);
++	uint32_t num = sram_rd(ACPM_INITDATA_OFF + INIT_NUM_IPC_CHANNELS);
++	uint32_t ap_max = sram_rd(ACPM_INITDATA_OFF + INIT_IPC_AP_MAX);
++	HU_LOG("HUSKY ACPM: initdata ipc_channels 0x%x num %u ap_max %u\n",
++	    channels, num, ap_max);
++	if (ap_max <= PMIC_IPC_CHANNEL || ap_max > 32 || ap_max > num ||
++	    !sram_range_ok(channels, ap_max * IPC_CH_SIZE)) {
++		HU_LOG("HUSKY ACPM: initdata implausible; not using ACPM\n");
++		lck_mtx_unlock(&husky_acpm_lock);
++		return ENODEV;
++	}
++
++	uint32_t ch = 0;
++	bool found = false;
++	for (uint32_t i = 0; i < ap_max; i++) {
++		if (sram_rd(channels + i * IPC_CH_SIZE + IPC_CH_ID) == PMIC_IPC_CHANNEL) {
++			ch = channels + i * IPC_CH_SIZE;
++			found = true;
++			break;
++		}
++	}
++	if (!found) {
++		HU_LOG("HUSKY ACPM: no channel %u\n", PMIC_IPC_CHANNEL);
++		lck_mtx_unlock(&husky_acpm_lock);
++		return ENODEV;
++	}
++
++	snd_rear = sram_rd(ch + IPC_CH_RX_REAR);
++	snd_front = sram_rd(ch + IPC_CH_RX_FRONT);
++	snd_base = sram_rd(ch + IPC_CH_RX_BASE);
++	rcv_rear = sram_rd(ch + IPC_CH_TX_REAR);
++	rcv_front = sram_rd(ch + IPC_CH_TX_FRONT);
++	rcv_base = sram_rd(ch + IPC_CH_TX_BASE);
++	q_len = sram_rd(ch + IPC_CH_Q_LEN);
++	q_elem = sram_rd(ch + IPC_CH_Q_ELEM_SIZE);
++	HU_LOG("HUSKY ACPM: ch %u snd rear/front/base 0x%x/0x%x/0x%x rcv 0x%x/0x%x/0x%x "
++	    "len %u elem %u ap_poll %u\n", PMIC_IPC_CHANNEL, snd_rear, snd_front, snd_base,
++	    rcv_rear, rcv_front, rcv_base, q_len, q_elem, sram_rd(ch + IPC_CH_AP_POLL));
++
++	if (q_len < 3 || q_len > 64 || q_elem < 8 || q_elem > 64 || (q_elem & 3) ||
++	    !sram_range_ok(snd_base, q_len * q_elem) || !sram_range_ok(rcv_base, q_len * q_elem) ||
++	    !sram_range_ok(snd_rear, 4) || !sram_range_ok(snd_front, 4) ||
++	    !sram_range_ok(rcv_rear, 4) || !sram_range_ok(rcv_front, 4)) {
++		HU_LOG("HUSKY ACPM: channel layout implausible; not using ACPM\n");
++		lck_mtx_unlock(&husky_acpm_lock);
++		return ENODEV;
++	}
++
++	acpm_ready = true;
++	lck_mtx_unlock(&husky_acpm_lock);
++	return 0;
++}
++
++/* Consume everything in the receive queue; copy out the element tagged seq. */
++static bool
++acpm_drain(uint32_t seq, uint32_t *reply)
++{
++	bool got = false;
++	uint32_t front = sram_rd(rcv_front);
++	uint32_t i = sram_rd(rcv_rear);
++
++	if (front >= q_len || i >= q_len) {
++		return false;
++	}
++	while (i != front) {
++		uint32_t slot = rcv_base + i * q_elem;
++		uint32_t w0 = sram_rd(slot);
++		if (seq && ((w0 >> ACPM_SEQ_SHIFT) & ACPM_SEQ_MASK) == seq) {
++			for (uint32_t w = 0; w < 4; w++) {
++				reply[w] = sram_rd(slot + w * 4);
++			}
++			got = true;
++		}
++		i = (i + 1) % q_len;
++	}
++	sram_wr(rcv_rear, front);
++	mbox_wr(MBOX_AP_INTCR, 1u << PMIC_IPC_CHANNEL);
++	return got;
++}
++
++static int
++acpm_send(uint32_t cmd[4], uint32_t reply[4])
++{
++	unsigned waited;
++
++	if (!acpm_ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&husky_acpm_lock);
++
++	/* Keep two slots free, as Google's driver does. */
++	uint32_t front;
++	for (waited = 0;; waited += 10) {
++		front = sram_rd(snd_front);
++		if (front < q_len && (front + 2) % q_len != sram_rd(rcv_front)) {
++			break;
++		}
++		if (waited >= ACPM_TIMEOUT_US) {
++			HU_LOG("HUSKY ACPM: send queue stuck (front %u)\n", front);
++			lck_mtx_unlock(&husky_acpm_lock);
++			return EBUSY;
++		}
++		delay(10);
++	}
++	if ((front + 1) % q_len == sram_rd(snd_rear)) {
++		HU_LOG("HUSKY ACPM: send queue full\n");
++		lck_mtx_unlock(&husky_acpm_lock);
++		return EBUSY;
++	}
++
++	(void)acpm_drain(0, NULL);
++
++	acpm_seq = (acpm_seq % ACPM_SEQ_MASK) + 1;      /* 1..63 */
++	uint32_t seq = acpm_seq;
++	cmd[0] = (cmd[0] & ~(ACPM_SEQ_MASK << ACPM_SEQ_SHIFT)) | (seq << ACPM_SEQ_SHIFT);
++
++	uint32_t slot = snd_base + front * q_elem;
++	for (uint32_t w = 0; w < q_elem / 4; w++) {
++		sram_wr(slot + w * 4, w < 4 ? cmd[w] : 0);
++	}
++	sram_wr(snd_front, (front + 1) % q_len);
++	mbox_wr(MBOX_APM_INTGR, 1u << PMIC_IPC_CHANNEL);
++
++	int err = ETIMEDOUT;
++	for (waited = 0; waited < ACPM_TIMEOUT_US; waited += 10) {
++		if (acpm_drain(seq, reply)) {
++			err = 0;
++			break;
++		}
++		delay(10);
++	}
++	lck_mtx_unlock(&husky_acpm_lock);
++	if (err) {
++		HU_LOG("HUSKY ACPM: no reply to seq %u (cmd %08x %08x)\n", seq, cmd[0], cmd[1]);
++	}
++	return err;
++}
++
++static uint32_t
++mfd_cmd0(uint8_t type, uint8_t reg)
++{
++	return (uint32_t)reg | ((uint32_t)(type & 0xf) << 8) | (PMIC_SPEEDY_CHANNEL << 12);
++}
++
++int
++husky_pmic_read(uint8_t type, uint8_t reg, uint8_t *val)
++{
++	uint32_t cmd[4] = {mfd_cmd0(type, reg), MFD_FUNC_READ, 0, 0};
++	uint32_t reply[4] = {0, 0, 0, 0};
++	int err = acpm_send(cmd, reply);
++	if (err) {
++		return err;
++	}
++	uint32_t status = reply[1] >> 24;
++	if (status) {
++		HU_LOG("HUSKY ACPM: PMIC read %x:%02x status %u\n", type, reg, status);
++		return EIO;
++	}
++	*val = (uint8_t)(reply[1] >> 8);
++	return 0;
++}
++
++int
++husky_pmic_update(uint8_t type, uint8_t reg, uint8_t val, uint8_t mask)
++{
++	uint32_t cmd[4] = {mfd_cmd0(type, reg),
++		           MFD_FUNC_UPDATE | ((uint32_t)val << 8) | ((uint32_t)mask << 16), 0, 0};
++	uint32_t reply[4] = {0, 0, 0, 0};
++	int err = acpm_send(cmd, reply);
++	if (err) {
++		return err;
++	}
++	uint32_t status = reply[1] >> 24;
++	if (status) {
++		HU_LOG("HUSKY ACPM: PMIC update %x:%02x status %u\n", type, reg, status);
++		return EIO;
++	}
++	return 0;
++}
++
++#endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/bsd/dev/husky_acpm.h b/bsd/dev/husky_acpm.h
+new file mode 100644
+index 0000000..d8f5268
+--- /dev/null
++++ b/bsd/dev/husky_acpm.h
+@@ -0,0 +1,32 @@
++/*
++ * HUSKY: polled ACPM IPC client and S2MPG14 PMIC register access
++ * (bsd/dev/husky_acpm.h), Google Tensor G3 ("zuma").
++ */
++#ifndef _HUSKY_ACPM_H
++#define _HUSKY_ACPM_H
++
++#include <sys/types.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* S2MPG14 register banks (ACPM MFD "type" field) */
++#define HUSKY_PMIC_TYPE_COMMON  0x0u
++#define HUSKY_PMIC_TYPE_PM      0x1u
++
++/*
++ * Map the APM SRAM and mailbox and find the PMIC channel in the firmware's
++ * initdata. Returns 0 when the channel looks sane; nothing is sent.
++ */
++int husky_acpm_init(void);
++
++/* One S2MPG14 register read / masked update over ACPM (speedy channel 0). */
++int husky_pmic_read(uint8_t type, uint8_t reg, uint8_t *val);
++int husky_pmic_update(uint8_t type, uint8_t reg, uint8_t val, uint8_t mask);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _HUSKY_ACPM_H */
+diff --git a/bsd/dev/husky_fts.c b/bsd/dev/husky_fts.c
+index 84a883d..33143c5 100644
+--- a/bsd/dev/husky_fts.c
++++ b/bsd/dev/husky_fts.c
+@@ -12,6 +12,8 @@
+  * - huskytouchinv=0/1: invert both axes (default 0: the IC reports panel pixels,
+  *   0..1343 x 0..2991, DT st,max-coords).
+  * - huskytouchdebug=1: verbose event logging.
++ * - huskytouchpwr=0: only read the touch rails over ACPM, never enable them
++ *   (default 1: enable LDO25M/LDO4M if they are off).
+  *
+  * FTM5 SPI protocol (google-modules touch/fts/ftm5, SPI build): hardware
+  * registers are read with 0xFB and written with 0xFA, each followed by a
+@@ -37,6 +39,7 @@
+ #include "husky_spi.h"
+ #include "husky_gpio.h"
+ #include "husky_fts.h"
++#include "husky_acpm.h"
+ #include "../../iokit/Kernel/arm/hid/HuskyHIDTouch.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
+@@ -100,12 +103,71 @@ fts_fifo_read(uint8_t ev[FTS_EVENT_SIZE])
+ 	return husky_spi_write_read_dummy(&cmd, 1, ev, FTS_EVENT_SIZE, 1);
+ }
+ 
++/*
++ * Touch rails on the S2MPG14 (zuma-common-touch.dtsi / zuma-husky-touch.dtsi):
++ * DVDD = LDO25M 1.8 V, AVDD = LDO4M 3.3 V, enabled in that order like the
++ * FTM5 driver. Neither is boot-on in the DT, and ABL leaves the IC in reset.
++ * Control registers (PM bank): bit 7 enable, bits 5:0 voltage selector;
++ * LDO25M 0.7 V + 25 mV steps -> 0x2c, LDO4M 1.8 V + 25 mV steps -> 0x3c.
++ * A rail that is already on keeps its voltage.
++ */
++#define PMIC_LDO_EN             0x80u
++#define PMIC_LDO_VSEL           0x3fu
++
++static const struct {
++	const char *name;
++	uint8_t reg;
++	uint8_t vsel;
++} fts_rails[] = {
++	{"LDO25M DVDD 1.8V", 0x43, 0x2c},
++	{"LDO4M AVDD 3.3V", 0x2e, 0x3c},
++};
++
++static void
++fts_power_on(bool enable)
++{
++	uint8_t chipid = 0;
++	int err = husky_acpm_init();
++	if (err) {
++		HU_LOG("HUSKY TOUCH: ACPM unavailable (%d); rails untouched\n", err);
++		return;
++	}
++	err = husky_pmic_read(HUSKY_PMIC_TYPE_COMMON, 0x0b, &chipid);
++	HU_LOG("HUSKY TOUCH: S2MPG14 CHIPID 0x%02x (err %d)\n", chipid, err);
++	if (err) {
++		return;
++	}
++
++	for (unsigned i = 0; i < sizeof(fts_rails) / sizeof(fts_rails[0]); i++) {
++		uint8_t v = 0;
++		err = husky_pmic_read(HUSKY_PMIC_TYPE_PM, fts_rails[i].reg, &v);
++		HU_LOG("HUSKY TOUCH: %s ctrl 0x%02x = 0x%02x (err %d)\n",
++		    fts_rails[i].name, fts_rails[i].reg, v, err);
++		if (err || !enable || (v & PMIC_LDO_EN)) {
++			continue;
++		}
++		if ((v & PMIC_LDO_VSEL) != fts_rails[i].vsel) {
++			err = husky_pmic_update(HUSKY_PMIC_TYPE_PM, fts_rails[i].reg,
++			    fts_rails[i].vsel, PMIC_LDO_VSEL);
++		}
++		if (!err) {
++			err = husky_pmic_update(HUSKY_PMIC_TYPE_PM, fts_rails[i].reg,
++			    PMIC_LDO_EN, PMIC_LDO_EN);
++		}
++		uint8_t after = 0;
++		(void)husky_pmic_read(HUSKY_PMIC_TYPE_PM, fts_rails[i].reg, &after);
++		HU_LOG("HUSKY TOUCH: %s enable err %d, ctrl now 0x%02x\n",
++		    fts_rails[i].name, err, after);
++		fts_sleep_ms(1);
++	}
++}
++
+ /*
+  * Common bring-up: USI/SPI, reset line, reset pulse, wait for
+  * CONTROLLER_READY, chip ID. Returns 0 when the chip ID matches.
+  */
+ static int
+-fts_bringup(void)
++fts_bringup(bool power)
+ {
+ 	uint8_t ev[FTS_EVENT_SIZE];
+ 	uint8_t id[3];
+@@ -127,9 +189,12 @@ fts_bringup(void)
+ 	}
+ 	HU_LOG("HUSKY TOUCH: irq line %d after GPIO init\n", husky_gpio_irq_get());
+ 
+-	HU_LOG("HUSKY TOUCH: reset pulse (gpp21-2 low 10 ms, high)\n");
++	/* Rails up with the IC held in reset, then the reset pulse. */
+ 	husky_gpio_reset_set(0);
++	fts_power_on(power);
+ 	fts_sleep_ms(10);
++	HU_LOG("HUSKY TOUCH: reset released after power-up (irq line %d)\n",
++	    husky_gpio_irq_get());
+ 	husky_gpio_reset_set(1);
+ 
+ 	/* The IC queues CONTROLLER_READY once its firmware is up. */
+@@ -168,6 +233,7 @@ husky_fts_thread(__unused void *arg, __unused wait_result_t wr)
+ 	uint32_t poll_ms = 10;
+ 	uint32_t invert = 0;
+ 	uint32_t debug_log = 0;
++	uint32_t power = 1;
+ 	uint8_t ev[FTS_EVENT_SIZE];
+ 	unsigned poll_errors = 0;
+ 	bool seen_first_touch = false;
+@@ -178,6 +244,7 @@ husky_fts_thread(__unused void *arg, __unused wait_result_t wr)
+ 	(void)PE_parse_boot_argn("huskytouchpoll", &poll_ms, sizeof(poll_ms));
+ 	(void)PE_parse_boot_argn("huskytouchinv", &invert, sizeof(invert));
+ 	(void)PE_parse_boot_argn("huskytouchdebug", &debug_log, sizeof(debug_log));
++	(void)PE_parse_boot_argn("huskytouchpwr", &power, sizeof(power));
+ 
+ 	if (enabled == 0) {
+ 		HU_LOG("HUSKY TOUCH: idle (opt-in via boot-arg huskytouch=1 or huskytouch=2)\n");
+@@ -196,7 +263,7 @@ husky_fts_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ 	(void)husky_gpio_probe_dump();
+ 
+-	err = fts_bringup();
++	err = fts_bringup(power != 0);
+ 	if (enabled == 2 || err) {
+ 		HU_LOG("HUSKY TOUCH: %s (bring-up %d)\n",
+ 		    enabled == 2 ? "probe finished, no scanning" : "giving up", err);
