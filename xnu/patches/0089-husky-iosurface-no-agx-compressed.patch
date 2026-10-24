@@ -1,0 +1,48 @@
+diff --git a/iokit/Kernel/arm/HuskySurface.cpp b/iokit/Kernel/arm/HuskySurface.cpp
+index 0a39020..f70ee99 100644
+--- a/iokit/Kernel/arm/HuskySurface.cpp
++++ b/iokit/Kernel/arm/HuskySurface.cpp
+@@ -38,6 +38,7 @@
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
++#include <pexpert/pexpert.h>
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -276,6 +277,17 @@ husky_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
+ 	return (uint32_t)((row + HUSKY_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(HUSKY_SURFACE_ROW_ALIGN - 1));
+ }
+ 
++static bool
++husky_surface_allow_compressed(void)
++{
++	static int allow = -1;
++	if (allow < 0) {
++		uint32_t v = 0;
++		allow = (PE_parse_boot_argn("huskysurfcompressed", &v, sizeof(v)) && v) ? 1 : 0;
++	}
++	return allow == 1;
++}
++
+ /* Geometry from the creation properties (IOSurface.h keys). */
+ static IOReturn
+ husky_surface_layout(HuskySurface *s, OSDictionary *props)
+@@ -288,6 +300,17 @@ husky_surface_layout(HuskySurface *s, OSDictionary *props)
+ 	s->elementWidth = (uint8_t)husky_dict_u32(props, "IOSurfaceElementWidth", 1);
+ 	s->elementHeight = (uint8_t)husky_dict_u32(props, "IOSurfaceElementHeight", 1);
+ 	s->pixelFormat = husky_dict_u32(props, "IOSurfacePixelFormat", 0);
++	/*
++	 * Formats with a leading '&' ('&w3r', ...) are AGX lossless-compressed:
++	 * only Apple's GPU can read them. backboardd's CPU renderer created one
++	 * for an asynchronous (EDR) layer and then asserted in
++	 * CA::OGL::Context::push_surface, the surface not being one it can track
++	 * (boots 0084, 0087; never in boots without a '&' surface). Refused, so CA
++	 * takes its no-buffer path; huskysurfcompressed=1 allows them again.
++	 */
++	if ((s->pixelFormat >> 24) == '&' && !husky_surface_allow_compressed()) {
++		return kIOReturnUnsupported;
++	}
+ 	s->cacheMode = husky_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = husky_dict_u32(props, "IOSurfaceOffset", 0);
+ 	if (s->width > HUSKY_SURFACE_MAX_DIM || s->height > HUSKY_SURFACE_MAX_DIM ||
