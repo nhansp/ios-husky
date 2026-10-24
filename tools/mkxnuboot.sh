@@ -33,9 +33,14 @@ echo ">> building shim"
 ( cd shim && bash build.sh >/dev/null )
 echo ">> building ADT"
 python3 -I tools/mkadt.py out/boot/husky.adt "${EXTRA[@]}"
-echo ">> building payload"
+# Mali CSF firmware for xnu's GPU bring-up (bsd/dev/husky_gpu.c), handed over
+# as /chosen/memory-map HuskyGPUFW; pulled from the phone's /vendor/firmware
+# (gitignored). GPUFW= (empty) leaves it out.
+GPUFW=${GPUFW-artifacts/gpu-fw/mali_csffw-r54p3.bin}
+[[ -n "$GPUFW" && -f "$GPUFW" ]] || GPUFW=
+echo ">> building payload${GPUFW:+ (+ $GPUFW)}"
 python3 -I tools/mkpayload.py "$KERNEL" out/boot/husky.adt out/boot/payload.bin \
-	--cmdline "$CMDLINE" ${RAMDISK:+--ramdisk "$RAMDISK"}
+	--cmdline "$CMDLINE" ${RAMDISK:+--ramdisk "$RAMDISK"} ${GPUFW:+--blob "HuskyGPUFW=$GPUFW"}
 echo ">> embedding payload in kernel image (appended at _end; image_size patched)"
 # ABL drops the boot.img ramdisk on `fastboot boot`, so the payload rides in
 # the kernel section itself: shim/out/Image is already padded to _end, so the

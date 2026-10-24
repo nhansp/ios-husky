@@ -135,6 +135,16 @@ def apply_chained_fixups(buf, m):
     return auth
 
 
+def add_memmap_to_adt(adt_blob, name, phys, size):
+    """One more /chosen/memory-map entry NAME = <phys, size>."""
+    root, _ = adt.parse(adt_blob)
+    chosen = next(c for c in root.children if c.name == 'chosen')
+    mmap = next(c for c in chosen.children if c.name == 'memory-map')
+    assert mmap.prop(name) is None, f'ADT already has {name}'
+    mmap.props.append((name, 0, struct.pack('<2Q', phys, size)))
+    return adt.serialize(root)
+
+
 def add_ramdisk_to_adt(adt_blob, phys, size):
     root, _ = adt.parse(adt_blob)
     chosen = next(c for c in root.children if c.name == 'chosen')
@@ -151,7 +161,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=()):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     auth = apply_chained_fixups(buf, m)
@@ -177,6 +187,18 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
         pieces.append((rd_va, rd_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
+    extra = []
+    for name, path in blobs:
+        # Like the ramdisk: a page-aligned segment past the kernel, found by
+        # the kernel through /chosen/memory-map NAME (e.g. HuskyGPUFW).
+        data = open(path, 'rb').read()
+        b_size = (len(data) + PAGE - 1) & ~(PAGE - 1)
+        b_va = kernel_end
+        kernel_end = b_va + b_size
+        b_pa = b_va - virt_base + PHYS_BASE
+        pieces.append((b_va, b_size, data))
+        adt_blob = add_memmap_to_adt(adt_blob, name, b_pa, len(data))
+        extra.append((name, hex(b_pa), hex(len(data))))
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -208,7 +230,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], virt_base=hex(virt_base),
                 entry=hex(m['entry']), kernel_end=hex(kernel_end), phys_base=hex(PHYS_BASE),
                 mem_size=hex(MEM_SIZE), auth_fixups=len(auth), auth_off=hex(auth_off),
-                ramdisk=ramdisk, size=len(out),
+                ramdisk=ramdisk, blobs=extra, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -218,8 +240,11 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1 -v -enable_kprintf_spam startup_debug=1 -noprogress')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--blob', action='append', default=[], metavar='NAME=FILE',
+                    help='extra boot blob, /chosen/memory-map NAME = <phys, size> (repeatable)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blobs = [tuple(b.split('=', 1)) for b in a.blob]
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, blobs)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
