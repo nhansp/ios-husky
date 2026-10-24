@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 2b546d1..64d14df 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -354,6 +354,26 @@ gpu_fault_dump(const char *why)
+ 	s2mpu_dump(why);
+ }
+ 
++/*
++ * Clean+invalidate to PoC by VA. XNU's flush_dcache64 is a bare dsb here:
++ * the HUSKY config inherits Apple's __ARM_COHERENT_IO__ (all DMA coherent),
++ * true for zuma's UFS but not for the GPU. Boots 0091-0093: the GPU read the
++ * page tables from stale DRAM (level-0 translation fault at VA 0).
++ */
++static void
++husky_dcache_flush(vm_offset_t va, size_t len)
++{
++	uint64_t ctr;
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	size_t line = 4u << ((ctr >> 16) & 0xf);        /* DminLine, words */
++	vm_offset_t p = va & ~(vm_offset_t)(line - 1);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (; p < va + len; p += line) {
++		__asm__ volatile ("dc civac, %0" : : "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ /* Simple word copies: the targets may be Device/NC mappings (no dc zva). */
+ static void
+ copy_bytes(volatile uint8_t *dst, const uint8_t *src, size_t n)
+@@ -550,8 +570,7 @@ husky_gpu_mcu_boot(void)
+ 	}
+ 	HU_LOG("HUSKY GPU: %u sections mapped, %u page-table pages\n", nsec, pt_used);
+ 	/* Push everything to DRAM: the GPU walks and reads non-coherently. */
+-	flush_dcache64((addr64_t)kva, (unsigned)region, FALSE);
+-	__asm__ volatile ("dsb sy" ::: "memory");
++	husky_dcache_flush(kva, region);
+ 
+ 	struct fw_section *sh = NULL;
+ 	for (unsigned i = 0; i < nsec; i++) {
