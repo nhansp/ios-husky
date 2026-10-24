@@ -1,0 +1,31 @@
+name: sdk-hid-headers
+
+# One-off: collect the IOHIDFamily event headers (IOHIDEventStructDefs.h etc.)
+# that Xcode 26's SDKs ship, for the iOS 26 HID event ABI (the public
+# IOHIDFamily source omits these generated headers since 2222).
+on:
+  workflow_dispatch:
+
+jobs:
+  headers:
+    runs-on: macos-26
+    steps:
+      - name: Collect
+        run: |
+          set -x
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          mkdir -p out
+          for sdk in macosx iphoneos driverkit; do
+            p=$(xcrun --sdk $sdk --show-sdk-path 2>/dev/null) || continue
+            echo "$sdk $p" >> out/sdks.txt
+            find "$p" \( -name 'IOHIDEvent*.h' -o -name 'IOHIDUsageTables.h' -o -name 'IOHIDKeys.h' \) 2>/dev/null | while read -r f; do
+              d="out/$sdk/$(dirname "${f#$p/}")"
+              mkdir -p "$d" && cp "$f" "$d/"
+            done
+          done
+          find out -type f | sort
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdk-hid-headers
+          path: out
