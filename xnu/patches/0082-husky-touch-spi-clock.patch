@@ -1,0 +1,298 @@
+diff --git a/bsd/dev/husky_fts.c b/bsd/dev/husky_fts.c
+index 9f8d959..84a883d 100644
+--- a/bsd/dev/husky_fts.c
++++ b/bsd/dev/husky_fts.c
+@@ -117,11 +117,15 @@ fts_bringup(void)
+ 		HU_LOG("HUSKY TOUCH: SPI init failed (%d)\n", err);
+ 		return err;
+ 	}
++	/* Clock/FIFO self-test, independent of the touch IC and its rails. */
++	(void)husky_spi_loopback_test();
++
+ 	err = husky_gpio_init();
+ 	if (err) {
+ 		HU_LOG("HUSKY TOUCH: GPIO init failed (%d)\n", err);
+ 		return err;
+ 	}
++	HU_LOG("HUSKY TOUCH: irq line %d after GPIO init\n", husky_gpio_irq_get());
+ 
+ 	HU_LOG("HUSKY TOUCH: reset pulse (gpp21-2 low 10 ms, high)\n");
+ 	husky_gpio_reset_set(0);
+@@ -136,7 +140,8 @@ fts_bringup(void)
+ 			HU_LOG("HUSKY TOUCH: FIFO read err %d\n", err);
+ 			break;
+ 		}
+-		if (ev[0] != FTM5_EVT_NO_EVENT) {
++		/* The first read shows what an idle or unpowered IC returns (00 / ff). */
++		if (ev[0] != FTM5_EVT_NO_EVENT || t == 0) {
+ 			HU_LOG("HUSKY TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x\n",
+ 			    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
+ 		}
+diff --git a/bsd/dev/husky_gpio.c b/bsd/dev/husky_gpio.c
+index aec32d0..8c12f44 100644
+--- a/bsd/dev/husky_gpio.c
++++ b/bsd/dev/husky_gpio.c
+@@ -187,6 +187,13 @@ husky_gpio_init(void)
+ 	con &= ~(0xfu << (HUSKY_IRQ_PIN * 4)); /* input */
+ 	gpio_wr(gpn0, REG_GPIO_CON, con);
+ 
++	/*
++	 * No pulls on either pin (DT ts_reset/ts_irq: EXYNOS_PIN_PULL_NONE; PUD is
++	 * a nibble per pin here). ABL leaves both pulled down (boot 0081).
++	 */
++	gpio_wr(gpp21, REG_GPIO_PUD, init_gpp21_pud & ~(0xfu << (HUSKY_RESET_PIN * 4)));
++	gpio_wr(gpn0, REG_GPIO_PUD, init_gpn0_pud & ~(0xfu << (HUSKY_IRQ_PIN * 4)));
++
+ 	husky_gpio_initialized = true;
+ 	lck_mtx_unlock(&husky_gpio_lock);
+ 
+diff --git a/bsd/dev/husky_spi.c b/bsd/dev/husky_spi.c
+index 7496d05..97f165f 100644
+--- a/bsd/dev/husky_spi.c
++++ b/bsd/dev/husky_spi.c
+@@ -40,6 +40,29 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define HUSKY_CMU_HSI0_PA       0x11000000ULL
+ #define HUSKY_CMU_HSI0_SIZE     0x8000ULL
+ 
++/*
++ * spi@111D0000 is USI2_HSI0; its ipclk comes from CMU_HSI0 (zuma cal-if
++ * cmucal-sfr.c): MUX_CLK_HSI0_USI2 (bit 0: 0 = CLKCMU_HSI0_PERI from CMU_TOP,
++ * 1 = OSCCLK 24.576 MHz) -> GATE_CLK_HSI0_USI2 -> DIV_CLK_HSI0_USI2 (bits 3:0)
++ * -> the IPCLK/RSTNSYNC gates; PCLK hangs off the HSI0 NOC. Gates: bit 20 =
++ * MANUAL, bit 21 = CG_VAL (pass when MANUAL). QCH: bit 0 ENABLE (hardware
++ * handshake), bit 1 CLOCK_REQ. The SPI divides ipclk by 4 for SCLK.
++ */
++#define CMU_PERI_USER_CON0      0x0680u
++#define CMU_MUX_USI2            0x101cu
++#define CMU_DIV_USI2            0x181cu
++#define CMU_GATE_USI2           0x2120u
++#define CMU_GATE_USI2_IPCLK     0x20fcu
++#define CMU_GATE_USI2_PCLK      0x2100u
++#define CMU_GATE_USI2_RSTNSYNC  0x20bcu
++#define CMU_QCH_USI2            0x30ccu
++#define CMU_BUSY                (1u << 16)
++#define CMU_GATE_MANUAL         (1u << 20)
++#define CMU_GATE_CG_VAL         (1u << 21)
++#define CMU_QCH_ENABLE          (1u << 0)
++#define CMU_QCH_CLOCK_REQ       (1u << 1)
++#define CMU_MUX_USI2_OSCCLK     1u
++
+ /* Physical addresses for USI & SPI */
+ #define HUSKY_SPI_PA            0x111d0000ULL
+ #define HUSKY_SPI_SIZE          0x1000ULL
+@@ -98,6 +121,9 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define ST_RX_FIFORDY          (1u << 1)
+ #define ST_TX_FIFORDY          (1u << 0)
+ 
++/* MODE_CFG: internal TX -> RX loopback */
++#define MODE_SELF_LOOPBACK     (1u << 3)
++
+ /* PACKET_CNT */
+ #define PACKET_CNT_EN          (1u << 16)
+ 
+@@ -245,6 +271,75 @@ husky_spi_probe_dump(void)
+ 	return 0;
+ }
+ 
++static void
++husky_cmu_dump(vm_offset_t cmu, const char *when)
++{
++	HU_LOG("HUSKY SPI: CMU_HSI0 USI2 %s: peri_user 0x%x mux 0x%x div 0x%x gate 0x%x "
++	    "ipclk 0x%x pclk 0x%x rstnsync 0x%x qch 0x%x\n", when,
++	    *(volatile uint32_t *)(cmu + CMU_PERI_USER_CON0),
++	    *(volatile uint32_t *)(cmu + CMU_MUX_USI2),
++	    *(volatile uint32_t *)(cmu + CMU_DIV_USI2),
++	    *(volatile uint32_t *)(cmu + CMU_GATE_USI2),
++	    *(volatile uint32_t *)(cmu + CMU_GATE_USI2_IPCLK),
++	    *(volatile uint32_t *)(cmu + CMU_GATE_USI2_PCLK),
++	    *(volatile uint32_t *)(cmu + CMU_GATE_USI2_RSTNSYNC),
++	    *(volatile uint32_t *)(cmu + CMU_QCH_USI2));
++}
++
++static void
++husky_cmu_wait_idle(vm_offset_t cmu, uint32_t off)
++{
++	for (unsigned i = 0; i < 1000; i++) {
++		if (!(*(volatile uint32_t *)(cmu + off) & CMU_BUSY)) {
++			return;
++		}
++		delay(1);
++	}
++	HU_LOG("HUSKY SPI: CMU 0x%x stays busy\n", off);
++}
++
++static void
++husky_cmu_rmw(vm_offset_t cmu, uint32_t off, uint32_t clear, uint32_t set)
++{
++	volatile uint32_t *reg = (volatile uint32_t *)(cmu + off);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*reg = (*reg & ~clear) | set;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/*
++ * Give USI2 a running ipclk that does not depend on CMU_TOP: OSCCLK through
++ * the mux, divide by 1 (SCLK = 24.576 MHz / 4 = 6.1 MHz, FTM5 takes up to
++ * 10 MHz), every gate on the path forced on, Q-channel handshake off with the
++ * clock requested. Linux leaves these gates to hardware auto-gating and only
++ * sets the mux/divider rate; boot 0081's transfers never clocked a byte.
++ */
++static void
++husky_spi_clock_setup(void)
++{
++	vm_offset_t cmu = ml_io_map(HUSKY_CMU_HSI0_PA, HUSKY_CMU_HSI0_SIZE);
++	if (!cmu) {
++		HU_LOG("HUSKY SPI: failed to map CMU_HSI0\n");
++		return;
++	}
++	husky_cmu_dump(cmu, "before");
++
++	husky_cmu_rmw(cmu, CMU_MUX_USI2, 0x1u, CMU_MUX_USI2_OSCCLK);
++	husky_cmu_wait_idle(cmu, CMU_MUX_USI2);
++	husky_cmu_rmw(cmu, CMU_DIV_USI2, 0xfu, 0);
++	husky_cmu_wait_idle(cmu, CMU_DIV_USI2);
++
++	const uint32_t gates[] = {CMU_GATE_USI2, CMU_GATE_USI2_IPCLK,
++		                  CMU_GATE_USI2_PCLK, CMU_GATE_USI2_RSTNSYNC};
++	for (unsigned i = 0; i < sizeof(gates) / sizeof(gates[0]); i++) {
++		husky_cmu_rmw(cmu, gates[i], 0, CMU_GATE_MANUAL | CMU_GATE_CG_VAL);
++	}
++	husky_cmu_rmw(cmu, CMU_QCH_USI2, CMU_QCH_ENABLE, CMU_QCH_CLOCK_REQ);
++	delay(10);
++
++	husky_cmu_dump(cmu, "after");
++}
++
+ static void
+ husky_spi_flush(void)
+ {
+@@ -318,6 +413,8 @@ husky_spi_init(void)
+ 		}
+ 	}
+ 
++	husky_spi_clock_setup();
++
+ 	sysreg_base = ml_io_map(sysreg_pa, sysreg_sz);
+ 	if (!sysreg_base) {
+ 		HU_LOG("HUSKY SPI: failed to map USI sysreg at 0x%llx\n", sysreg_pa);
+@@ -429,7 +526,9 @@ husky_spi_transfer(const uint8_t *tx, uint8_t *rx, size_t len)
+ 		spi_wr(REG_PENDING_CLR, 0x1fu);
+ 		spi_wr(REG_PENDING_CLR, 0);
+ 
+-		/* Set packet count for the chunk */
++		/* Packet count, then its enable bit, as two writes (Google's driver) */
++		spi_wr(REG_PACKET_CNT, 0);
++		spi_wr(REG_PACKET_CNT, (uint32_t)(chunk & 0xffffu));
+ 		spi_wr(REG_PACKET_CNT, (uint32_t)(chunk & 0xffffu) | PACKET_CNT_EN);
+ 
+ 		/* Push bytes into TX FIFO */
+@@ -467,14 +566,20 @@ husky_spi_transfer(const uint8_t *tx, uint8_t *rx, size_t len)
+ 			}
+ 		}
+ 
++		uint32_t st_end = spi_rd(REG_STATUS);
++		uint32_t mode_end = spi_rd(REG_MODE_CFG);
++		uint32_t pkt_end = spi_rd(REG_PACKET_CNT);
++
+ 		/* Disable channels */
+ 		ch &= ~(CH_RXCH_ON | CH_TXCH_ON);
+ 		spi_wr(REG_CH_CFG, ch);
+ 		spi_wr(REG_PACKET_CNT, 0);
+ 
+ 		if (received < chunk) {
+-			HU_LOG("HUSKY SPI: transfer timeout (expected %zu, got %zu)\n",
+-			    chunk, received);
++			HU_LOG("HUSKY SPI: transfer timeout (expected %zu, got %zu) STATUS 0x%x "
++			    "(tx lvl %u rx lvl %u) CH_CFG 0x%x MODE_CFG 0x%x PACKET_CNT 0x%x\n",
++			    chunk, received, st_end, ST_TX_FIFO_LVL(st_end),
++			    ST_RX_FIFO_LVL(st_end), ch, mode_end, pkt_end);
+ 			husky_spi_flush();
+ 			err = ETIMEDOUT;
+ 			break;
+@@ -510,31 +615,51 @@ int
+ husky_spi_write_read_dummy(const uint8_t *tx, size_t tx_len,
+     uint8_t *rx, size_t rx_len, size_t dummy_len)
+ {
+-	husky_spi_cs(1);
+-	delay(2); /* CS clock delay (cs-clock-delay = 2 from DT) */
+-
+-	int err = 0;
++	/* One full-duplex run under one CS: command, dummy bytes, then data. */
++	uint8_t out[128];
++	uint8_t in[128];
++	size_t total = tx_len + dummy_len + rx_len;
++	if (total == 0) {
++		return 0;
++	}
++	if (total > sizeof(out)) {
++		return EINVAL;
++	}
++	bzero(out, total);
+ 	if (tx_len > 0) {
+-		err = husky_spi_write(tx, tx_len);
++		memcpy(out, tx, tx_len);
+ 	}
+ 
+-	if (!err && dummy_len > 0) {
+-		uint8_t dummy_buf[16];
+-		size_t rem = dummy_len;
+-		while (rem > 0 && !err) {
+-			size_t chunk = (rem > sizeof(dummy_buf)) ? sizeof(dummy_buf) : rem;
+-			err = husky_spi_read(dummy_buf, chunk);
+-			rem -= chunk;
+-		}
+-	}
++	husky_spi_cs(1);
++	delay(2); /* CS clock delay (cs-clock-delay = 2 from DT) */
++	int err = husky_spi_transfer(out, in, total);
++	delay(10); /* FTM5 SPI_DELAY_CS */
++	husky_spi_cs(0);
+ 
+ 	if (!err && rx_len > 0) {
+-		err = husky_spi_read(rx, rx_len);
++		memcpy(rx, in + tx_len + dummy_len, rx_len);
+ 	}
+-
+-	delay(2);
+-	husky_spi_cs(0);
+ 	return err;
+ }
+ 
++int
++husky_spi_loopback_test(void)
++{
++	static const uint8_t pattern[8] = {0xa5, 0x5a, 0x00, 0xff, 0x36, 0x40, 0x81, 0x7e};
++	uint8_t in[sizeof(pattern)];
++
++	if (!husky_spi_initialized || !spi_base) {
++		return ENXIO;
++	}
++	bzero(in, sizeof(in));
++	spi_wr(REG_MODE_CFG, spi_rd(REG_MODE_CFG) | MODE_SELF_LOOPBACK);
++	int err = husky_spi_transfer(pattern, in, sizeof(pattern));
++	spi_wr(REG_MODE_CFG, spi_rd(REG_MODE_CFG) & ~MODE_SELF_LOOPBACK);
++
++	bool match = !err && memcmp(in, pattern, sizeof(pattern)) == 0;
++	HU_LOG("HUSKY SPI: loopback %s (err %d): %02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    match ? "OK" : "FAILED", err, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7]);
++	return match ? 0 : (err ? err : EIO);
++}
++
+ #endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/bsd/dev/husky_spi.h b/bsd/dev/husky_spi.h
+index aef193b..b2c3eec 100644
+--- a/bsd/dev/husky_spi.h
++++ b/bsd/dev/husky_spi.h
+@@ -72,6 +72,12 @@ int husky_spi_write_read(const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t r
+ int husky_spi_write_read_dummy(const uint8_t *tx, size_t tx_len,
+     uint8_t *rx, size_t rx_len, size_t dummy_len);
+ 
++/*
++ * Controller self-test with MODE_CFG internal loopback: an 8-byte pattern must
++ * come back unchanged. Proves the ipclk and FIFOs independently of the slave.
++ */
++int husky_spi_loopback_test(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
