@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/husky_acpm.c b/bsd/dev/husky_acpm.c
-index 8003cfb..c731eea 100644
+index 8003cfb..efae10c 100644
 --- a/bsd/dev/husky_acpm.c
 +++ b/bsd/dev/husky_acpm.c
 @@ -45,6 +45,7 @@
@@ -10,7 +10,19 @@ index 8003cfb..c731eea 100644
  #include <pexpert/pexpert.h>
  #include "husky_acpm.h"
  
-@@ -409,6 +410,8 @@ husky_tmu_read(uint32_t zone, int *celsius)
+@@ -403,18 +404,24 @@ husky_tmu_read(uint32_t zone, int *celsius)
+ /*
+  * Thermal watch: nothing else manages temperature here. Every 10 s read the
+  * CPU and GPU zones, log them every 30 s, and when a CPU zone reaches
+- * huskytemphot (default 85 C) step the A715 and X3 clusters down to
+- * HUSKY_THROTTLE_KHZ; back to the requested rates 10 C below.
++ * huskytemphot (default 70 C) step the A715 and X3 clusters down to
++ * HUSKY_THROTTLE_KHZ; back to the requested rates 10 C below. Pixel's
++ * thermal HAL (/vendor/etc/thermal_info_config.json) throttles on a skin
++ * estimate from board NTCs (soc/north/cam/charge/disp/quiet/usb thermistors
++ * and the battery) at 37..55 C, which is well below die temperature; until
++ * those NTCs are read through the PMIC ADC, a conservative die threshold.
+  */
  #define HUSKY_THROTTLE_KHZ      1500000u
  
  static uint32_t dvfs_req_cl1, dvfs_req_cl2;
@@ -19,7 +31,14 @@ index 8003cfb..c731eea 100644
  
  static void
  husky_thermal_thread(__unused void *arg, __unused wait_result_t wr)
-@@ -436,15 +439,17 @@ husky_thermal_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	static const char *names[] = {"BIG", "MID", "LITTLE", "G3D"};
+-	uint32_t hot = 85;
++	uint32_t hot = 70;
+ 	bool throttled = false;
+ 	int chan;
+ 
+@@ -436,15 +443,17 @@ husky_thermal_thread(__unused void *arg, __unused wait_result_t wr)
  		}
  		if (!throttled && cpu_max >= (int)hot) {
  			throttled = true;
@@ -39,7 +58,7 @@ index 8003cfb..c731eea 100644
  				(void)husky_dvfs_set(HUSKY_DVFS_CPUCL2, dvfs_req_cl2);
  			}
  			HU_LOG("HUSKY TEMP: %d C: A715/X3 back to the requested rates\n", cpu_max);
-@@ -454,6 +459,108 @@ husky_thermal_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -454,6 +463,108 @@ husky_thermal_thread(__unused void *arg, __unused wait_result_t wr)
  	}
  }
  
@@ -148,7 +167,7 @@ index 8003cfb..c731eea 100644
  static const struct {
  	uint32_t domain;
  	const char *name;
-@@ -516,6 +623,17 @@ husky_dvfs_report(void)
+@@ -516,6 +627,17 @@ husky_dvfs_report(void)
  			thread_deallocate(thread);
  		}
  	}
