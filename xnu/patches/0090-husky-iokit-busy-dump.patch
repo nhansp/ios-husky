@@ -1,0 +1,74 @@
+diff --git a/iokit/Kernel/arm/HuskyPlatformExpert.cpp b/iokit/Kernel/arm/HuskyPlatformExpert.cpp
+index 96ae7ba..f480384 100644
+--- a/iokit/Kernel/arm/HuskyPlatformExpert.cpp
++++ b/iokit/Kernel/arm/HuskyPlatformExpert.cpp
+@@ -68,6 +68,56 @@ husky_halt_restart(unsigned int type)
+ 	return -1;
+ }
+ 
++/*
++ * IOKit quiet diagnostic: SystemConfiguration (configd's InterfaceNamer)
++ * waits for the registry to go quiet before listing network interfaces, and
++ * Settings' main thread blocked forever in __wait_for_IOKit_to_quiesce
++ * (boot 0089b). Log every service whose busy state never drops to zero.
++ */
++extern "C" kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern "C" void thread_deallocate(thread_t);
++extern "C" thread_t current_thread(void);
++extern "C" kern_return_t thread_terminate(thread_t);
++
++static void
++husky_busy_dump(const char *when)
++{
++	IOService *root = IOService::getServiceRoot();
++	unsigned n = 0;
++	kprintf("HUSKY BUSY: %s root busy %u\n", when, root ? root->getBusyState() : 0);
++	IOLog("HUSKY BUSY: %s root busy %u\n", when, root ? root->getBusyState() : 0);
++	IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
++	if (it == NULL) {
++		return;
++	}
++	IORegistryEntry *e;
++	while ((e = it->getNextObject()) != NULL) {
++		IOService *svc = OSDynamicCast(IOService, e);
++		if (svc == NULL || svc->getBusyState() == 0) {
++			continue;
++		}
++		IOService *prov = svc->getProvider();
++		IOLog("HUSKY BUSY: %s busy %u (%s) provider %s state 0x%x\n", svc->getName(),
++		    svc->getBusyState(), svc->getMetaClass()->getClassName(),
++		    prov ? prov->getName() : "-", (unsigned)svc->getState());
++		if (++n >= 64) {
++			break;
++		}
++	}
++	it->release();
++	IOLog("HUSKY BUSY: %s %u busy services\n", when, n);
++}
++
++static void
++husky_busy_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	IOSleep(30 * 1000);
++	husky_busy_dump("t+30s");
++	IOSleep(60 * 1000);
++	husky_busy_dump("t+90s");
++	(void)thread_terminate(current_thread());
++}
++
+ OSDefineMetaClassAndStructors(HuskyPlatformExpert, IODTPlatformExpert);
+ 
+ bool
+@@ -80,6 +130,12 @@ HuskyPlatformExpert::start(IOService *provider)
+ 	registerService();
+ 	IOLog("HUSKY: platform expert registered\n");
+ 	PE_halt_restart = husky_halt_restart;
++	{
++		thread_t thread;
++		if (kernel_thread_start(husky_busy_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	}
+ 
+ 	unsigned long long t = 0;
+ 	(void)PE_parse_boot_argn("huskytime", &t, sizeof(t));
