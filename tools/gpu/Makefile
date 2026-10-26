@@ -1,6 +1,6 @@
 # tools/gpu: host-side generators for husky_gpu.c's in-kernel GPU jobs.
 #
-#   make MESA_SRC=/path/to/mesa [OUT=../../artifacts/xnu-12377/bsd/dev/husky_gpu_compute.h]
+#   make MESA_SRC=/path/to/mesa [OUT=...husky_gpu_compute.h] [ROUT=...husky_gpu_render.h]
 #
 # Mesa (MIT) is used only as a library at build time: the genxml packers and cs_builder.h, plus
 # util/ralloc.c and util/u_dynarray.c. Mesa commit 1f9035d is the one tested. Python 3 runs
@@ -9,6 +9,7 @@
 MESA_SRC ?= $(error set MESA_SRC to a Mesa checkout)
 BUILD    ?= build
 OUT      ?= ../../artifacts/xnu-12377/bsd/dev/husky_gpu_compute.h
+ROUT     ?= ../../artifacts/xnu-12377/bsd/dev/husky_gpu_render.h
 PYTHON   ?= python3
 CC       ?= cc
 CXX      ?= c++
@@ -16,11 +17,12 @@ CXX      ?= c++
 include mesa_defs.mk
 
 GENXML := $(MESA_SRC)/src/panfrost/genxml
+VALHALL := $(MESA_SRC)/src/panfrost/compiler/bifrost/valhall
 GEN    := $(BUILD)/gen
 INC    := -I$(GEN) -I$(MESA_SRC)/include -I$(MESA_SRC)/src -I$(MESA_SRC)/src/panfrost -I.
 CFLAGS_MESA := -O1 -g -w $(MESA_DEFS) $(INC)
 
-all: $(OUT)
+all: $(OUT) $(ROUT)
 
 $(GEN)/genxml/v11_pack.h $(GEN)/genxml/common_pack.h: $(GENXML)/gen_pack.py $(GENXML)/v11.xml
 	@mkdir -p $(GEN)/genxml
@@ -46,6 +48,18 @@ $(BUILD)/gen-husky-compute: gen-husky-compute.cpp mali_compute_build.h mul_add_k
 
 $(OUT): $(BUILD)/gen-husky-compute
 	$(BUILD)/gen-husky-compute $@
+
+# Render jobs (clear + triangle). The .vhasm shaders are assembled with Mesa's valhall/asm.py.
+%_kernel.h: %.vhasm vhasm.py
+	$(PYTHON) vhasm.py --valhall-dir $(VALHALL) -o $@ $<
+
+$(BUILD)/gen-husky-render: gen-husky-render.cpp mali_render_build.h tri_vs_kernel.h tri_fs_kernel.h \
+    $(GEN)/genxml/v11_pack.h $(BUILD)/ralloc.o $(BUILD)/u_dynarray.o $(BUILD)/shim.o
+	$(CXX) -std=gnu++17 $(CFLAGS_MESA) -DPAN_ARCH=11 $< $(BUILD)/ralloc.o $(BUILD)/u_dynarray.o \
+	    $(BUILD)/shim.o -o $@ -lpthread
+
+$(ROUT): $(BUILD)/gen-husky-render
+	$(BUILD)/gen-husky-render $@
 
 clean:
 	rm -rf $(BUILD)

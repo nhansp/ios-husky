@@ -1,0 +1,22 @@
+#! name tri_fs
+#! preload r60
+#! fau_slots 0
+#! work_regs 64
+#! threads_per_group 1
+#
+# Solid Colour B fragment shader for Mali-G715 (Valhall arch 11)
+# Colour B: R=1.0 (0x3F800000), G=128/255 (0x3F008081), B=64/255 (0x3E808081), A=1.0 (0x3F800000)
+# (exact k/255 values so UNORM8 conversion cannot round either way)
+# Resulting in RGBA8: [255, 128, 64, 255] = 0xFF4080FF
+# Inputs:
+#   r60: cumulative coverage mask in bits 15:0 (preloaded)
+# Outputs:
+#   BLEND to target 0 using blend_descriptor_0
+#
+FADD_IMM.f32 r0, 0x0, #0x3f800000
+FADD_IMM.f32 r1, 0x0, #0x3f008081
+FADD_IMM.f32 r2, 0x0, #0x3e808081
+# BLEND needs slots 0,1,2,6,7 settled first (Mesa va_insert_flow.c:28-29,425-429; kraid
+# required_waits.rs:12-13). A .wait takes effect after its instruction, so it sits on the FADD.
+FADD_IMM.f32.wait r3, 0x0, #0x3f800000
+BLEND.slot0.v4.f32.end @r0:r1:r2:r3, blend_descriptor_0.w0, r60, target:0x0

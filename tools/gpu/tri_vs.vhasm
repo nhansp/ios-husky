@@ -1,0 +1,19 @@
+#! name tri_vs
+#! preload r59 r60 r61
+#! fau_slots 1
+#! work_regs 64
+#! threads_per_group 1
+#
+# Pass-through vertex shader for Mali-G715 (Valhall arch 11) IDVS position variant
+# Inputs:
+#   r59: internal ID (preloaded)
+#   r60: vertex ID (preloaded)
+#   u0: 64-bit vertex buffer pointer in FAU slot 0
+# Outputs:
+#   128-bit vec4 position written to geometry buffer FIFO slot via LEA_BUF_IMM
+#
+SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:0x4
+LOAD.i128.slot0 @r8:r9:r10:r11, [r2^:r3^], offset:0
+LEA_BUF_IMM.slot1 @r4:r5, r59^, table:0xD, index:0x0
+NOP.wait01
+STORE.i128.istream.slot0.end @r8:r9:r10:r11, [r4^:r5^], offset:0
