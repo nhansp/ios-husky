@@ -239,10 +239,30 @@ def drop_mg_cache(dry):
             sys.exit('MobileGestalt cache still present')
 
 
+def rerun_migration(dry):
+    """Delete the com.apple.migration preference files (plain and ByHost) so iOS runs its first-boot
+    data migration again. On iOS 26 that migration installs the stock apps from
+    /private/var/staged_system_apps (Safari, Messages, Camera, ...); seeding LastSystemVersion made
+    iOS skip it, so only the apps in /Applications (Settings, Phone) ever appeared."""
+    pd = f'{MNT}/private/var/mobile/Library/Preferences'
+    files = su(f'ls {pd}/com.apple.migration.plist {pd}/ByHost/com.apple.migration.*.plist 2>/dev/null; true').split()
+    if not files:
+        print('no migration preferences: migration will run')
+        return
+    for f in files:
+        print(f'delete {os.path.relpath(f, MNT)}')
+        if not dry:
+            su(f'rm -f {f}')
+    if not dry and su(f'ls {pd}/com.apple.migration.plist {pd}/ByHost/com.apple.migration.*.plist 2>/dev/null; true').split():
+        sys.exit('migration preferences still present')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dry-run', action='store_true', help='mount read-only and report, write nothing')
     ap.add_argument('--timezone', default=tweaks.TIMEZONE)
+    ap.add_argument('--rerun-migration', action='store_true',
+                    help='delete the migration preferences so the first-boot migration (staged apps) runs')
     ap.add_argument('--drop-mg-cache', action='store_true',
                     help='delete the MobileGestalt cache (after an identity change)')
     args = ap.parse_args()
@@ -268,6 +288,8 @@ def main():
             set_timezone(args.timezone, args.dry_run)
             if args.drop_mg_cache:
                 drop_mg_cache(args.dry_run)
+            if args.rerun_migration:
+                rerun_migration(args.dry_run)
         finally:
             unmount()
     finally:

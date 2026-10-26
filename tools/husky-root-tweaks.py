@@ -29,7 +29,9 @@ each tweak re-checked against the real 23G90 / 26.6.2 image:
                   missing dirs are created; existing dirs are never touched.
                   NO per-group subdirs: containermanagerd deletes group dirs
                   that lack a metadata plist and self-provisions the rest.
-  migration       LastSystemVersion=23G90 (+ DMUserDataDisposition) merged into
+  migration       (only with --skip-data-migration; off by default since iOS 26 installs its stock apps
+                  from /private/var/staged_system_apps during that first-boot migration)
+                  LastSystemVersion=<build> (+ DMUserDataDisposition) merged into
                   the plain com.apple.migration.plist AND every ByHost/
                   com.apple.migration.<UUID>.plist (CurrentHost writes land in
                   ByHost now that IOPlatformUUID exists). Existing keys are kept.
@@ -401,6 +403,9 @@ def main():
     ap.add_argument('--dry-run', action='store_true', help='print every change, write nothing')
     ap.add_argument('--platform-uuid', help='IOPlatformUUID: create ByHost migration plists for it')
     ap.add_argument('--timezone', default=TIMEZONE, help=f'zoneinfo name (default {TIMEZONE})')
+    ap.add_argument('--skip-data-migration', action='store_true',
+                    help='seed LastSystemVersion so the first-boot data migration is skipped (NOT for iOS 26: '
+                    'that migration installs the stock apps from /private/var/staged_system_apps)')
     args = ap.parse_args()
     root = args.root
     if not os.path.isdir(os.path.join(root, 'System/Library/xpc')):
@@ -421,7 +426,10 @@ def main():
     activation(root)
     user_dirs(root)
     audio(root)
-    migration(root, args.platform_uuid)
+    if args.skip_data_migration:
+        migration(root, args.platform_uuid)
+    else:
+        say('migration: not seeded; iOS runs its first-boot data migration (installs the staged system apps)')
     ui(root)
     system_plists(root)
     timezone(root, args.timezone)
