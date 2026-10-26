@@ -13,6 +13,12 @@
 #   preload r60       = global invocation id x   (BI_PRELOAD_GLOBAL_ID_0, compiler.h; SPD preload bit 12)
 #   work registers    : r0..r5 + preloaded r60/r61 -> 64 registers per thread (r48..r63 only exist in that mode)
 #
+# Flow control: an instruction's .waitN takes effect AFTER that instruction (Mesa va_merge_flow.c
+# merges a wait NOP upward into the preceding instruction). So the wait for the LOAD's slot 0 sits on
+# the instruction BEFORE the first consumer. Boot 0098 had IMUL.wait0: the IMUL read r4 before the
+# load landed, the load then overwrote r4, and every result came out in + ADD (0099's imul_probe
+# isolated it: the same sequence after a NOP.wait0 is correct).
+#
 #! name mul_add
 #! preload r60 r61
 #! fau_slots 3
@@ -20,7 +26,7 @@
 #! threads_per_group 64
 SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:0x2
 LOAD.i32.unsigned.slot0 @r4, [r2^:r3^], offset:0
-SHADDX.u64 [r0:r1], u1, [r60:r61].w0, shift:0x2
-IMUL.i32.wait0 r4, r4, u2.w0
+SHADDX.u64.wait0 [r0:r1], u1, [r60:r61].w0, shift:0x2
+IMUL.i32 r4, r4, u2.w0
 IADD.u32 r4, r4^, u2.w1
 STORE.i32.slot0.end @r4, [r0^:r1^], offset:0
