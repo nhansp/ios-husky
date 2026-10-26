@@ -1,0 +1,209 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index d69a653..f683ab5 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -325,6 +325,11 @@ static const uint32_t gpu_l2_hash[3] = {0x0036DB6D, 0x005B6DB6, 0x0};
+ #define TEST_SUSPEND_MAX        0x80000u
+ #define TEST_SIZE               (TEST_SUSPEND + TEST_SUSPEND_MAX)
+ #define TEST_MAGIC              0x600DCAFEu
++/* Compute smoke job (huskygpu=4): job page (GPU-executable), in[], out[] inside the job area. */
++#define COMP_JOB                0x4000u
++#define COMP_IN                 0x5000u
++#define COMP_OUT                0x6000u
++#include "husky_gpu_compute.h"
+ 
+ /* CS instructions (Mesa genxml v10/v11 "CS ..." structs; opcode in 63:56). */
+ #define CS_MOVE48(r, imm)       ((1ULL << 56) | ((uint64_t)(r) << 48) | ((uint64_t)(imm) & 0xffffffffffffULL))
+@@ -483,6 +488,7 @@ static vm_offset_t pt_kva;
+ static unsigned pt_used;
+ static uint64_t test_pa;        /* job area (TEST_VA) */
+ static uint64_t mcu_root;       /* AS0 TRANSTAB, shared with AS1 */
++static uint32_t husky_gpu_mode; /* boot-arg huskygpu */
+ 
+ static uint64_t *
+ pt_entry_table(uint64_t table_pa)
+@@ -582,6 +588,92 @@ cs_state_dump(const char *when, vm_offset_t csout, vm_offset_t csgout, vm_offset
+  * timestamp, flushes the caches and bumps a 64-bit sync object, the way
+  * panthor ends every job.
+  */
++/*
++ * First shader job (huskygpu=4): after the store job, append a compute dispatch to the same ring.
++ * husky_gpu_compute.h (generated on the host by tools/gpu/gen-husky-compute.cpp with Mesa's genxml
++ * packers and cs_builder) holds the job page (FAU, the hand-written mul_add Valhall shader, TSD,
++ * SPD) and the CS words: REQ_RESOURCE compute, the compute staging registers (SRT r0, FAU r8,
++ * SPD r16, TSD r24, WG_SIZE r33, JOB_SIZE r37-r39), RUN_COMPUTE, WAIT, FLUSH_CACHE2, WAIT. The
++ * shader computes out[i] = in[i] * MUL + ADD; the CPU checks every element. The shader cores'
++ * domain (pd_embedded_g3d) is already on from ABL, and CSF firmware powers the cores themselves
++ * from the endpoint request, so a timeout here, with no MMU fault, points at core power (R1).
++ */
++_Static_assert(HUSKY_COMP_JOB_VA == TEST_VA + COMP_JOB, "compute job page");
++_Static_assert(HUSKY_COMP_IN_VA == TEST_VA + COMP_IN, "compute in[]");
++_Static_assert(HUSKY_COMP_OUT_VA == TEST_VA + COMP_OUT, "compute out[]");
++_Static_assert(HUSKY_COMP_JOB_BYTES <= GPU_PAGE, "compute job fits its page");
++_Static_assert(HUSKY_COMP_THREADS * 4 <= GPU_PAGE, "compute buffers fit a page");
++
++static void
++husky_gpu_compute_job(vm_offset_t t, vm_offset_t csout, vm_offset_t csgout, unsigned ring_used,
++    unsigned ra, unsigned rv, uint32_t waitall)
++{
++	for (unsigned i = 0; i < HUSKY_COMP_JOB_BYTES; i++) {
++		*(volatile uint8_t *)(t + COMP_JOB + i) = husky_comp_job[i];
++	}
++	for (unsigned i = 0; i < HUSKY_COMP_THREADS; i++) {
++		*(volatile uint32_t *)(t + COMP_IN + 4 * i) = 0x1000u + i * 0x11u;
++		*(volatile uint32_t *)(t + COMP_OUT + 4 * i) = 0xdeadbeefu;
++	}
++
++	unsigned n = sizeof(husky_comp_cs) / sizeof(husky_comp_cs[0]);
++	const uint64_t tail[] = {
++		CS_MOVE48(ra, TEST_VA + TEST_DATA),
++		CS_STORE_STATE_TS(ra, 16),              /* end timestamp next to the store job's */
++		CS_WAIT(waitall),
++		CS_MOVE48(ra, TEST_VA + TEST_SYNC),
++		CS_MOVE48(rv, 1),
++		CS_SYNC_ADD64(ra, rv),                  /* sync 1 -> 2 */
++		CS_ERROR_BARRIER,
++	};
++	unsigned m = sizeof(tail) / sizeof(tail[0]);
++	unsigned total = (n + m + 7) & ~7u;
++	if ((ring_used + total) * 8 > TEST_RING_SIZE) {
++		HU_LOG("HUSKY GPU: compute job does not fit the ring\n");
++		return;
++	}
++	for (unsigned i = 0; i < total; i++) {
++		uint64_t w = i < n ? husky_comp_cs[i] : i < n + m ? tail[i - n] : 0;
++		*(volatile uint64_t *)(t + TEST_RING + 8 * (ring_used + i)) = w;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr64(t, TEST_RING_IN, 8 * (ring_used + total));
++	__asm__ volatile ("dsb sy" ::: "memory");
++	HU_LOG("HUSKY GPU: compute job: %u CS + %u tail instructions at ring +0x%x, %u threads, shader at 0x%x\n",
++	    n, m, 8 * ring_used, HUSKY_COMP_THREADS, HUSKY_COMP_JOB_VA + HUSKY_COMP_CODE_OFF);
++	gwr(DOORBELL(CS_DOORBELL_ID), 1);
++
++	unsigned us;
++	for (us = 0; us < 500000; us += 10) {
++		if (rd64(t, TEST_SYNC) == 2) {
++			break;
++		}
++		delay(10);
++	}
++	unsigned bad = 0, first_bad = ~0u;
++	for (unsigned i = 0; i < HUSKY_COMP_THREADS; i++) {
++		uint32_t want = (0x1000u + i * 0x11u) * HUSKY_COMP_MUL + HUSKY_COMP_ADD;
++		if (rd32(t, COMP_OUT + 4 * i) != want) {
++			if (bad++ == 0) {
++				first_bad = i;
++			}
++		}
++	}
++	HU_LOG("HUSKY GPU: COMPUTE JOB %s after %u us: sync %llu, %u/%u results correct "
++	    "(out[0] 0x%x out[255] 0x%x), ticks %llu\n", us < 500000 ? "COMPLETED" : "did not complete", us,
++	    rd64(t, TEST_SYNC), HUSKY_COMP_THREADS - bad, HUSKY_COMP_THREADS, rd32(t, COMP_OUT),
++	    rd32(t, COMP_OUT + 4 * (HUSKY_COMP_THREADS - 1)), rd64(t, TEST_DATA + 16) - rd64(t, TEST_DATA + 8));
++	if (bad != 0 && first_bad != ~0u) {
++		HU_LOG("HUSKY GPU: first wrong element %u: 0x%x (want 0x%x)\n", first_bad,
++		    rd32(t, COMP_OUT + 4 * first_bad),
++		    (0x1000u + first_bad * 0x11u) * HUSKY_COMP_MUL + HUSKY_COMP_ADD);
++	}
++	cs_state_dump("after the compute job", csout, csgout, t);
++	if (us >= 500000 || bad != 0) {
++		gpu_fault_dump("compute job");
++	}
++}
++
+ static void
+ husky_gpu_first_job(vm_offset_t shared, uint32_t shared_size, vm_offset_t gin, vm_offset_t gout)
+ {
+@@ -720,6 +812,10 @@ husky_gpu_first_job(vm_offset_t shared, uint32_t shared_size, vm_offset_t gin, v
+ 	cs_state_dump("after the job", csout, csgout, t);
+ 	if (us >= 200000) {
+ 		gpu_fault_dump("first job");
++		return;
++	}
++	if (husky_gpu_mode >= 4) {
++		husky_gpu_compute_job(t, csout, csgout, padded, ra, rv, waitall);
+ 	}
+ }
+ 
+@@ -838,7 +934,9 @@ husky_gpu_mcu_boot(void)
+ 	}
+ 	test_pa = pt_pa + PT_PAGES * GPU_PAGE;
+ 	for (uint32_t off = 0; off < TEST_SIZE; off += GPU_PAGE) {
+-		if (!pt_map_page(root, TEST_VA + off, test_pa + off, leaf_attrs_for(FW_IFACE_RD | FW_IFACE_WR))) {
++		/* the compute job's page holds shader code: executable, read-only */
++		uint32_t f = off == COMP_JOB ? FW_IFACE_RD | FW_IFACE_EX : FW_IFACE_RD | FW_IFACE_WR;
++		if (!pt_map_page(root, TEST_VA + off, test_pa + off, leaf_attrs_for(f))) {
+ 			HU_LOG("HUSKY GPU: page-table pool exhausted (job area)\n");
+ 			return;
+ 		}
+@@ -1009,6 +1107,7 @@ husky_gpu_probe(void)
+ 		return;
+ 	}
+ 	HU_LOG("HUSKY GPU: probe mode %u\n", mode);
++	husky_gpu_mode = mode;
+ 	vm_offset_t pmu = ml_io_map(PMU_PA, PMU_SIZE);
+ 	if (!pmu) {
+ 		HU_LOG("HUSKY GPU: PMU map failed\n");
+diff --git a/bsd/dev/husky_gpu_compute.h b/bsd/dev/husky_gpu_compute.h
+new file mode 100644
+index 0000000..d4feff8
+--- /dev/null
++++ b/bsd/dev/husky_gpu_compute.h
+@@ -0,0 +1,56 @@
++/* generated by tools/gpu/gen-husky-compute.cpp; do not edit */
++/*
++ * In-kernel compute smoke job (xnu 0098, huskygpu=4): out[i] = in[i] * 3 + 7 for
++ * i < 256, 4 workgroups of 64 threads. Job page at GPU VA 0x6004000 (FAU @0x0, mul_add code @0x80,
++ * TSD @0xc0, SPD @0xe0), in[] at 0x6005000, out[] at 0x6006000. The CS words go in the ring.
++ */
++#define HUSKY_COMP_JOB_VA       0x6004000u
++#define HUSKY_COMP_IN_VA        0x6005000u
++#define HUSKY_COMP_OUT_VA       0x6006000u
++#define HUSKY_COMP_THREADS      256u
++#define HUSKY_COMP_MUL          3u
++#define HUSKY_COMP_ADD          7u
++#define HUSKY_COMP_CODE_OFF     0x80u
++#define HUSKY_COMP_JOB_BYTES    256u
++
++static const uint8_t husky_comp_job[256] = {
++	0x00, 0x50, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00,
++	0x03, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x80, 0x3c, 0x27, 0x20, 0x00, 0xc2, 0xa3, 0x01, 0x42, 0x00, 0x00, 0x18, 0x82, 0x84, 0x60, 0x00,
++	0x82, 0x3c, 0x27, 0x20, 0x00, 0xc0, 0xa3, 0x01, 0x04, 0x84, 0x0a, 0x00, 0x00, 0xc4, 0xa0, 0x08,
++	0x44, 0x85, 0x00, 0x00, 0x00, 0xc4, 0xa0, 0x00, 0x40, 0x00, 0x00, 0x18, 0x02, 0x44, 0x61, 0x78,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x18, 0x00, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x80, 0x40, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++static const uint64_t husky_comp_cs[20] = {
++	0x2200000000000001ULL,  /* opcode 34 */
++	0x0100000000000000ULL,  /* opcode 1 */
++	0x0208000006004000ULL,  /* opcode 2 */
++	0x0209000003000000ULL,  /* opcode 2 */
++	0x01100000060040e0ULL,  /* opcode 1 */
++	0x01180000060040c0ULL,  /* opcode 1 */
++	0x0220000000000000ULL,  /* opcode 2 */
++	0x022100008000003fULL,  /* opcode 2 */
++	0x0222000000000000ULL,  /* opcode 2 */
++	0x0223000000000000ULL,  /* opcode 2 */
++	0x0224000000000000ULL,  /* opcode 2 */
++	0x0225000000000004ULL,  /* opcode 2 */
++	0x0226000000000001ULL,  /* opcode 2 */
++	0x0227000000000001ULL,  /* opcode 2 */
++	0x1c00000000000000ULL,  /* opcode 28 */
++	0x0400000000000001ULL,  /* opcode 4 */
++	0x0300000000010000ULL,  /* opcode 3 */
++	0x0200000000000000ULL,  /* opcode 2 */
++	0x2400000000000033ULL,  /* opcode 36 */
++	0x0300000000010000ULL,  /* opcode 3 */
++};
