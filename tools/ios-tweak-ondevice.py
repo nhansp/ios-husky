@@ -257,15 +257,66 @@ def rerun_migration(dry):
         sys.exit('migration preferences still present')
 
 
+def install_system_apps(tar, dry):
+    """Restore the staged system-app bundles and set up the migrator to install them.
+
+    iOS 26's MISystemAppMigrator (a DataMigrator plugin) installs the ~49 stock apps from
+    /private/var/staged_system_apps into Bundle/Application on the first-boot data migration.
+    On our first attempt the apps were installed and then demoted+uninstalled because they are
+    not in the trust cache, leaving the staged dir empty. The migrator skips that demotion when
+    <installd>/SystemAppMigratorIgnoreAppsNotInTrustCache exists (string in InstalledContentLibrary),
+    which is the one ingredient missing before. This restores the (consumed) staged bundles from
+    the host tar, creates that sentinel, resets the installd system-app state, and deletes the
+    migration preferences so the migrator runs again on the next boot."""
+    staged = f'{MNT}/private/var/staged_system_apps'
+    n = len([x for x in su(f'ls {staged} 2>/dev/null; true').split() if x.endswith('.app')])
+    print(f'staged_system_apps currently holds {n} .app bundles')
+    sentinel = f'{MNT}/private/var/installd/SystemAppMigratorIgnoreAppsNotInTrustCache'
+    mi = f'{MNT}/private/var/installd/Library/MobileInstallation'
+    state_plists = ['SystemAppInstallState.plist', 'BackedUpState/SystemAppInstallState.plist',
+                    'LastBuildInfo.plist', 'MigrationInfo.plist']
+    if dry:
+        print(f"[dry-run] would extract {tar} into private/var "
+              f'({os.path.getsize(tar) // (1<<20)} MiB), chown 501:501')
+        print(f'[dry-run] would touch {os.path.relpath(sentinel, MNT)}')
+        for p in state_plists:
+            print(f'[dry-run] would delete installd .../{p}')
+        return
+    # Restore the bundles: remove the emptied dir, stream the tar straight into the volume.
+    su(f'rm -rf {staged}')
+    rc = subprocess.run(['adb', '-s', SERIAL, 'exec-in',
+                         f"su -c 'tar --numeric-owner -C {MNT}/private/var -xf -'"],
+                        stdin=open(tar, 'rb')).returncode
+    if rc != 0:
+        sys.exit(f'tar extract failed (rc {rc})')
+    su(f'chown -R 501:501 {staged}')
+    n2 = len([x for x in su(f'ls {staged} 2>/dev/null; true').split() if x.endswith('.app')])
+    print(f'restored {n2} .app bundles into staged_system_apps')
+    if n2 < 40:
+        sys.exit('restore looks short; aborting')
+    su(f'install -o 501 -g 501 -m 644 /dev/null {sentinel} 2>/dev/null || (touch {sentinel}; chown 501:501 {sentinel})')
+    print(f'touched {os.path.relpath(sentinel, MNT)}')
+    for p in state_plists:
+        su(f'rm -f {mi}/{p}')
+        print(f'deleted installd .../{p}')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dry-run', action='store_true', help='mount read-only and report, write nothing')
     ap.add_argument('--timezone', default=tweaks.TIMEZONE)
     ap.add_argument('--rerun-migration', action='store_true',
                     help='delete the migration preferences so the first-boot migration (staged apps) runs')
+    ap.add_argument('--install-system-apps', metavar='TAR',
+                    help='restore staged_system_apps from TAR, set the trust-cache sentinel, reset installd '
+                    'state; implies --rerun-migration so the migrator installs them next boot')
     ap.add_argument('--drop-mg-cache', action='store_true',
                     help='delete the MobileGestalt cache (after an identity change)')
     args = ap.parse_args()
+    if args.install_system_apps:
+        args.rerun_migration = True
+        if not os.path.isfile(args.install_system_apps):
+            sys.exit(f'no such tar: {args.install_system_apps}')
     check_clean()
     # New files on the unlabeled hfsplus mount fail SELinux "associate", even
     # for KernelSU root: permissive only while writing, Enforcing restored.
@@ -286,6 +337,8 @@ def main():
                     continue
                 merge_plist(f'{MNT}/{rel}', rel, values, args.dry_run)
             set_timezone(args.timezone, args.dry_run)
+            if args.install_system_apps:
+                install_system_apps(args.install_system_apps, args.dry_run)
             if args.drop_mg_cache:
                 drop_mg_cache(args.dry_run)
             if args.rerun_migration:
