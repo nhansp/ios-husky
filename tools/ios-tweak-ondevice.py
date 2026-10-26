@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply small iOS root tweaks (UI prefs, system plists, timezone) to husky over adb.
+"""Apply small iOS root tweaks (UI prefs, system plists, timezone, activation ark) to husky over adb.
 
   tools/ios-tweak-ondevice.py [--dry-run] [--timezone NAME]
 
@@ -177,6 +177,50 @@ def set_timezone(tz, dry):
             sys.exit('timezone link read-back mismatch')
 
 
+def set_build():
+    """Point the shared tweak values at the build on the device volume."""
+    ver = plistlib.loads(su_bytes(f'cat {MNT}/System/Library/CoreServices/SystemVersion.plist'))
+    b, v = ver.get('ProductBuildVersion'), ver.get('ProductVersion')
+    if tweaks.SUPPORTED.get(b) != v:
+        sys.exit(f'device volume is {v} / {b}: not a build the tweaks support')
+    tweaks.BUILD, tweaks.VERSION = b, v
+    print(f'device volume: iOS {v} ({b})')
+
+
+def seed_ark(dry):
+    """Merge the activation keys into mobileactivationd's data ark. The ark
+    lives in its Data/System container, which containermanagerd creates on
+    the first boot, so this only works after one boot. The file is rewritten
+    in place (same catalog record), keeping the owner and mode iOS gave it."""
+    base = f'{MNT}/private/var/containers/Data/System'
+    found = su(f'for m in {base}/*/.com.apple.mobile_container_manager.metadata.plist; do '
+               f'grep -q com.apple.mobileactivationd "$m" && dirname "$m"; done; true').split()
+    if len(found) != 1:
+        print(f'warning: {len(found)} mobileactivationd containers found; ark not seeded '
+              f'(boot once so containermanagerd creates it)')
+        return
+    path = f'{found[0]}/Library/internal/data_ark.plist'
+    if su(f'test -f {path} && echo yes').strip() != 'yes':
+        print(f'warning: no {path} yet; ark not seeded')
+        return
+    raw = su_bytes(f'cat {path}')
+    old = plistlib.loads(raw)
+    new = dict(old)
+    new.update(tweaks.ark_values())
+    if new == old:
+        print('unchanged data ark')
+        return
+    print(f'update data ark {os.path.relpath(path, MNT)} '
+          f'{sorted(k for k in new if old.get(k) != new[k])}')
+    if dry:
+        return
+    buf = io.BytesIO()
+    plistlib.dump(new, buf, fmt=plistlib.FMT_BINARY if raw[:6] == b'bplist' else plistlib.FMT_XML)
+    adb('exec-in', f"su -c 'cat > {path}'", data=buf.getvalue())
+    if plistlib.loads(su_bytes(f'cat {path}')) != new:
+        sys.exit('data ark: read-back mismatch')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dry-run', action='store_true', help='mount read-only and report, write nothing')
@@ -192,6 +236,8 @@ def main():
     try:
         mount_rw(ro=args.dry_run)
         try:
+            set_build()
+            seed_ark(args.dry_run)
             for name, values in tweaks.UI_PREFS.items():
                 merge_pref(name, values, args.dry_run)
             for rel, values in tweaks.SYSTEM_PLISTS.items():

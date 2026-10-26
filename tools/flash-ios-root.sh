@@ -19,7 +19,7 @@ DEV=/dev/block/by-name/userdata
 
 sig=$(dd if="$IMG" bs=1 skip=1024 count=2 2>/dev/null | tr -d '\0')
 [[ "$sig" == "H+" || "$sig" == "HX" ]] || { echo "$IMG: not an HFS+ image (signature '$sig')" >&2; exit 1; }
-img_size=$(stat -c %s "$IMG")
+img_size=$(stat -L -c %s "$IMG")
 (( img_size % 4096 == 0 )) || { echo "$IMG: size not a multiple of 4096" >&2; exit 1; }
 
 su() { adb -s "$SERIAL" shell "su -c '$1'" | tr -d '\r'; }

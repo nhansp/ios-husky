@@ -69,6 +69,9 @@ pulling the root back: tools/ios-tweak-ondevice.py.
 import argparse, glob, os, plistlib, sys
 
 BUILD, VERSION = '23G90', '26.6.2'
+# Userland builds the tweaks have been checked against (build -> version);
+# BUILD/VERSION are set from the image's SystemVersion.plist.
+SUPPORTED = {'23G90': '26.6.2', '23F77': '26.5'}
 MOBILE = 501
 SETUP_VERSION = 11          # iOS 16 value; the key still exists on iOS 26, current value unverified
 
@@ -262,12 +265,18 @@ def find_container(root, kind, identifier):
     return None
 
 
-def activation(root):
-    ark = {
+def ark_values():
+    """Keys merged into mobileactivationd's data ark (shared with
+    tools/ios-tweak-ondevice.py)."""
+    return {
         '-ActivationState': 'Activated', '-BrickState': False,
         '-BuildVersion': BUILD, '-ProductVersion': VERSION,
         '-DataMigrationCompleted': True, '-PreSydroDataMigrationCompleted': True,
     }
+
+
+def activation(root):
+    ark = ark_values()
     # mobileactivationd reads the ark from its Data/System container
     # (container_system_path_for_identifier("com.apple.mobileactivationd") +
     # Library/internal/data_ark.plist). If -BuildVersion matches the running
@@ -399,10 +408,13 @@ def main():
     DRY = args.dry_run
     if not DRY and os.geteuid() != 0:
         sys.exit('run as root (or use --dry-run)')
+    global BUILD, VERSION
     ver = load(os.path.join(root, 'System/Library/CoreServices/SystemVersion.plist'))
-    if (ver.get('ProductBuildVersion'), ver.get('ProductVersion')) != (BUILD, VERSION):
-        sys.exit(f'image is {ver.get("ProductVersion")} / {ver.get("ProductBuildVersion")}, '
-                 f'script is for {VERSION} / {BUILD}')
+    b, v = ver.get('ProductBuildVersion'), ver.get('ProductVersion')
+    if SUPPORTED.get(b) != v:
+        sys.exit(f'image is {v} / {b}, script supports '
+                 + ', '.join(f'{sv} / {sb}' for sb, sv in SUPPORTED.items()))
+    BUILD, VERSION = b, v
 
     launchd(root)
     containers(root)
