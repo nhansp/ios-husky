@@ -1,0 +1,68 @@
+diff --git a/bsd/kern/kern_mib.c b/bsd/kern/kern_mib.c
+index e67ea79..a958aab 100644
+--- a/bsd/kern/kern_mib.c
++++ b/bsd/kern/kern_mib.c
+@@ -542,7 +542,7 @@ sysctl_hw_generic(__unused struct sysctl_oid *oidp, void *arg1,
+ 		 * Deprecated variables.  We still support these for
+ 		 * backwards compatibility purposes only.
+ 		 */
+-#if XNU_TARGET_OS_OSX && defined(__arm64__)
++#if XNU_TARGET_OS_OSX && defined(__arm64__) && !defined(ARM64_BOARD_CONFIG_HUSKY)
+ 	/* The following two are kludged for backward
+ 	 * compatibility. Use hw.product/hw.target for something
+ 	 * consistent instead. */
+@@ -575,6 +575,13 @@ sysctl_hw_generic(__unused struct sysctl_oid *oidp, void *arg1,
+ 		dummy[64] = 0;
+ 		return SYSCTL_OUT(req, dummy, strlen(dummy) + 1);
+ #else
++	/*
++	 * HUSKY builds on a macOS-class config but runs an iOS userland: it takes
++	 * the iOS answers (hw.machine = ADT model "iPhone12,5", hw.model =
++	 * compatible[0] "D431AP"). The iOS-on-Mac branch above answered
++	 * "iPad8,6", and CoreFoundation's product-name check made every
++	 * device-specific string read "iPad".
++	 */
+ 	case HW_MACHINE:
+ 		bzero(dummy, sizeof(dummy));
+ 		if (!PEGetMachineName(dummy, 64)) {
+diff --git a/iokit/Kernel/arm/HuskyPlatformExpert.cpp b/iokit/Kernel/arm/HuskyPlatformExpert.cpp
+index f480384..8a72d56 100644
+--- a/iokit/Kernel/arm/HuskyPlatformExpert.cpp
++++ b/iokit/Kernel/arm/HuskyPlatformExpert.cpp
+@@ -24,7 +24,6 @@ public:
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+ 	bool getTargetName(char *name, int maxLength) APPLE_KEXT_OVERRIDE;
+-	bool getProductName(char *name, int maxLength) APPLE_KEXT_OVERRIDE;
+ 	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
+ 	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+@@ -185,7 +184,11 @@ HuskyPlatformExpert::processTopLevel(IORegistryEntry *root)
+ 	}
+ }
+ 
+-/* Userland identity is the iPhone 11 Pro Max the ADT poses as (hw.target). */
++/*
++ * Userland identity is the iPhone 11 Pro Max the ADT poses as (hw.target).
++ * hw.product comes from IODTPlatformExpert::getProductName, the root model
++ * "iPhone12,5", as on a real D431AP.
++ */
+ bool
+ HuskyPlatformExpert::getTargetName(char *name, int maxLength)
+ {
+@@ -196,15 +199,6 @@ HuskyPlatformExpert::getTargetName(char *name, int maxLength)
+ 	return true;
+ }
+ 
+-bool
+-HuskyPlatformExpert::getProductName(char *name, int maxLength)
+-{
+-	if (name == NULL || maxLength <= 0) {
+-		return false;
+-	}
+-	strlcpy(name, "iPhone 11 Pro Max", (size_t)maxLength);
+-	return true;
+-}
+ long
+ HuskyPlatformExpert::getGMTTimeOfDay(void)
+ {
