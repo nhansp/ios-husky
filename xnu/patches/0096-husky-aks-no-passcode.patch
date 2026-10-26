@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/HuskyKeyStore.cpp b/iokit/Kernel/arm/HuskyKeyStore.cpp
+index 51599ab..da6e5a1 100644
+--- a/iokit/Kernel/arm/HuskyKeyStore.cpp
++++ b/iokit/Kernel/arm/HuskyKeyStore.cpp
+@@ -60,6 +60,9 @@ enum {
+  */
+ #define HUSKY_AKS_LOCK_STATE    0x4
+ 
++/* MobileKeyBag lock state "disabled": no passcode is set. */
++#define HUSKY_MKB_LOCK_DISABLED 3
++
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+ 
+@@ -140,9 +143,16 @@ husky_aks_der_pair(uint8_t *p, const char *key, uint8_t value)
+ 
+ /*
+  * Device state (selector 17): a DER SET of key/INTEGER pairs that libaks
+- * decode_extended_state reads: ss state, sls lock state (MKBGetDeviceLockState:
+- * 0 = unlocked), sb backoff, sfa failed attempts, sgs generation, sas
+- * assertions, sgpe grace period, srcd recovery countdown.
++ * decode_extended_state reads: ss state, sls lock state, sb backoff, sfa
++ * failed attempts, sgs generation, sas assertions, sgpe grace period, srcd
++ * recovery countdown (iOS 26.5 also knows sbo, sfao and sms; absent keys
++ * decode as 0).
++ *
++ * sls is what MKBGetDeviceLockState returns (the second field of the decoded
++ * struct, read at +4 by MobileKeyBag 26.5): 0 unlocked, 1 locked, 2 locking,
++ * 3 disabled. A device without a passcode reports 3. With 0, iOS believes a
++ * passcode exists and is merely unlocked: Settings' passcode pages asked for
++ * it although none was ever set.
+  */
+ static IOReturn
+ husky_aks_device_state(IOExternalMethodArguments *args)
+@@ -151,7 +161,7 @@ husky_aks_device_state(IOExternalMethodArguments *args)
+ 		const char *key;
+ 		uint8_t value;
+ 	} fields[] = {
+-		{ "ss", HUSKY_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
++		{ "ss", HUSKY_AKS_LOCK_STATE }, { "sls", HUSKY_MKB_LOCK_DISABLED }, { "sb", 0 }, { "sfa", 0 },
+ 		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+ 	};
+ 	uint8_t buf[128];
