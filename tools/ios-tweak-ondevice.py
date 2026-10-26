@@ -221,10 +221,30 @@ def seed_ark(dry):
         sys.exit('data ark: read-back mismatch')
 
 
+MG_CACHE = ('private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/'
+            'Library/Caches/com.apple.MobileGestalt.plist')
+
+
+def drop_mg_cache(dry):
+    """Delete MobileGestalt's answer cache so identity answers (DeviceClass,
+    ProductType, ...) are recomputed after a kernel/ADT identity change."""
+    path = f'{MNT}/{MG_CACHE}'
+    if su(f'test -f {path} && echo yes').strip() != 'yes':
+        print('no MobileGestalt cache')
+        return
+    print(f'delete {MG_CACHE}')
+    if not dry:
+        su(f'rm -f {path}')
+        if su(f'test -e {path} && echo yes').strip() == 'yes':
+            sys.exit('MobileGestalt cache still present')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dry-run', action='store_true', help='mount read-only and report, write nothing')
     ap.add_argument('--timezone', default=tweaks.TIMEZONE)
+    ap.add_argument('--drop-mg-cache', action='store_true',
+                    help='delete the MobileGestalt cache (after an identity change)')
     args = ap.parse_args()
     check_clean()
     # New files on the unlabeled hfsplus mount fail SELinux "associate", even
@@ -246,6 +266,8 @@ def main():
                     continue
                 merge_plist(f'{MNT}/{rel}', rel, values, args.dry_run)
             set_timezone(args.timezone, args.dry_run)
+            if args.drop_mg_cache:
+                drop_mg_cache(args.dry_run)
         finally:
             unmount()
     finally:
