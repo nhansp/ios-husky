@@ -1,0 +1,21 @@
+# i128_probe.vhasm - does LOAD.i128 / STORE.i128 decode on the G715? (xnu 0102 diagnostic)
+#
+# Boot 0101's triangle faulted INSTR_INVALID_ENC (0x51) at the vertex shader's LOAD.i128, even
+# though Mesa's disassembler and both ISA tables (valhall ISA.xml, kraid isa-v9-v14.xml) accept the
+# encoding, and Mesa's own backend emits 128-bit loads (bi_load_to bitsize 128). This runs the same
+# vec4 load+store through the proven compute path, where every u32 of output is checked, to tell
+# "the G715 rejects this i128 encoding" apart from "the IDVS/tiler/LEA_BUF path is the problem".
+#
+#   out[i] = in[i]   for 256 u32, each thread copying 4 consecutive u32 as one 128-bit quantity.
+#
+# ABI: FAU u0 = &in[0], u1 = &out[0]; r60 = global invocation id x (groups of 4 u32 = 16 bytes).
+#! name i128_probe
+#! preload r60 r61
+#! fau_slots 2
+#! work_regs 64
+#! threads_per_group 64
+SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:0x4
+SHADDX.u64 [r0:r1], u1, [r60:r61].w0, shift:0x4
+LOAD.i128.slot0 @r4:r5:r6:r7, [r2^:r3^], offset:0
+NOP.wait0
+STORE.i128.slot0.end @r4:r5:r6:r7, [r0^:r1^], offset:0
