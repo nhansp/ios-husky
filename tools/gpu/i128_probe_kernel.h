@@ -9,14 +9,14 @@
 static const uint64_t i128_probe_code[5] = {
     0x01a3c20020473c80ull, /* SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:0x4 */
     0x01a3c00020473c82ull, /* SHADDX.u64 [r0:r1], u1, [r60:r61].w0, shift:0x4 */
-    0x0060847838000042ull, /* LOAD.i128.slot0 @r4:r5:r6:r7, [r2^:r3^], offset:0 */
+    0x006084f838000042ull, /* LOAD.i128.unsigned.slot0 @r4:r5:r6:r7, [r2^:r3^], offset:0 */
     0x0800c00000000000ull, /* NOP.wait0 */
     0x7861440838000040ull, /* STORE.i128.slot0.end @r4:r5:r6:r7, [r0^:r1^], offset:0 */
 };
 static const char *const i128_probe_src[5] = {
     "SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:0x4",
     "SHADDX.u64 [r0:r1], u1, [r60:r61].w0, shift:0x4",
-    "LOAD.i128.slot0 @r4:r5:r6:r7, [r2^:r3^], offset:0",
+    "LOAD.i128.unsigned.slot0 @r4:r5:r6:r7, [r2^:r3^], offset:0",
     "NOP.wait0",
     "STORE.i128.slot0.end @r4:r5:r6:r7, [r0^:r1^], offset:0",
 };

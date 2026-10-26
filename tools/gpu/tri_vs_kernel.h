@@ -8,14 +8,14 @@
 #define TRI_VS_THREADS_PER_GROUP 1
 static const uint64_t tri_vs_code[5] = {
     0x01a3c20020473c80ull, /* SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:0x4 */
-    0x0060887838000042ull, /* LOAD.i128.slot0 @r8:r9:r10:r11, [r2^:r3^], offset:0 */
+    0x006088f838000042ull, /* LOAD.i128.unsigned.slot0 @r8:r9:r10:r11, [r2^:r3^], offset:0 */
     0x005e840440000d7bull, /* LEA_BUF_IMM.slot1 @r4:r5, r59^, table:0xD, index:0x0 */
     0x1800c00000000000ull, /* NOP.wait01 */
     0x7861480839000044ull, /* STORE.i128.istream.slot0.end @r8:r9:r10:r11, [r4^:r5^], offset:0 */
 };
 static const char *const tri_vs_src[5] = {
     "SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:0x4",
-    "LOAD.i128.slot0 @r8:r9:r10:r11, [r2^:r3^], offset:0",
+    "LOAD.i128.unsigned.slot0 @r8:r9:r10:r11, [r2^:r3^], offset:0",
     "LEA_BUF_IMM.slot1 @r4:r5, r59^, table:0xD, index:0x0",
     "NOP.wait01",
     "STORE.i128.istream.slot0.end @r8:r9:r10:r11, [r4^:r5^], offset:0",

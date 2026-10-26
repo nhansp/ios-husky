@@ -16,6 +16,6 @@
 #! threads_per_group 64
 SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:0x4
 SHADDX.u64 [r0:r1], u1, [r60:r61].w0, shift:0x4
-LOAD.i128.slot0 @r4:r5:r6:r7, [r2^:r3^], offset:0
+LOAD.i128.unsigned.slot0 @r4:r5:r6:r7, [r2^:r3^], offset:0
 NOP.wait0
 STORE.i128.slot0.end @r4:r5:r6:r7, [r0^:r1^], offset:0
