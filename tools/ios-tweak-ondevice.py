@@ -136,7 +136,7 @@ def merge_pref(name, values, dry):
 
 
 def merge_plist(path, name, values, dry):
-    exists = su(f'test -f {path} && echo yes').strip() == 'yes'
+    exists = su(f'test -f {path} && echo yes; true').strip() == 'yes'
     if exists:
         raw = su_bytes(f'cat {path}')
         fmt = plistlib.FMT_BINARY if raw[:6] == b'bplist' else plistlib.FMT_XML
@@ -164,7 +164,7 @@ def merge_plist(path, name, values, dry):
 def set_timezone(tz, dry):
     link = f'{MNT}/{tweaks.LOCALTIME}'
     want = tweaks.zone_target(tz)
-    if su(f'test -f {MNT}/usr/share/zoneinfo.default/{tz} && echo yes').strip() != 'yes':
+    if su(f'test -f {MNT}/usr/share/zoneinfo.default/{tz} && echo yes; true').strip() != 'yes':
         sys.exit(f'no zone {tz} on the device image')
     cur = su(f'readlink {link}').strip()
     if cur == want:
@@ -200,7 +200,7 @@ def seed_ark(dry):
               f'(boot once so containermanagerd creates it)')
         return
     path = f'{found[0]}/Library/internal/data_ark.plist'
-    if su(f'test -f {path} && echo yes').strip() != 'yes':
+    if su(f'test -f {path} && echo yes; true').strip() != 'yes':
         print(f'warning: no {path} yet; ark not seeded')
         return
     raw = su_bytes(f'cat {path}')
@@ -229,13 +229,13 @@ def drop_mg_cache(dry):
     """Delete MobileGestalt's answer cache so identity answers (DeviceClass,
     ProductType, ...) are recomputed after a kernel/ADT identity change."""
     path = f'{MNT}/{MG_CACHE}'
-    if su(f'test -f {path} && echo yes').strip() != 'yes':
+    if su(f'test -f {path} && echo yes; true').strip() != 'yes':
         print('no MobileGestalt cache')
         return
     print(f'delete {MG_CACHE}')
     if not dry:
         su(f'rm -f {path}')
-        if su(f'test -e {path} && echo yes').strip() == 'yes':
+        if su(f'test -e {path} && echo yes; true').strip() == 'yes':
             sys.exit('MobileGestalt cache still present')
 
 
@@ -261,7 +261,7 @@ def main():
             for name, values in tweaks.UI_PREFS.items():
                 merge_pref(name, values, args.dry_run)
             for rel, values in tweaks.SYSTEM_PLISTS.items():
-                if su(f'test -f {MNT}/{rel} && echo yes').strip() != 'yes':
+                if su(f'test -f {MNT}/{rel} && echo yes; true').strip() != 'yes':
                     print(f'warning: no {rel}')
                     continue
                 merge_plist(f'{MNT}/{rel}', rel, values, args.dry_run)
