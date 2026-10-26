@@ -1,0 +1,33 @@
+# imul_probe.vhasm - five variants of the mul_add arithmetic in one kernel (xnu 0099 diagnostics).
+#
+# Boot 0098 ran mul_add on the GPU: every out[i] came back in[i] + 7, not in[i] * 3 + 7, as if the
+# IMUL result never reached the IADD. Each variant below writes its own 1 KiB output array
+# (out + 0x400 * k), so one dispatch tells the cases apart:
+#   k=0  IMUL into a fresh register        out0 = in * 3
+#   k=1  IMUL by a register (MOV from FAU)  out1 = in * 3
+#   k=2  IMUL of the thread id (no load)    out2 = gid * 3
+#   k=3  IADD of the loaded value to itself out3 = in * 2
+#   k=4  the original in-place sequence     out4 = in * 3 + 7
+# Same ABI as mul_add.vhasm: FAU u0 = &in, u1 = &out, u2.w0 = MUL, u2.w1 = ADD; r60 = global id x.
+#
+#! name imul_probe
+#! preload r60 r61
+#! fau_slots 3
+#! work_regs 64
+#! threads_per_group 64
+SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:0x2
+LOAD.i32.unsigned.slot0 @r4, [r2^:r3^], offset:0
+SHADDX.u64 [r0:r1], u1, [r60:r61].w0, shift:0x2
+NOP.wait0
+IMUL.i32 r5, r4, u2.w0
+STORE.i32.slot1 @r5, [r0:r1], offset:0
+MOV.i32 r6, u2.w0
+IMUL.i32 r7, r4, r6
+STORE.i32.slot1 @r7, [r0:r1], offset:1024
+IMUL.i32 r8, r60, u2.w0
+STORE.i32.slot1 @r8, [r0:r1], offset:2048
+IADD.u32 r9, r4, r4
+STORE.i32.slot1 @r9, [r0:r1], offset:3072
+IMUL.i32 r4, r4, u2.w0
+IADD.u32 r4, r4^, u2.w1
+STORE.i32.slot1.end @r4, [r0^:r1^], offset:4096

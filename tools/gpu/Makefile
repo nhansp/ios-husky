@@ -39,7 +39,7 @@ $(BUILD)/shim.o: mesa_util_shim.c
 	@mkdir -p $(BUILD)
 	$(CC) -O1 -c $< -o $@
 
-$(BUILD)/gen-husky-compute: gen-husky-compute.cpp mali_compute_build.h mul_add_kernel.h \
+$(BUILD)/gen-husky-compute: gen-husky-compute.cpp mali_compute_build.h mul_add_kernel.h imul_probe_kernel.h \
     $(GEN)/genxml/v11_pack.h $(BUILD)/ralloc.o $(BUILD)/u_dynarray.o $(BUILD)/shim.o
 	$(CXX) -std=gnu++17 $(CFLAGS_MESA) -DPAN_ARCH=11 $< $(BUILD)/ralloc.o $(BUILD)/u_dynarray.o \
 	    $(BUILD)/shim.o -o $@ -lpthread
