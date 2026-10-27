@@ -1,0 +1,94 @@
+diff --git a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+index 92ef3ec..66c0966 100644
+--- a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
++++ b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+@@ -24,6 +24,7 @@
+ #include "IOGPUNotificationQueue.h"
+ #include <sys/systm.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
+ 
+ OSDefineMetaClassAndStructors(IOGPUDeviceUserClient, IOUserClient);
+ 
+@@ -33,6 +34,18 @@ OSDefineMetaClassAndStructors(IOGPUDeviceUserClient, IOUserClient);
+ 
+ static volatile SInt64 sClientCounter = 0x1000;
+ 
++/* boot-arg huskygputrace=1: every selector and trap into pmsg, written synchronously by kprintf */
++static bool
++iogpu_trace_on(void)
++{
++	static int on = -1;
++	if (on < 0) {
++		uint32_t v = 0;
++		on = PE_parse_boot_argn("huskygputrace", &v, sizeof(v)) && v;
++	}
++	return on;
++}
++
+ /* ===================================================================== *
+  * Lifecycle & start [spec 01 lines 122-157, deviceUserClientStart]
+  * ===================================================================== */
+@@ -1012,12 +1025,17 @@ IOGPUDeviceUserClient::externalMethod(uint32_t selector,
+ 		if (!target) {
+ 			target = this;
+ 		}
+-	} else {
+-		/* Fall through for vendor extensions (> 0x37) [spec 01 line 168] */
+-		return IOUserClient::externalMethod(selector, args, dispatch, target, reference);
+ 	}
+ 
+-	return IOUserClient::externalMethod(selector, args, dispatch, target, reference);
++	const bool trace = iogpu_trace_on();
++	if (trace) {
++		kprintf("IOGPU uc sel %u in %u/%u\n", selector, args->scalarInputCount, args->structureInputSize);
++	}
++	IOReturn rc = IOUserClient::externalMethod(selector, args, dispatch, target, reference);
++	if (trace) {
++		kprintf("IOGPU uc sel %u -> 0x%x\n", selector, rc);
++	}
++	return rc;
+ }
+ 
+ /* ===================================================================== *
+@@ -1029,6 +1047,9 @@ IOGPUDeviceUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 inde
+ 	if (!fStarted || index >= IOGPU_UC_NUM_TRAPS) {
+ 		return NULL;
+ 	}
++	if (iogpu_trace_on()) {
++		kprintf("IOGPU uc trap %u\n", (unsigned)index);
++	}
+ 	*targetP = this;
+ 	return &fTraps[index];
+ }
+diff --git a/iokit/Kernel/arm/HuskyPlatformExpert.cpp b/iokit/Kernel/arm/HuskyPlatformExpert.cpp
+index 8a72d56..931e706 100644
+--- a/iokit/Kernel/arm/HuskyPlatformExpert.cpp
++++ b/iokit/Kernel/arm/HuskyPlatformExpert.cpp
+@@ -48,19 +48,22 @@ husky_uptime_secs(uint64_t since)
+ /*
+  * Restart and halt (XNU's reboot path, after processes exit and the volumes
+  * are unmounted): last console-log flush, then PSCI SYSTEM_RESET to BL31 and
+- * ABL boots Android. Panic restarts are left alone: the watchdog resets the
+- * phone and pmsg survives, as before.
++ * ABL boots Android. Panic restarts (debug=0x100000) reset the same way,
++ * without the UFS flush (no I/O from panic context): after a watchdog reset
++ * ABL often drops pram, and the panic text in pmsg with it.
+  */
+ extern "C" void husky_log_final_flush(void);
+ 
+ static int
+ husky_halt_restart(unsigned int type)
+ {
+-	if (type != kPERestartCPU && type != kPEHaltCPU) {
++	if (type != kPERestartCPU && type != kPEHaltCPU && type != kPEPanicRestartCPU) {
+ 		return -1;
+ 	}
+ 	kprintf("HUSKY: PSCI SYSTEM_RESET (halt/restart type %u)\n", type);
+-	husky_log_final_flush();
++	if (type != kPEPanicRestartCPU) {
++		husky_log_final_flush();
++	}
+ 	register uint64_t x0 __asm__("x0") = 0x84000009ULL;   /* SYSTEM_RESET */
+ 	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+ 	kprintf("HUSKY: PSCI SYSTEM_RESET returned %lld\n", (long long)x0);
