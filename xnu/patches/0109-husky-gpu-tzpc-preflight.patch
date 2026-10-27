@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index d62282d..727ab8a 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -1374,6 +1374,44 @@ husky_gpu_mcu_boot(void)
+ 	}
+ }
+ 
++/*
++ * Before the first GPU register access: pd_g3d is TZPC-protected (zuma-pm-domains.dtsi need_smc
++ * 0x1EE10204), and every power-on of the domain needs the TZPC restore SMC (pmucal_local.c:52-53,
++ * exynos_pd_tz_restore) before the normal world can touch the block. The domain can already be on
++ * but still protected (power-cycled by someone who did not restore), and then the first GPU_ID read
++ * stalls the bus (boots 0107/0108: whole-machine freeze, watchdog reset). So restore it every time,
++ * and log the G3D clock state around it. CMU_TOP is always on; CMU_G3D sits in the G3D block.
++ * Offsets: cal-if/zuma/cmucal-sfr.c:11,15,90,93,166,175,878.
++ */
++#define CMU_TOP_PA              0x26040000ULL
++#define CMU_TOP_G3D_GLB_MUX     0x106cu
++#define CMU_TOP_G3D_SWITCH_MUX  0x1074u
++#define CMU_TOP_G3D_GLB_GATE    0x2094u
++#define CMU_G3D_PA              0x1ee00000ULL
++#define CMU_G3D_PLL_CON3        0x10cu          /* bit 31 enable, bit 29 stable */
++#define CMU_G3D_PLL_L2_CON3     0x18cu
++
++static void
++husky_gpu_preflight(void)
++{
++	vm_offset_t top = ml_io_map(CMU_TOP_PA, 0x4000);
++	if (top) {
++		HU_LOG("HUSKY GPU: CMU_TOP G3D_GLB mux 0x%x gate 0x%x, G3D_SWITCH mux 0x%x\n",
++		    rd32(top, CMU_TOP_G3D_GLB_MUX), rd32(top, CMU_TOP_G3D_GLB_GATE), rd32(top, CMU_TOP_G3D_SWITCH_MUX));
++	}
++	int64_t rc_prot = husky_smc4(0x82002010u, 0, 12, 0);     /* PROT_G3D off */
++	int64_t rc_tzpc = husky_smc4(SMC_CMD_PREPARE_PD_ONOFF, EXYNOS_WAKEUP_PD_DOWN, G3D_NEED_SMC,
++	    RUNTIME_PM_TZPC_GROUP);
++	HU_LOG("HUSKY GPU: preflight SMC protection-disable rc %lld, TZPC restore rc %lld\n",
++	    (long long)rc_prot, (long long)rc_tzpc);
++	vm_offset_t cmu = ml_io_map(CMU_G3D_PA, 0x4000);
++	if (cmu) {
++		HU_LOG("HUSKY GPU: reading CMU_G3D\n");
++		HU_LOG("HUSKY GPU: CMU_G3D PLL_G3D CON3 0x%x, PLL_G3D_L2 CON3 0x%x\n",
++		    rd32(cmu, CMU_G3D_PLL_CON3), rd32(cmu, CMU_G3D_PLL_L2_CON3));
++	}
++}
++
+ void
+ husky_gpu_probe(void)
+ {
+@@ -1420,6 +1458,7 @@ husky_gpu_probe(void)
+ 			return;
+ 		}
+ 	}
++	husky_gpu_preflight();
+ 	husky_gpu_dump();
+ 	if (mode >= 3) {
+ 		husky_gpu_mcu_boot();
