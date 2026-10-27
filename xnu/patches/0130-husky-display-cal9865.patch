@@ -1,0 +1,964 @@
+diff --git a/iokit/Kernel/arm/HuskyDisplay.cpp b/iokit/Kernel/arm/HuskyDisplay.cpp
+index de807c7..082e0ed 100644
+--- a/iokit/Kernel/arm/HuskyDisplay.cpp
++++ b/iokit/Kernel/arm/HuskyDisplay.cpp
+@@ -11,15 +11,21 @@
+  * panel come from a physically contiguous pool below 4 GiB (the DPU SysMMU is
+  * left in bypass); anything else still takes the CPU copy into the splash.
+  *
++ * Register offsets and fields are those of the zuma CAL (cal_9865: decon,
++ * dpp, dsim); cal_9845 is the gs101 layout and differs in the RDMA geometry
++ * registers, the IRQ masks and the DSIM PLL.
++ *
+  * Everything runs only when boot-arg huskydisp=N is set; the steps are
+  * cumulative:
+- *   1  read-only register probe and TE measurement
++ *   1  register probe and TE measurement (HW_TE_CNT)
+  *   2  scanout pool, swap statistics, SwapWait argument logging
+  *   3  direct flips, polled
+- *   4  GIC interrupts, vsync from the panel's TE
++ *   4  GIC interrupts when the SPIs are Non-secure; vsync from HW_TE_CNT
+  *   5  panel to 120 Hz (huskydisp_hz=60 skips it)
+  *   6  failure injection (huskydisp_inject=1|2)
+  * huskydisp_slots=2..6 sizes the pool (default 4 x 16 MiB).
++ * Diagnostics: huskydisp_cmp=1 adds SHD_REG_UP_REQ_CMP to frame requests,
++ * huskydisp_phy=1 reads the DSIM PHY PLL, huskydisp_terise=1 retests TE_RISE.
+  */
+ #include "HuskyDisplay.h"
+ 
+@@ -46,6 +52,7 @@ extern unsigned long gPhysBase, gPhysSize;
+ #define HD_WIN_PHYS             0x19480000ULL
+ #define HD_WINCON_PHYS          0x194A0000ULL
+ #define HD_DSIM_PHYS            0x19440000ULL
++#define HD_DPHY_PHYS            0x19460000ULL   /* DSIM0 PHY bias; the PLL block starts at +0x100 */
+ #define HD_RDMA_PHYS            0x19900000ULL
+ #define HD_SYSMMU_PHYS          0x19840000ULL
+ #define HD_WINDOWS              14
+@@ -60,6 +67,11 @@ extern unsigned long gPhysBase, gPhysSize;
+ #define DECON_INT_EN_EXTRA      0x64
+ #define DECON_INT_PEND          0x70
+ #define DECON_INT_PEND_EXTRA    0x74
++#define DECON_RSC_STATUS_0      0x100
++#define DECON_RSC_STATUS_2      0x108
++#define DECON_CLOCK_CON         0x5000
++#define GCON_ENABLE             0x3u            /* DECON_EN | DECON_EN_F */
++#define GCON_RUN_STATUS         (1u << 4)
+ #define GCON_CMD                (1u << 8)
+ #define TRIG_HW_EN              (1u << 0)
+ #define TRIG_MASK_DECON         (1u << 4)
+@@ -71,45 +83,80 @@ extern unsigned long gPhysBase, gPhysSize;
+ #define EXTRA_TIME_OUT          (1u << 0)
+ #define EXTRA_RES_CONFLICT      (1u << 4)
+ #define EXTRA_TE_RISE           (1u << 16)
+-#define EXTRA_ALL               (EXTRA_TIME_OUT | EXTRA_RES_CONFLICT | EXTRA_TE_RISE)
+-#define SHD_REQUEST             0x80003FFFu
+-
+-/* DPP0 RDMA */
++#define EXTRA_ALL               (EXTRA_TIME_OUT | EXTRA_RES_CONFLICT)
++#define SHD_REQUEST             0x80003FFFu     /* SHD_REG_UP_REQ_GLOBAL | _FOR_DECON */
++#define SHD_REQ_CMP             (1u << 20)
++
++/* DECON0 window and window-control banks, one 0x1000 stride per window */
++#define WIN_CON_EN              (1u << 0)
++#define WIN_CON_CHMAP_SHIFT     4
++#define WIN_CON_CHMAP_MASK      (0xFu << WIN_CON_CHMAP_SHIFT)
++#define WIN_START_POSITION      0xC
++#define WIN_END_POSITION        0x10
++
++/* DPU_DMA L0 (the DPP0 RDMA), cal_9865 regs-dpp.h */
+ #define RDMA_IRQ                0x04
+ #define RDMA_IN_CTRL_0          0x08
+-#define RDMA_SRC_SIZE           0x10
+-#define RDMA_SRC_OFFSET         0x14
+-#define RDMA_IMG_SIZE           0x18
+-#define RDMA_BASEADDR_Y8        0x40
++#define RDMA_SRC_WIDTH          0x10
++#define RDMA_SRC_HEIGHT         0x14
++#define RDMA_SRC_OFFSET         0x18
++#define RDMA_IMG_SIZE           0x1C
++#define RDMA_BASEADDR_P0        0x40
+ #define RDMA_SRC_STRIDE_0       0x50
+ #define RDMA_SRC_STRIDE_1       0x54
+ #define RDMA_SHADOW             0x400
++#define RDMA_SRC_DIM_MASK       0xFFFFFFu
++#define RDMA_IMG_WIDTH_MASK     0xFFFFu
++#define RDMA_CTRL0_FMT_SHIFT    8
++#define RDMA_CTRL0_FMT_MASK     (0x3Fu << RDMA_CTRL0_FMT_SHIFT)
++#define RDMA_FMT_LAST_RGB32     7               /* BGRA..XRGB8888; 8 is BGR565 */
++/* SBWC_LOSSY, ROT[6:4], AFBC, SBWC, SAJC, BLOCK */
++#define RDMA_CTRL0_NOT_LINEAR   ((1u << 14) | (7u << 4) | 0xFu)
+ #define RDMA_IRQ_EN             (1u << 0)
+ #define RDMA_IRQ_FD_MASK        (1u << 1)
+-#define RDMA_IRQ_ALL_MASK       (0x7FBu << 1)
+-#define RDMA_IRQ_PEND           (0x7FFu << 16)
++#define RDMA_IRQ_ALL_MASK       (0xDFBu << 1)
++#define RDMA_IRQ_PEND           (0xDFBu << 16)
+ #define RDMA_IRQ_DEADLOCK       (1u << 17)
++#define RDMA_IRQ_READ_SLAVE_ERR (1u << 19)
+ #define RDMA_IRQ_CONFIG_ERR     (1u << 21)
++#define RDMA_IRQ_FBC_ERR        (1u << 23)
++#define RDMA_IRQ_ERR            (RDMA_IRQ_DEADLOCK | RDMA_IRQ_READ_SLAVE_ERR | RDMA_IRQ_CONFIG_ERR | \
++	                         RDMA_IRQ_FBC_ERR)
+ 
+-/* DSIM0 */
++/* DSIM0, cal_9865 regs-dsim.h */
++#define DSIM_LINK_STATUS3       0x14
+ #define DSIM_ESCMODE            0x2C
+ #define DSIM_UNDERRUN_CTRL      0x34
+ #define DSIM_CONFIG             0x4C
+ #define DSIM_INTSRC             0x50
+ #define DSIM_PKTHDR             0x58
+ #define DSIM_PAYLOAD            0x5C
++#define DSIM_SFR_CTRL           0x64
+ #define DSIM_FIFOCTRL           0x68
++#define DSIM_CPRS_CTRL          0x74
++#define DSIM_SLICE01            0x78
++#define DSIM_SLICE23            0x7C
+ #define DSIM_CMD_CONFIG         0x80
+ #define DSIM_CMD_TE_CTRL0       0x84
+ #define DSIM_CMD_TE_CTRL1       0x88
+-#define DSIM_PLL_CTRL           0xA0
+ #define DSIM_INT_UNDER_RUN      (1u << 19)
++#define DSIM_SFR_SHADOW_EN      (1u << 0)
++#define DSIM_SFR_READ_EN        (1u << 1)
+ #define DSIM_FIFO_EMPTY_PL      (1u << 8)
+ #define DSIM_FIFO_FULL_PL       (1u << 9)
+ #define DSIM_FIFO_EMPTY_PH      (1u << 10)
+ #define DSIM_FIFO_FULL_PH       (1u << 11)
+ #define DSIM_CMD_PKT_GO_EN      (1u << 16)
+ #define DSIM_CONFIG_VIDEO       (1u << 18)
++
++/* DSIM0 PHY PLL block (DT "dphy" resource, 0x19460100) */
++#define DPHY_PLL                0x100
++#define DPHY_PLL_CON0           0x00
++#define DPHY_PLL_CON1           0x04
++#define DPHY_PLL_CON2           0x08
++#define DPHY_PLL_STAT0          0x40
++
++/* DPU SysMMU v9, VM 0 */
+ #define SYSMMU_CTRL_VM          0x8000
+ 
+ /* GIC INTIDs (SPI + 32) of DECON0 and the DPP0 RDMA, from the zuma DT */
+@@ -119,11 +166,17 @@ extern unsigned long gPhysBase, gPhysSize;
+ #define HD_INTID_RDMA           288
+ #define HD_IRQ_PRIO             0xA0
+ 
+-/* DSIM timer values for 60 and 120 fps with hk3's te_idle_us = 350, te_var = 1 */
++/*
++ * DSIM timers for 60 and 120 fps: the underrun count is dsim_calc_underrun
++ * at the DT hs clock (hk3: te_idle_us 350, te_var 1), and ABL's 60 Hz value is
++ * identical. CMD_TE_CTRL1 is dsim_reg_get_cmd_timer (TE_MARGIN 5); ABL's own
++ * 60 Hz value is 0x34C53C1E and does not follow that formula, so the 60 Hz
++ * state is recognised by proximity and restored from the probe, not compared.
++ */
+ #define HD_URUN_60              0x2235
+ #define HD_URUN_120             0x06A7
+-#define HD_TE1_60               0x34E13D3Bu
+-#define HD_TE1_120              0x1A701E9Du
++#define HD_HS_MHZ               1368
++#define HD_TE_MARGIN            5
+ 
+ #define HD_SLOT_SIZE            (16u << 20)
+ #define HD_MAX_SLOTS            6
+@@ -164,6 +217,37 @@ hd_boot_arg(const char *name, uint32_t def)
+ 	return PE_parse_boot_argn(name, &v, sizeof(v)) ? v : def;
+ }
+ 
++/* DSIM_CMD_TE_CTRL1 at fps: TIME_TE_PROTECT_ON [31:16], TIME_TE_TOUT [15:0]. */
++static uint32_t
++hd_te1(uint32_t fps)
++{
++	uint32_t protect = HD_HS_MHZ * (100 - HD_TE_MARGIN) * 100 / fps / 16;
++	uint32_t tout = HD_HS_MHZ * (100 + 2 * HD_TE_MARGIN) * 100 / fps / 16;
++
++	return protect << 16 | tout;
++}
++
++static uint32_t
++hd_dist(uint32_t a, uint32_t b)
++{
++	return a > b ? a - b : b - a;
++}
++
++/* Both halves of v are nearer to the fps timing than to the other one of 60 and 120. */
++static bool
++hd_te1_is(uint32_t v, uint32_t fps)
++{
++	uint32_t e = hd_te1(fps), o = hd_te1(fps == 60 ? 120 : 60);
++
++	for (uint32_t sh = 0; sh <= 16; sh += 16) {
++		uint32_t x = (v >> sh) & 0xFFFF;
++		if (hd_dist(x, (e >> sh) & 0xFFFF) >= hd_dist(x, (o >> sh) & 0xFFFF)) {
++			return false;
++		}
++	}
++	return true;
++}
++
+ /* ---- scanout pool ---- */
+ 
+ static struct {
+@@ -234,8 +318,11 @@ struct husky_dcs {
+  * 60 -> 120 Hz and back: the byte sequences hk3_set_panel_feat
+  * (panel-google-hk3.c) emits for HS op mode, manual frame mode, early exit on
+  * and fixed TE at 120 Hz, and for early exit off, changeable TE at 60 Hz. Each
+- * batch must go out whole (the driver warns of a black screen otherwise). The
+- * IRC and TE2 blocks are deliberately not sent: this code never changes them.
++ * batch must go out whole (the driver warns of a black screen otherwise).
++ * husky_dcs_120 is the NS -> HS transition (entries 6-7 are the op-mode
++ * block) without the TE2 block the driver adds for it (hk3_update_te2_internal,
++ * which needs the mode's TE2 edges); husky_dcs_60 is HS -> HS. The panel's op
++ * mode at hand-off is not probed, so the 120 Hz step is unverified.
+  */
+ static const struct husky_dcs husky_dcs_120[] = {
+ 	{ 3, { 0xF0, 0x5A, 0x5A } },
+@@ -352,6 +439,7 @@ HuskyDisplay::create(IOWorkLoop *loop, uint64_t splashPA, uint32_t width, uint32
+ 	d->fLevel = lvl;
+ 	d->fHz = hd_boot_arg("huskydisp_hz", 120);
+ 	d->fInject = lvl >= 6 ? hd_boot_arg("huskydisp_inject", 0) : 0;
++	d->fShdReq = SHD_REQUEST | (hd_boot_arg("huskydisp_cmp", 0) != 0 ? SHD_REQ_CMP : 0);
+ 	d->fPeriodUS = 16667;
+ 	d->fDispLock = IOSimpleLockAlloc();
+ 	d->fWaitLock = IOLockAlloc();
+@@ -435,31 +523,56 @@ HuskyDisplay::probe(void)
+ 	HUSKY_DISP_LOG("HUSKY DISP: probe decon gcon=%08x trig=%08x shd=%08x en=%08x enx=%08x pend=%08x "
+ 	    "pendx=%08x tecnt=%08x\n", gcon, trig, shd, fDecon[DECON_INT_EN / 4], fDecon[DECON_INT_EN_EXTRA / 4],
+ 	    fDecon[DECON_INT_PEND / 4], fDecon[DECON_INT_PEND_EXTRA / 4], fDecon[DECON_HW_TE_CNT / 4]);
++	HUSKY_DISP_LOG("HUSKY DISP: probe decon rsc0=%08x rsc2=%08x clkcon=%08x\n",
++	    fDecon[DECON_RSC_STATUS_0 / 4], fDecon[DECON_RSC_STATUS_2 / 4], fDecon[DECON_CLOCK_CON / 4]);
++	uint32_t winEn = 0, winCon = 0, winStart = 0, winEnd = 0;
+ 	for (uint32_t n = 0; n < HD_WINDOWS; n++) {
+ 		uint32_t con = fWinCon[(n * HD_WIN_STRIDE) / 4];
+-		if (con & 1) {
+-			HUSKY_DISP_LOG("HUSKY DISP: probe win%u con=%08x start=%08x end=%08x\n", n, con,
+-			    fWin[(n * HD_WIN_STRIDE + 0xC) / 4], fWin[(n * HD_WIN_STRIDE + 0x10) / 4]);
++		if (con & WIN_CON_EN) {
++			uint32_t st = fWin[(n * HD_WIN_STRIDE + WIN_START_POSITION) / 4];
++			uint32_t en = fWin[(n * HD_WIN_STRIDE + WIN_END_POSITION) / 4];
++			if (winEn++ == 0) {
++				winCon = con;
++				winStart = st;
++				winEnd = en;
++			}
++			HUSKY_DISP_LOG("HUSKY DISP: probe win%u con=%08x start=%08x end=%08x\n", n, con, st, en);
+ 		}
+ 	}
+ 
++	uint32_t rirq = fRdma[RDMA_IRQ / 4];
+ 	uint32_t ctrl0 = fRdma[RDMA_IN_CTRL_0 / 4];
+-	uint32_t src = fRdma[RDMA_SRC_SIZE / 4];
++	uint32_t w = fRdma[RDMA_SRC_WIDTH / 4] & RDMA_SRC_DIM_MASK;
++	uint32_t h = fRdma[RDMA_SRC_HEIGHT / 4] & RDMA_SRC_DIM_MASK;
+ 	uint32_t off = fRdma[RDMA_SRC_OFFSET / 4];
+ 	uint32_t img = fRdma[RDMA_IMG_SIZE / 4];
+-	uint32_t base = fRdma[RDMA_BASEADDR_Y8 / 4];
+-	uint32_t sbase = fRdma[(RDMA_SHADOW + RDMA_BASEADDR_Y8) / 4];
+-	HUSKY_DISP_LOG("HUSKY DISP: probe rdma0 en=%08x ctrl0=%08x src=%08x off=%08x img=%08x base=%08x "
+-	    "sbase=%08x st0=%08x st1=%08x\n", fRdma[0], ctrl0, src, off, img, base, sbase,
++	uint32_t base = fRdma[RDMA_BASEADDR_P0 / 4];
++	uint32_t sbase = fRdma[(RDMA_SHADOW + RDMA_BASEADDR_P0) / 4];
++	HUSKY_DISP_LOG("HUSKY DISP: probe rdma0 en=%08x irq=%08x ctrl0=%08x w=%u h=%u off=%08x img=%08x "
++	    "base=%08x sbase=%08x st0=%08x st1=%08x\n", fRdma[0], rirq, ctrl0, w, h, off, img, base, sbase,
+ 	    fRdma[RDMA_SRC_STRIDE_0 / 4], fRdma[RDMA_SRC_STRIDE_1 / 4]);
+ 
+ 	fDsimUrun = fDsim[DSIM_UNDERRUN_CTRL / 4] & 0xFFFF;
+ 	fDsimTe1 = fDsim[DSIM_CMD_TE_CTRL1 / 4];
+ 	uint32_t dcfg = fDsim[DSIM_CONFIG / 4];
+ 	HUSKY_DISP_LOG("HUSKY DISP: probe dsim cfg=%08x esc=%08x urun=%08x te0=%08x te1=%08x cmdcfg=%08x "
+-	    "fifo=%08x pll=%08x\n", dcfg, fDsim[DSIM_ESCMODE / 4], fDsim[DSIM_UNDERRUN_CTRL / 4],
+-	    fDsim[DSIM_CMD_TE_CTRL0 / 4], fDsimTe1, fDsim[DSIM_CMD_CONFIG / 4], fDsim[DSIM_FIFOCTRL / 4],
+-	    fDsim[DSIM_PLL_CTRL / 4]);
++	    "fifo=%08x\n", dcfg, fDsim[DSIM_ESCMODE / 4], fDsim[DSIM_UNDERRUN_CTRL / 4],
++	    fDsim[DSIM_CMD_TE_CTRL0 / 4], fDsimTe1, fDsim[DSIM_CMD_CONFIG / 4], fDsim[DSIM_FIFOCTRL / 4]);
++	HUSKY_DISP_LOG("HUSKY DISP: probe dsim link3=%08x sfr=%08x cprs=%08x slice01=%08x slice23=%08x\n",
++	    fDsim[DSIM_LINK_STATUS3 / 4], fDsim[DSIM_SFR_CTRL / 4], fDsim[DSIM_CPRS_CTRL / 4],
++	    fDsim[DSIM_SLICE01 / 4], fDsim[DSIM_SLICE23 / 4]);
++	if (hd_boot_arg("huskydisp_phy", 0) != 0) {
++		volatile uint32_t *phy = (volatile uint32_t *)ml_io_map(HD_DPHY_PHYS, 0x1000);
++		if (phy != NULL) {
++			uint32_t c0 = phy[(DPHY_PLL + DPHY_PLL_CON0) / 4];
++			uint32_t c1 = phy[(DPHY_PLL + DPHY_PLL_CON1) / 4];
++			uint32_t c2 = phy[(DPHY_PLL + DPHY_PLL_CON2) / 4];
++			uint32_t st = phy[(DPHY_PLL + DPHY_PLL_STAT0) / 4];
++			HUSKY_DISP_LOG("HUSKY DISP: probe dphy pll con0=%08x con1=%08x con2=%08x stat0=%08x "
++			    "en=%u p=%u m=%u s=%u k=%u lock=%u\n", c0, c1, c2, st, (c0 >> 12) & 1, c0 & 0x3F,
++			    c2 & 0x3FF, (c0 >> 8) & 7, c1 & 0xFFFF, st & 1);
++		}
++	}
+ 
+ 	uint32_t mmu = fSysmmu[SYSMMU_CTRL_VM / 4];
+ 	HUSKY_DISP_LOG("HUSKY DISP: probe sysmmu ctrl=%08x\n", mmu);
+@@ -481,11 +594,17 @@ HuskyDisplay::probe(void)
+ 	HUSKY_DISP_LOG("HUSKY DISP: probe dram base=%llx size=%llx splash=%llx in_dram=%d low_managed=%d\n",
+ 	    (uint64_t)gPhysBase, (uint64_t)gPhysSize, fSplashPA, inDram, gPhysBase < 0x100000000ULL);
+ 
++	/*
++	 * The pool is read through the format ABL set, exactly as the CPU copy
++	 * into the splash is, so any linear 32-bit RGB code is accepted and none
++	 * is programmed.
++	 */
+ 	const char *why = NULL;
+-	uint32_t w = src & 0xFFFF, h = src >> 16;
+-	if (((ctrl0 >> 8) & 0x3F) != 0) {
++	uint32_t fmt = (ctrl0 & RDMA_CTRL0_FMT_MASK) >> RDMA_CTRL0_FMT_SHIFT;
++	if (fmt > RDMA_FMT_LAST_RGB32 || (ctrl0 & RDMA_CTRL0_NOT_LINEAR) != 0) {
+ 		why = "rdma-fmt";
+-	} else if (w != fWidth || h != fHeight || (img & 0x3FFF) != w || ((img >> 16) & 0x3FFF) != h || off != 0) {
++	} else if (w != fWidth || h != fHeight || (img & RDMA_IMG_WIDTH_MASK) != w || (img >> 16) != h ||
++	    off != 0) {
+ 		why = "geometry";
+ 	} else if (fRowBytes != fWidth * 4) {
+ 		why = "stride";
+@@ -502,6 +621,11 @@ HuskyDisplay::probe(void)
+ 	} else if (why == NULL && (trig & (TRIG_HW_EN | TRIG_MASK_DECON | TRIG_SEL_MASK)) != TRIG_HW_EN) {
+ 		HUSKY_DISP_LOG("HUSKY DISP: trig %08x not TE/DDI0, staying in copy mode\n", trig);
+ 		why = "trig";
++	} else if (why == NULL && (winEn != 1 || ((winCon & WIN_CON_CHMAP_MASK) >> WIN_CON_CHMAP_SHIFT) != 0 ||
++	    winStart != 0 || winEnd != (((fHeight - 1) << 16) | (fWidth - 1)))) {
++		HUSKY_DISP_LOG("HUSKY DISP: windows %u enabled, first con=%08x start=%08x end=%08x: not DPP0 "
++		    "full-screen, staying in copy mode\n", winEn, winCon, winStart, winEnd);
++		why = "win";
+ 	}
+ 	if (dcfg & DSIM_CONFIG_VIDEO) {
+ 		why = why != NULL ? why : "dsim-video";
+@@ -589,17 +713,17 @@ HuskyDisplay::hwTe(void)
+ 	return (fDecon[DECON_HW_TE_CNT / 4] >> fHwShift) & 0xFFFF;
+ }
+ 
+-/* Edges between two teSample() values: TE_RISE is a 32-bit count, the HW_TE_CNT field wraps at 16. */
++/* Edges between two hwTe() values; the field wraps at 16 bits. */
+ uint32_t
+ HuskyDisplay::teDelta(uint32_t cur, uint32_t last)
+ {
+-	return fTeRise ? cur - last : (cur - last) & 0xFFFF;
++	return (cur - last) & 0xFFFF;
+ }
+ 
+ uint32_t
+ HuskyDisplay::teSample(void)
+ {
+-	return fTeRise ? fTeCount : hwTe();
++	return hwTe();
+ }
+ 
+ void
+@@ -626,7 +750,7 @@ HuskyDisplay::teWait(uint32_t ms, uint32_t *periodUS)
+ 		}
+ 		uint32_t cur = teSample();
+ 		if (cur != seen) {
+-			uint64_t stamp = fTeRise ? fTeTime : mach_absolute_time();
++			uint64_t stamp = mach_absolute_time();
+ 			n += teDelta(cur, seen);
+ 			seen = cur;
+ 			if (tFirst == 0) {
+@@ -647,19 +771,50 @@ HuskyDisplay::teWait(uint32_t ms, uint32_t *periodUS)
+ 	return n;
+ }
+ 
++/* Both HW_TE_CNT words, sampled across ms. */
++void
++HuskyDisplay::teMeasure(uint32_t ms, uint32_t *hw0, uint32_t *hw1)
++{
++	uint64_t t0;
++	uint64_t span = hd_us_to_abs((uint64_t)ms * 1000);
++
++	*hw0 = fDecon[DECON_HW_TE_CNT / 4];
++	t0 = mach_absolute_time();
++	do {
++		IOSleep(1);
++	} while (mach_absolute_time() - t0 < span);
++	*hw1 = fDecon[DECON_HW_TE_CNT / 4];
++}
++
+ /*
+- * TE_RISE is not enabled by the Linux driver (it takes TE from a GPIO), so
+- * whether the DECON latches it with te_from = DDI0 is unproven: count it by
+- * polling the pending bit, and fall back to HW_TE_CNT if it never shows.
++ * HW_TE_CNT is two 16-bit counters, CNT_A [15:0] and CNT_B [31:16]; the zuma
++ * CAL defines both and reads neither. On silicon (boot 0127d2) both advance
++ * 30 per 500 ms at 60 Hz, so the probe takes the first whose 500 ms delta is
++ * 20..70 (60 or 120 Hz panel).
+  */
+-bool
+-HuskyDisplay::teMeasure(uint32_t ms, uint32_t *edges, uint32_t *hw0, uint32_t *hw1)
++static bool
++hd_hwcnt_is_te(uint32_t d)
++{
++	return d >= 20 && d <= 70;
++}
++
++/*
++ * The zuma driver takes TE from a GPIO and never enables TE_RISE, and it
++ * never pended on silicon with INT_EN_EXTRA forced while INT_EN was off. The
++ * retest uses the driver's enable sequence (INT_EN master + EXTRA, TE_RISE
++ * added to INT_EN_EXTRA) and restores both registers; the count is only
++ * logged, TE comes from HW_TE_CNT either way.
++ */
++void
++HuskyDisplay::teRiseDiag(void)
+ {
++	uint32_t en = fDecon[DECON_INT_EN / 4], enx = fDecon[DECON_INT_EN_EXTRA / 4];
+ 	uint32_t n = 0;
+-	uint64_t span = hd_us_to_abs((uint64_t)ms * 1000);
++	uint64_t span = hd_us_to_abs(500000);
+ 
+ 	fDecon[DECON_INT_PEND_EXTRA / 4] = EXTRA_TE_RISE;
+-	*hw0 = fDecon[DECON_HW_TE_CNT / 4];
++	fDecon[DECON_INT_EN_EXTRA / 4] = enx | EXTRA_TE_RISE;
++	fDecon[DECON_INT_EN / 4] = en | INT_EN_MASTER | INT_EXTRA;
+ 	uint64_t t0 = mach_absolute_time();
+ 	do {
+ 		IOSleep(1);
+@@ -668,52 +823,53 @@ HuskyDisplay::teMeasure(uint32_t ms, uint32_t *edges, uint32_t *hw0, uint32_t *h
+ 			n++;
+ 		}
+ 	} while (mach_absolute_time() - t0 < span);
+-	*hw1 = fDecon[DECON_HW_TE_CNT / 4];
+-	*edges = n;
+-	return n != 0;
++	fDecon[DECON_INT_EN / 4] = en;
++	fDecon[DECON_INT_EN_EXTRA / 4] = enx;
++	fDecon[DECON_INT_PEND_EXTRA / 4] = EXTRA_TE_RISE;
++	fDecon[DECON_INT_PEND / 4] = INT_EXTRA;
++	HUSKY_DISP_LOG("HUSKY DISP: probe te_rise pend=%u in 500 ms (en %08x enx %08x)\n", n, en, enx);
+ }
+ 
+-/*
+- * HW_TE_CNT is two 16-bit counters, CNT_A [15:0] and CNT_B [31:16]; the zuma
+- * CAL defines both and reads neither, so which one counts TE is proven only
+- * by the probe: its count over the 500 ms window must match the TE_RISE
+- * edges, or without TE_RISE sit between 20 and 70 (60 or 120 Hz panel).
+- */
+-static bool
+-hd_hwcnt_is_te(uint32_t edges, uint32_t d)
++/* Whether the pending shadow request ever clears and FRAME_START ever latches: eight reads over 40 ms. */
++void
++HuskyDisplay::latchDiag(void)
+ {
+-	if (edges != 0) {
+-		return d + 2 >= edges && d <= edges + 2;
++	uint32_t shd[8], pend[8];
++
++	for (uint32_t i = 0; i < 8; i++) {
++		shd[i] = fDecon[DECON_SHD_REG_UP_REQ / 4];
++		pend[i] = fDecon[DECON_INT_PEND / 4];
++		IOSleep(5);
+ 	}
+-	return d >= 20 && d <= 70;
++	HUSKY_DISP_LOG("HUSKY DISP: probe latch shd/pend %08x/%08x %08x/%08x %08x/%08x %08x/%08x %08x/%08x "
++	    "%08x/%08x %08x/%08x %08x/%08x\n", shd[0], pend[0], shd[1], pend[1], shd[2], pend[2], shd[3],
++	    pend[3], shd[4], pend[4], shd[5], pend[5], shd[6], pend[6], shd[7], pend[7]);
+ }
+ 
+ void
+ HuskyDisplay::bringup(void)
+ {
+-	uint32_t edges = 0, hw0 = 0, hw1 = 0;
+-	bool forced = false;
++	uint32_t hw0 = 0, hw1 = 0;
+ 
+-	fTeRise = teMeasure(500, &edges, &hw0, &hw1);
+-	if (!fTeRise) {
+-		fDecon[DECON_INT_EN_EXTRA / 4] |= EXTRA_TE_RISE;
+-		forced = true;
+-		fTeRise = teMeasure(500, &edges, &hw0, &hw1);
++	latchDiag();
++	if (hd_boot_arg("huskydisp_terise", 0) != 0) {
++		teRiseDiag();
+ 	}
++	teMeasure(500, &hw0, &hw1);
+ 	uint32_t dA = (hw1 - hw0) & 0xFFFF;
+ 	uint32_t dB = ((hw1 >> 16) - (hw0 >> 16)) & 0xFFFF;
+ 	fHwCnt = true;
+-	if (hd_hwcnt_is_te(edges, dA)) {
++	if (hd_hwcnt_is_te(dA)) {
+ 		fHwShift = 0;
+-	} else if (hd_hwcnt_is_te(edges, dB)) {
++	} else if (hd_hwcnt_is_te(dB)) {
+ 		fHwShift = 16;
+ 	} else {
+ 		fHwCnt = false;
+ 	}
+-	fTeHz = edges * 2;
++	fTeHz = fHwCnt ? (fHwShift ? dB : dA) * 2 : 0;
+ 	fPeriodUS = (fTeHz >= 115 && fTeHz <= 125) ? 8333 : 16667;
+-	HUSKY_DISP_LOG("HUSKY DISP: probe te pend=%u hwcnt=%08x->%08x dA=%u dB=%u use=%s in 500 ms (enx_forced=%d)\n",
+-	    edges, hw0, hw1, dA, dB, fHwCnt ? (fHwShift ? "B" : "A") : "none", forced);
++	HUSKY_DISP_LOG("HUSKY DISP: probe te hwcnt=%08x->%08x dA=%u dB=%u use=%s in 500 ms\n", hw0, hw1, dA, dB,
++	    fHwCnt ? (fHwShift ? "B" : "A") : "none");
+ 	if (fLevel < 3) {
+ 		return;
+ 	}
+@@ -731,7 +887,8 @@ HuskyDisplay::bringup(void)
+ 		if (fIrqOK) {
+ 			irqOn();
+ 		} else {
+-			HUSKY_DISP_LOG("HUSKY DISP: no IRQ mode (gic-group)\n");
++			HUSKY_DISP_LOG("HUSKY DISP: no IRQ mode (gic-group): SPIs are Secure, GIC untouched, "
++			    "flips and vsync polled\n");
+ 		}
+ 	}
+ 	if (fLevel >= 5) {
+@@ -747,7 +904,7 @@ HuskyDisplay::bringup(void)
+ 	IOInterruptState st = IOSimpleLockLockDisableInterrupt(fDispLock);
+ 	fMode = kModeDirect;
+ 	IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
+-	HUSKY_DISP_LOG("HUSKY DISP: direct on splash=%08x mask=%08x\n", (uint32_t)fSplashPA, SHD_REQUEST);
++	HUSKY_DISP_LOG("HUSKY DISP: direct on splash=%08x mask=%08x\n", (uint32_t)fSplashPA, fShdReq);
+ 	fWatch->setTimeoutMS(HD_WATCH_MS);
+ 	armWait(fSplash, fSplashPA, 0);
+ }
+@@ -757,7 +914,7 @@ HuskyDisplay::enableDecon(void)
+ {
+ 	fDecon[DECON_INT_PEND / 4] = INT_FRAME_START | INT_FRAME_DONE | INT_EXTRA;
+ 	fDecon[DECON_INT_PEND_EXTRA / 4] = EXTRA_ALL;
+-	fDecon[DECON_INT_EN_EXTRA / 4] |= EXTRA_TIME_OUT | EXTRA_RES_CONFLICT | (fTeRise ? EXTRA_TE_RISE : 0);
++	fDecon[DECON_INT_EN_EXTRA / 4] |= EXTRA_TIME_OUT | EXTRA_RES_CONFLICT;
+ 	fDecon[DECON_INT_EN / 4] |= INT_EN_MASTER | INT_EXTRA | INT_FRAME_START | INT_FRAME_DONE;
+ 	uint32_t v = fRdma[RDMA_IRQ / 4] & ~(RDMA_IRQ_ALL_MASK | RDMA_IRQ_PEND);
+ 	fRdma[RDMA_IRQ / 4] = v | RDMA_IRQ_FD_MASK | RDMA_IRQ_EN | RDMA_IRQ_PEND;
+@@ -788,11 +945,11 @@ HuskyDisplay::irqOn(void)
+ 	return true;
+ }
+ 
+-/* Vsync from TE when its interrupt works, else HW_TE_CNT, else the software timer. */
++/* Vsync from HW_TE_CNT, polled at a quarter period, else the software timer. */
+ void
+ HuskyDisplay::pickVsync(bool measure)
+ {
+-	uint32_t src = (fIrqOn && fTeRise) ? kVsyncTE : (fHwCnt ? kVsyncHWCnt : kVsyncTimer);
++	uint32_t src = fHwCnt ? kVsyncHWCnt : kVsyncTimer;
+ 
+ 	if (measure && src != kVsyncTimer) {
+ 		uint32_t period = 0;
+@@ -803,7 +960,6 @@ HuskyDisplay::pickVsync(bool measure)
+ 	}
+ 	IOInterruptState st = IOSimpleLockLockDisableInterrupt(fDispLock);
+ 	fVsyncSrc = src;
+-	fTeSent = fTeCount;
+ 	fHwCntLast = hwTe();
+ 	fWantTimer = src == kVsyncTimer;
+ 	fWantPeriodUS = fPeriodUS;
+@@ -813,7 +969,7 @@ HuskyDisplay::pickVsync(bool measure)
+ 	if (src == kVsyncHWCnt) {
+ 		fPoll->setTimeoutUS(fPeriodUS / 4);
+ 	}
+-	static const char *const names[] = { "timer", "te", "hwcnt" };
++	static const char *const names[] = { "timer", "hwcnt" };
+ 	if (measure) {
+ 		HUSKY_DISP_LOG("HUSKY DISP: vsync src=%s period %u us\n", names[src], fPeriodUS);
+ 	}
+@@ -880,6 +1036,28 @@ HuskyDisplay::dsimTimers(uint32_t urun, uint32_t te1)
+ 	fDsim[DSIM_CMD_TE_CTRL1 / 4] = te1;
+ }
+ 
++/*
++ * With SHADOW_EN set (dsim_reg_init does) a write lands in the programming
++ * bank and takes effect on the next frame. READ_EN clear reads the operating
++ * bank, which cannot show the write while the trigger is masked, so READ_EN
++ * is set for the read and put back.
++ */
++void
++HuskyDisplay::dsimTimersRead(uint32_t *urun, uint32_t *te1)
++{
++	uint32_t sfr = fDsim[DSIM_SFR_CTRL / 4];
++	bool swap = (sfr & DSIM_SFR_SHADOW_EN) && !(sfr & DSIM_SFR_READ_EN);
++
++	if (swap) {
++		fDsim[DSIM_SFR_CTRL / 4] = sfr | DSIM_SFR_READ_EN;
++	}
++	*urun = fDsim[DSIM_UNDERRUN_CTRL / 4] & 0xFFFF;
++	*te1 = fDsim[DSIM_CMD_TE_CTRL1 / 4];
++	if (swap) {
++		fDsim[DSIM_SFR_CTRL / 4] = sfr;
++	}
++}
++
+ void
+ HuskyDisplay::requestFrame(uint64_t pa)
+ {
+@@ -888,20 +1066,55 @@ HuskyDisplay::requestFrame(uint64_t pa)
+ 	IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
+ }
+ 
+-/* Waits for n TE edges, at most 100 ms. */
+-void
++/* Waits for n TE edges, at most 100 ms; returns the edges seen. */
++uint32_t
+ HuskyDisplay::teSkip(uint32_t n)
+ {
+-	uint32_t s0 = teSample();
++	uint32_t s0 = teSample(), seen = 0;
+ 	uint64_t t0 = mach_absolute_time();
+ 	uint64_t span = hd_us_to_abs(100000);
+ 
+-	while (teDelta(teSample(), s0) < n && mach_absolute_time() - t0 < span) {
++	while ((seen = teDelta(teSample(), s0)) < n && mach_absolute_time() - t0 < span) {
+ 		IOSleep(1);
+ 		if (!fIrqOn) {
+ 			pollNow();
+ 		}
+ 	}
++	return seen;
++}
++
++/*
++ * decon_reg_set_trigger: masking writes HW_TRIG_MASK_DECON with HW_TRIG_EN
++ * cleared, unmasking writes HW_TRIG_EN with the mask cleared. The other TRIG_CON
++ * bits are ABL's (silicon 0x3061 has 0x3000 and 0x60 set) and stay as read.
++ */
++void
++HuskyDisplay::triggerMask(void)
++{
++	fDecon[DECON_TRIG_CON / 4] = (fDecon[DECON_TRIG_CON / 4] & ~TRIG_HW_EN) | TRIG_MASK_DECON;
++}
++
++void
++HuskyDisplay::triggerUnmask(void)
++{
++	fDecon[DECON_TRIG_CON / 4] = (fDecon[DECON_TRIG_CON / 4] & ~TRIG_MASK_DECON) | TRIG_HW_EN;
++}
++
++/* decon_reg_start order: request, drop a stale FRAME_START, wait for RUN_STATUS (2 ms), unmask. */
++void
++HuskyDisplay::triggerResume(void)
++{
++	requestFrame(fSplashPA);
++	fDecon[DECON_INT_PEND / 4] = INT_FRAME_START;
++	for (uint32_t waited = 0; !(fDecon[DECON_GLOBAL_CON / 4] & GCON_RUN_STATUS); waited++) {
++		if (waited > 200) {
++			HUSKY_DISP_LOG("HUSKY DISP: decon run-status timeout gcon=%08x\n",
++			    fDecon[DECON_GLOBAL_CON / 4]);
++			break;
++		}
++		IODelay(10);
++	}
++	triggerUnmask();
+ }
+ 
+ /*
+@@ -922,7 +1135,7 @@ HuskyDisplay::panelQuiesce(void)
+ 		IOSleep(1);
+ 	}
+ 	IOSleep(10);
+-	fDecon[DECON_TRIG_CON / 4] |= TRIG_MASK_DECON;
++	triggerMask();
+ 	return true;
+ }
+ 
+@@ -934,10 +1147,9 @@ HuskyDisplay::panelTo60(void)
+ 	if (!panelQuiesce() || !dsimSend(husky_dcs_60, sizeof(husky_dcs_60) / sizeof(husky_dcs_60[0]), &us)) {
+ 		HUSKY_DISP_LOG("HUSKY DISP: panel revert to 60Hz failed\n");
+ 	}
+-	dsimTimers(HD_URUN_60, HD_TE1_60);
++	dsimTimers(fDsimUrun, fDsimTe1);
+ 	teSkip(2);
+-	fDecon[DECON_TRIG_CON / 4] &= ~TRIG_MASK_DECON;
+-	requestFrame(fSplashPA);
++	triggerResume();
+ }
+ 
+ void
+@@ -949,7 +1161,7 @@ HuskyDisplay::panelTo120(void)
+ 		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz skipped (huskydisp_hz=60)\n");
+ 		return;
+ 	}
+-	if (!fTeRise && !fHwCnt) {
++	if (!fHwCnt) {
+ 		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz skipped (no TE to verify the switch)\n");
+ 		return;
+ 	}
+@@ -959,7 +1171,7 @@ HuskyDisplay::panelTo120(void)
+ 		fPeriodUS = 8333;
+ 		return;
+ 	}
+-	if (fDsimUrun != HD_URUN_60 || fDsimTe1 != HD_TE1_60) {
++	if (fDsimUrun != HD_URUN_60 || !hd_te1_is(fDsimTe1, 60)) {
+ 		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz skipped (dsim-timers urun %04x te1 %08x)\n", fDsimUrun,
+ 		    fDsimTe1);
+ 		return;
+@@ -969,29 +1181,37 @@ HuskyDisplay::panelTo120(void)
+ 		return;
+ 	}
+ 	if (!dsimSend(husky_dcs_120, sizeof(husky_dcs_120) / sizeof(husky_dcs_120[0]), &us)) {
+-		fDecon[DECON_TRIG_CON / 4] &= ~TRIG_MASK_DECON;
++		triggerUnmask();
+ 		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz FAILED (dcs-timeout), staying at 60\n");
+ 		return;
+ 	}
+ 	HUSKY_DISP_LOG("HUSKY DISP: dcs %u pkts drained in %u us\n",
+ 	    (uint32_t)(sizeof(husky_dcs_120) / sizeof(husky_dcs_120[0])), us);
+ 
++	const uint32_t te120 = hd_te1(120);
+ 	uint32_t urun = fDsim[DSIM_UNDERRUN_CTRL / 4] & 0xFFFF;
+ 	uint32_t te1 = fDsim[DSIM_CMD_TE_CTRL1 / 4];
+-	if (urun == HD_URUN_60 && te1 == HD_TE1_60) {
+-		dsimTimers(HD_URUN_120, HD_TE1_120);
+-	} else if (urun != HD_URUN_120 || te1 != HD_TE1_120) {
++	if (urun == fDsimUrun && te1 == fDsimTe1) {
++		dsimTimers(HD_URUN_120, te120);
++	} else if (urun != HD_URUN_120 || te1 != te120) {
+ 		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz FAILED (dsim-timers urun %04x te1 %08x), reverting\n", urun,
+ 		    te1);
+ 		panelTo60();
+ 		return;
+ 	}
+-	HUSKY_DISP_LOG("HUSKY DISP: dsim urun %04x->%04x te1 %08x->%08x\n", urun,
+-	    fDsim[DSIM_UNDERRUN_CTRL / 4] & 0xFFFF, te1, fDsim[DSIM_CMD_TE_CTRL1 / 4]);
++	uint32_t urunNow, te1Now;
++	dsimTimersRead(&urunNow, &te1Now);
++	HUSKY_DISP_LOG("HUSKY DISP: dsim urun %04x->%04x te1 %08x->%08x sfr=%08x\n", urun, urunNow, te1, te1Now,
++	    fDsim[DSIM_SFR_CTRL / 4]);
++	if (urunNow != HD_URUN_120 || te1Now != te120) {
++		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz FAILED (dsim-timers readback), reverting\n");
++		panelTo60();
++		return;
++	}
+ 
+-	teSkip(2);
+-	fDecon[DECON_TRIG_CON / 4] &= ~TRIG_MASK_DECON;
+-	requestFrame(fSplashPA);
++	uint32_t settled = teSkip(2);
++	HUSKY_DISP_LOG("HUSKY DISP: te while masked %u edges\n", settled);
++	triggerResume();
+ 	uint32_t edges = teWait(250, &period);
+ 	if (edges >= 28 && edges <= 32) {
+ 		fPeriodUS = period != 0 ? period : 8333;
+@@ -1008,14 +1228,16 @@ HuskyDisplay::panelTo120(void)
+ void
+ HuskyDisplay::programFlip(uint64_t pa)
+ {
+-	fRdma[RDMA_BASEADDR_Y8 / 4] = (uint32_t)pa;
++	fRdma[RDMA_BASEADDR_P0 / 4] = (uint32_t)pa;
+ 	__builtin_arm_dsb(DSB_SY);
+-	fDecon[DECON_GLOBAL_CON / 4] |= 0x3;
++	fDecon[DECON_GLOBAL_CON / 4] |= GCON_ENABLE;
+ 	/*
+-	 * 0x80003FFF (global + windows 0..13) is the value that moves a frame on
+-	 * silicon; the CAL's FOR_DECON covers only windows 0..5.
++	 * Divergence: decon_reg_update_req_global also requests the compression
++	 * bank (SHD_REG_UP_REQ_CMP, bit 20, DECON0); the console's 0x80003FFF
++	 * moves frames on silicon without it, so it is added only by
++	 * huskydisp_cmp=1.
+ 	 */
+-	fDecon[DECON_SHD_REG_UP_REQ / 4] = SHD_REQUEST;
++	fDecon[DECON_SHD_REG_UP_REQ / 4] = fShdReq;
+ }
+ 
+ void
+@@ -1127,7 +1349,7 @@ HuskyDisplay::onFrameStart(void)
+ 		fFsOrphan++;
+ 		return;
+ 	}
+-	uint32_t sbase = fRdma[(RDMA_SHADOW + RDMA_BASEADDR_Y8) / 4];
++	uint32_t sbase = fRdma[(RDMA_SHADOW + RDMA_BASEADDR_P0) / 4];
+ 	if (sbase == (uint32_t)fArmed.pa) {
+ 		fArmed.tLatch = mach_absolute_time();
+ 		fScanning = fArmed;
+@@ -1173,11 +1395,7 @@ HuskyDisplay::onExtra(void)
+ 
+ 	fDecon[DECON_INT_PEND_EXTRA / 4] = seen;
+ 	fDecon[DECON_INT_PEND / 4] = INT_EXTRA;
+-	if (seen & EXTRA_TE_RISE) {
+-		fTeCount++;
+-		fTeTime = mach_absolute_time();
+-	}
+-	if (seen & (EXTRA_TIME_OUT | EXTRA_RES_CONFLICT)) {
++	if (seen != 0) {
+ 		fErr |= ERR_DECON;
+ 		fErrArg = seen;
+ 		fErrSeen |= ERR_DECON;
+@@ -1191,7 +1409,7 @@ HuskyDisplay::onRdma(void)
+ 	uint32_t pend = v & RDMA_IRQ_PEND;
+ 
+ 	fRdma[RDMA_IRQ / 4] = v;
+-	if (pend & (RDMA_IRQ_DEADLOCK | RDMA_IRQ_CONFIG_ERR)) {
++	if (pend & RDMA_IRQ_ERR) {
+ 		fErr |= ERR_RDMA;
+ 		fErrArg = pend >> 16;
+ 		fErrSeen |= ERR_RDMA;
+@@ -1211,7 +1429,7 @@ HuskyDisplay::servicePoll(void)
+ 	if (p & INT_FRAME_START) {
+ 		onFrameStart();
+ 	}
+-	if (fRdma[RDMA_IRQ / 4] & (RDMA_IRQ_DEADLOCK | RDMA_IRQ_CONFIG_ERR)) {
++	if (fRdma[RDMA_IRQ / 4] & RDMA_IRQ_ERR) {
+ 		onRdma();
+ 	}
+ }
+@@ -1366,7 +1584,9 @@ HuskyDisplay::markRetired(uint32_t swapID)
+  * sel 6 is shared by _kern_SwapWait and _kern_SwapWaitWithTimeout; until the
+  * scalar order is confirmed from the userland disassembly, in[0] is the swap
+  * id and in[1], when present, a timeout in ms, capped at 100 ms. The first 32
+- * calls are logged to settle it.
++ * calls are logged to settle it. Boot 0127d2 logged in=3 [n, 0x8000000X, 0, 0]
++ * with X in {0, 1, 3}: in[1] is not a millisecond count, so the cap always
++ * applies; what it is stays open until the disassembly says.
+  */
+ IOReturn
+ HuskyDisplay::swapWait(uint32_t inCount, const uint64_t *in, uint32_t maxSwapID)
+@@ -1409,9 +1629,8 @@ bool
+ HuskyDisplay::doWork(void)
+ {
+ 	struct husky_flip done[8];
+-	uint32_t nDone = 0, err, errArg, te, mismArmed = 0, mismSBase = 0, src;
++	uint32_t nDone = 0, err, errArg, mismArmed = 0, mismSBase = 0;
+ 	uint32_t period;
+-	uint64_t teT;
+ 	bool wake, dirty, wantTimer, inject, mism, announce, mismSame;
+ 
+ 	IOInterruptState st = IOSimpleLockLockDisableInterrupt(fDispLock);
+@@ -1422,9 +1641,6 @@ HuskyDisplay::doWork(void)
+ 	}
+ 	wake = fWakeSlots;
+ 	fWakeSlots = false;
+-	te = fTeCount;
+-	teT = fTeTime;
+-	src = fVsyncSrc;
+ 	err = fErr;
+ 	errArg = fErrArg;
+ 	inject = fErrInject;
+@@ -1468,12 +1684,6 @@ HuskyDisplay::doWork(void)
+ 	if (dirty) {
+ 		fOps.vsyncTimer(fCtx, wantTimer, period);
+ 	}
+-	if ((src == kVsyncTE) && te != fTeSent) {
+-		uint32_t delta = te - fTeSent;
+-		fTeSent = te;
+-		fDrops += delta - 1;
+-		fOps.vsync(fCtx, delta, teT);
+-	}
+ 	if (announce) {
+ 		HUSKY_DISP_LOG("HUSKY DISP: fallback (%s) -> copy mode\n", fFallbackMsg);
+ 	}
+@@ -1510,9 +1720,8 @@ HuskyDisplay::fallback(const char *reason)
+ 		return;
+ 	}
+ 	fMode = kModeFallback;
+-	bool teIrq = fIrqOn && fTeRise;
+-	fDecon[DECON_INT_EN / 4] = teIrq ? (INT_EN_MASTER | INT_EXTRA) : 0;
+-	fDecon[DECON_INT_EN_EXTRA / 4] = teIrq ? EXTRA_TE_RISE : 0;
++	/* decon_reg_set_interrupts(0): gate the master and EXTRA only. */
++	fDecon[DECON_INT_EN / 4] &= ~(INT_EN_MASTER | INT_EXTRA);
+ 	fRdma[RDMA_IRQ / 4] = ((fRdma[RDMA_IRQ / 4] & ~(RDMA_IRQ_EN | RDMA_IRQ_PEND)) | RDMA_IRQ_ALL_MASK) | RDMA_IRQ_PEND;
+ 	retire(&fArmed);
+ 	retire(&fScanning);
+@@ -1548,9 +1757,13 @@ HuskyDisplay::pollFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (d->fVsyncSrc == kVsyncHWCnt) {
+ 		uint32_t cnt = d->hwTe();
+ 		if (cnt != d->fHwCntLast) {
+-			uint32_t delta = (cnt - d->fHwCntLast) & 0xFFFF;
++			uint32_t delta = d->teDelta(cnt, d->fHwCntLast);
++			uint64_t now = mach_absolute_time();
+ 			d->fHwCntLast = cnt;
+-			d->fOps.vsync(d->fCtx, delta, mach_absolute_time());
++			d->fTeCount += delta;
++			d->fTeTime = now;
++			d->fDrops += delta - 1;
++			d->fOps.vsync(d->fCtx, delta, now);
+ 		}
+ 		again = true;
+ 	}
+@@ -1596,7 +1809,7 @@ HuskyDisplay::watch(void)
+ 		if (reason[0] == '\0' && fScanning.surf != NULL && now - fScanning.tLatch > hd_us_to_abs(HD_XFER_TIMEOUT_US)) {
+ 			snprintf(reason, sizeof(reason), "xfer-timeout");
+ 		}
+-		if (reason[0] == '\0' && fTeRise && now - fTeTime > hd_us_to_abs(HD_TE_LOST_US)) {
++		if (reason[0] == '\0' && fVsyncSrc == kVsyncHWCnt && now - fTeTime > hd_us_to_abs(HD_TE_LOST_US)) {
+ 			snprintf(reason, sizeof(reason), "te-lost");
+ 		}
+ 		if (fLevel >= 5 && (fDsim[DSIM_INTSRC / 4] & DSIM_INT_UNDER_RUN)) {
+diff --git a/iokit/Kernel/arm/HuskyDisplay.h b/iokit/Kernel/arm/HuskyDisplay.h
+index 6c49042..dd28572 100644
+--- a/iokit/Kernel/arm/HuskyDisplay.h
++++ b/iokit/Kernel/arm/HuskyDisplay.h
+@@ -3,7 +3,8 @@
+  * IOSurfaces out of the scanout pool through DECON0/DPP0 without a CPU copy,
+  * paces vsync from the panel's TE, and switches the panel to 120 Hz.
+  *
+- * Owned by AppleCLCD (HuskyFramebuffer.cpp). Everything is behind the
++ * Registers follow the zuma CAL (display/samsung/cal_9865). Owned by
++ * AppleCLCD (HuskyFramebuffer.cpp). Everything is behind the
+  * huskydisp=N boot-arg; with N absent or 0 no instance exists.
+  */
+ #ifndef _HUSKY_DISPLAY_H
+@@ -62,7 +63,6 @@ public:
+ 	};
+ 	enum {
+ 		kVsyncTimer,
+-		kVsyncTE,
+ 		kVsyncHWCnt,
+ 	};
+ 
+@@ -92,13 +92,14 @@ private:
+ 	IOWorkLoop            *fLoop;
+ 	HuskyDispEventSource  *fEvent;
+ 	IOTimerEventSource    *fWatch;          /* 20 ms watchdog */
+-	IOTimerEventSource    *fPoll;           /* 250 us DECON poll, HW_TE_CNT vsync */
++	IOTimerEventSource    *fPoll;           /* 250 us DECON poll; HW_TE_CNT vsync at a quarter period */
+ 	HuskyDisplayOps        fOps;
+ 	void                  *fCtx;
+ 	HuskySurface          *fSplash;
+ 	uint64_t               fSplashPA;
+ 	uint32_t               fWidth, fHeight, fRowBytes, fFrameBytes;
+ 	uint32_t               fLevel, fHz, fInject;
++	uint32_t               fShdReq;         /* SHD_REG_UP_REQ value of one frame request */
+ 
+ 	volatile uint32_t *fDecon;
+ 	volatile uint32_t *fWin;
+@@ -123,9 +124,9 @@ private:
+ 	uint32_t fMismRun, fMismArmed, fMismSBase, fMismSBase0;
+ 	bool     fMismNew, fMismSame;
+ 
+-	volatile uint32_t fTeCount;
++	volatile uint32_t fTeCount;             /* HW_TE_CNT edges seen by the vsync poll */
+ 	volatile uint64_t fTeTime;
+-	uint32_t fTeSent, fDrops;
++	uint32_t fDrops;
+ 	uint32_t fFs, fFd, fFdSpurious, fFsOrphan, fFdMissed, fIrqSpur;
+ 	uint32_t fFlips, fCopies, fMism, fReuse, fArmWaits, fRingOverflow;
+ 	uint32_t fDsimUnder;
+@@ -133,11 +134,11 @@ private:
+ 	uint32_t fRetiredSwapID;                /* fWaitLock */
+ 
+ 	bool     fPoolOK, fProbeOK;
+-	bool     fIrqOK, fIrqOn;
+-	bool     fTeRise, fHwCnt;               /* TE_RISE latches; HW_TE_CNT counts */
++	bool     fIrqOK, fIrqOn;                /* fIrqOK: all four SPIs are Non-secure Group 1 */
++	bool     fHwCnt;                        /* HW_TE_CNT counts TE edges */
+ 	uint32_t fPeriodUS;
+ 	uint32_t fTeHz;
+-	uint32_t fDsimUrun, fDsimTe1;           /* ABL's values, probed */
++	uint32_t fDsimUrun, fDsimTe1;           /* the 60 Hz pair ABL left, probed */
+ 	uint32_t fWatchTick;
+ 	uint32_t fHwCntLast;
+ 	uint32_t fHwShift;                      /* HW_TE_CNT field that counts TE: 0 = CNT_A, 16 = CNT_B */
+@@ -158,20 +159,26 @@ private:
+ 	void probe(void);
+ 	bool allocPool(void);
+ 	void bringup(void);
+-	bool teMeasure(uint32_t ms, uint32_t *edges, uint32_t *hw0, uint32_t *hw1);
++	void teMeasure(uint32_t ms, uint32_t *hw0, uint32_t *hw1);
++	void teRiseDiag(void);
++	void latchDiag(void);
+ 	uint32_t teWait(uint32_t ms, uint32_t *periodUS);
+ 	uint32_t hwTe(void);
+ 	uint32_t teDelta(uint32_t cur, uint32_t last);
+ 	uint32_t teSample(void);
+-	void teSkip(uint32_t n);
++	uint32_t teSkip(uint32_t n);
+ 	void enableDecon(void);
+ 	bool irqOn(void);
++	void triggerMask(void);
++	void triggerUnmask(void);
++	void triggerResume(void);
+ 	void pickVsync(bool measure);
+ 	void panelTo120(void);
+ 	void panelTo60(void);
+ 	bool panelQuiesce(void);
+ 	bool dsimSend(const void *packets, uint32_t count, uint32_t *drainedUS);
+ 	void dsimTimers(uint32_t urun, uint32_t te1);
++	void dsimTimersRead(uint32_t *urun, uint32_t *te1);
+ 	void requestFrame(uint64_t pa);
+ 
+ 	void programFlip(uint64_t pa);
