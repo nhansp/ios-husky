@@ -1,0 +1,14 @@
+diff --git a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+index f472bfa..92ef3ec 100644
+--- a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
++++ b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+@@ -261,7 +261,8 @@ h_get_next_trace_id(OSObject *, void *, IOExternalMethodArguments *a)
+ 	if (a->structureOutputSize < 0x10) {
+ 		return kIOGPUReturnBadArgument;
+ 	}
+-	static volatile SInt64 sTrace = 0;
++	/* IOGPU asserts the range minimum is non-zero (IOGPUDeviceRef.c getNextGIDGroup) */
++	static volatile SInt64 sTrace = 0x1000000;
+ 	uint64_t begin = (uint64_t)OSAddAtomic64(0x1000000, &sTrace);
+ 	uint64_t *o = (uint64_t *)a->structureOutput;
+ 	o[0] = begin;
