@@ -14,6 +14,7 @@ BUNDLE=$OUT/MaliMetal.bundle
 OBJ=$OUT/obj
 rm -rf "$BUNDLE" "$OBJ"
 mkdir -p "$BUNDLE" "$OBJ"
+failed=""
 
 ARCH="-arch arm64e -isysroot $SDK -miphoneos-version-min=26.0"
 DEFS="$(cat "$MESA_TREE/mesa_defs.txt") -D_DARWIN_C_SOURCE"
@@ -29,18 +30,22 @@ done
 
 for f in mali_formats mali_texture mali_desc mali_state mali_cs; do
 	clang $ARCH -std=gnu11 -O2 -g -Wall -Werror -DPAN_ARCH=11 $DEFS \
-		-I"$HERE/core" -I"$HERE/compat" -I"$CONTRACT" $MESA_INC -c "$HERE/core/$f.c" -o "$OBJ/$f.o"
+		-I"$HERE/core" -I"$HERE/compat" -I"$CONTRACT" $MESA_INC -c "$HERE/core/$f.c" -o "$OBJ/$f.o" || failed="$failed $f"
 done
 
 for f in mvpack air2vh_offline; do
-	clang $ARCH -std=gnu11 -O2 -g -Wall -Werror -I"$CONTRACT" -c "$HERE/offline/$f.c" -o "$OBJ/$f.o"
+	clang $ARCH -std=gnu11 -O2 -g -Wall -Werror -I"$CONTRACT" -c "$HERE/offline/$f.c" -o "$OBJ/$f.o" || failed="$failed $f"
 done
 
 for f in MaliMTLDevice MaliResources MaliResourceUsage MaliCommandBuffer MaliShader MaliPipeline MaliInternal \
 	MaliBindings MaliRenderEncoder MaliComputeEncoder MaliBlitEncoder; do
 	clang $ARCH -fobjc-arc -std=gnu11 -O2 -g -Wall -Werror -I"$HERE" -I"$HERE/core" -I"$CONTRACT" \
-		-c "$HERE/$f.m" -o "$OBJ/$f.o"
+		-c "$HERE/$f.m" -o "$OBJ/$f.o" || failed="$failed $f"
 done
+if [ -n "$failed" ]; then
+	echo "failed:$failed" >&2
+	exit 1
+fi
 
 clang $ARCH -bundle -dead_strip -o "$BUNDLE/MaliMetal" "$OBJ"/*.o "$MESA_LIB" \
 	"$HERE/stubs/IOGPU.tbd" "$HERE/stubs/Metal.tbd" \

@@ -235,7 +235,8 @@ static void MaliLoadDevProps(io_service_t port, mali_dev_props_t *out) {
 - (id)newLibraryWithGraphs:(id)g functions:(id)f error:(NSError **)e { return nil; }
 - (id)newLibraryWithGraphsSPI:(id)g functions:(id)f error:(NSError **)e { return nil; }
 - (id)newRenderPipelineStateWithTileDescriptor:(id)d error:(NSError **)e { return nil; }
-- (id)newRenderPipelineStateWithTileDescriptor:(id)d options:(NSUInteger)o reflection:(id *)r error:(NSError **)e { return nil; }
+- (id)newRenderPipelineStateWithTileDescriptor:(MTLTileRenderPipelineDescriptor *)d options:(MTLPipelineOption)o
+                                    reflection:(MTLAutoreleasedRenderPipelineReflection *)r error:(NSError **)e { return nil; }
 /* iOS-only selectors absent from the macOS-derived base (spec 04 section 9, SnapMetal port notes) */
 - (id)newResourceGroupFromResources:(const id *)r count:(NSUInteger)n { return nil; }
 - (id)newTextureLayoutWithDescriptor:(id)d isHeapOrBufferBacked:(BOOL)b { return nil; }
