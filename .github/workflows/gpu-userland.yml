@@ -53,6 +53,11 @@ jobs:
       - name: MaliMetal.bundle
         run: |
           set -eux
+          xcrun -sdk iphoneos metal --version || xcodebuild -downloadComponent MetalToolchain
+          mkdir -p out/plugin
+          xcrun -sdk iphoneos metal -c -mios-version-min=26.0 userland/plugin/MaliMetal/shaders/MaliInternal.metal -o out/plugin/MaliInternal.air
+          xcrun -sdk iphoneos metallib out/plugin/MaliInternal.air -o out/plugin/MaliInternal.metallib
+          export INTERNAL_AIR=$PWD/out/plugin/MaliInternal.air
           PACK=""
           [ -f userland/shadercache/shaders.mvpack ] && PACK=$PWD/userland/shadercache/shaders.mvpack
           MESA_SRC=$PWD/mesa MESA_TREE=$PWD/out/mesa/tree MESA_LIB=$PWD/out/mesa/lib/libmali_mesa.a \
@@ -78,6 +83,7 @@ jobs:
         run: |
           mkdir -p artifact
           [ -d out/plugin/MaliMetal.bundle ] && cp -R out/plugin/MaliMetal.bundle artifact/
+          [ -f out/plugin/MaliInternal.metallib ] && cp out/plugin/MaliInternal.metallib artifact/
           [ -d out/smoke ] && cp out/smoke/metal_smoke out/smoke/metal_smoke.metallib out/smoke/*.plist artifact/ 2>/dev/null || true
           (cd artifact && find . -type f ! -name SHA256SUMS -exec shasum -a 256 {} + > ../SHA256SUMS && mv ../SHA256SUMS .) || true
 

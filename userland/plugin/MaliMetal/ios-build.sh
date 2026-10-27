@@ -47,7 +47,13 @@ if [ -n "$failed" ]; then
 	exit 1
 fi
 
+# the built-in shaders' AIR module (shaders/MaliInternal.metal) as section __MALI,__internal (MaliInternal.m)
+if [ -z "${INTERNAL_AIR:-}" ] || [ ! -s "$INTERNAL_AIR" ]; then
+	echo "INTERNAL_AIR (compiled shaders/MaliInternal.metal) is required" >&2
+	exit 1
+fi
 clang $ARCH -bundle -dead_strip -o "$BUNDLE/MaliMetal" "$OBJ"/*.o "$MESA_LIB" \
+	-Wl,-sectcreate,__MALI,__internal,"$INTERNAL_AIR" \
 	"$HERE/stubs/IOGPU.tbd" "$HERE/stubs/Metal.tbd" \
 	-framework Foundation -framework CoreFoundation -framework IOKit -framework IOSurface -lc++ -lz
 cp "$HERE/Info.plist" "$BUNDLE/Info.plist"
