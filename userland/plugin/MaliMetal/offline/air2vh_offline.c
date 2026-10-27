@@ -110,7 +110,8 @@ static const mvp_index *lookup_key(const char key[65])
 static const mvp_index *lookup_name(const air2vh_compile_info *info)
 {
     const mvp_index *found = NULL;
-    if (!info->entry || info->num_constants)
+    /* Metal names every generated stage alike (air.vertexFetchFunction): only the exact AIR identifies one. */
+    if (!info->entry || info->num_constants || !strncmp(info->entry, "air.", 4))
         return NULL;
     for (uint32_t i = 0; i < g_pack.count; i++) {
         const mvp_index *e = &g_pack.index[i];
