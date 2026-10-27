@@ -1,0 +1,268 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 37774e3..0adaa6e 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -241,7 +241,7 @@ static const uint32_t gpu_l2_hash[3] = {0x0036DB6D, 0x005B6DB6, 0x0};
+ #define FW_SHARED_VA            0x04000000u
+ #define FW_MAX_SECTIONS         16
+ #define FW_MEM_MAX              (2u << 20)
+-#define PT_PAGES                32u
++#define PT_PAGES                256u
+ /* GPU MMU granule (4 KiB); xnu's own PAGE_SIZE is 16 KiB here. */
+ #define GPU_PAGE                0x1000u
+ #define GPU_PAGE_MASK           (GPU_PAGE - 1)
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+index 27ea8dd..cf11b4e 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+@@ -71,9 +71,73 @@ IOGPUCommandQueue::free()
+ 		mali_backend_ops.syncobj_destroy(fSync);
+ 		fSync = NULL;
+ 	}
++	if (fHeap != NULL) {
++		mali_backend_ops.tiler_heap_destroy(fHeap);
++		fHeap = NULL;
++	}
+ 	OSObject::free();
+ }
+ 
++/*
++ * D-3 (MaliPluginABI.h): create the queue's tiler heap and publish it in the plug-in's queue-state
++ * buffer, a TILER_HEAP descriptor at +0 and struct mali_heap_result at +0x80, before the SUBMIT_CS
++ * that follows in the same command buffer runs HEAP_SET.
++ */
++uint32_t
++IOGPUCommandQueue::heapOp(const struct mali_kcmd_heap_op *cmd)
++{
++	if (cmd->op == MALI_HEAP_OP_DESTROY) {
++		if (fHeap != NULL) {
++			mali_backend_ops.tiler_heap_destroy(fHeap);
++			fHeap = NULL;
++		}
++		return kIOGPUStatus_Success;
++	}
++	if (cmd->op != MALI_HEAP_OP_CREATE || fHeap != NULL || cmd->qstate_resource_id > UINT32_MAX) {
++		return kIOGPUStatus_ParseError;
++	}
++
++	IOGPUResource *r = fDevice->lookupResource((uint32_t)cmd->qstate_resource_id);
++	if (r == NULL) {
++		return kIOGPUStatus_ParseError;
++	}
++	uint8_t *qs = r->bo() ? (uint8_t *)mali_backend_ops.bo_cpu_map(r->bo()) : NULL;
++	const bool usable = qs != NULL && r->gpuAddress() == cmd->qstate_gpu_va &&
++	    r->gpuLength() >= MALI_QSTATE_RESULT_OFF + sizeof(struct mali_heap_result);
++	if (!usable) {
++		IOLog("IOGPU: HEAP_OP: queue-state resource %llu unusable (gpu 0x%llx, expected 0x%llx, size 0x%llx)\n",
++		    cmd->qstate_resource_id, (unsigned long long)r->gpuAddress(), cmd->qstate_gpu_va, r->gpuLength());
++		r->release();
++		return kIOGPUStatus_ParseError;
++	}
++
++	mali_gpu_va_t ctx = 0, first = 0;
++	struct mali_heap_result res;
++	bzero(&res, sizeof(res));
++	mali_status_t st = mali_backend_ops.tiler_heap_create(fDevice->task()->vm(), cmd->chunk_size,
++	    cmd->initial_chunks, cmd->max_chunks, &fHeap, &ctx, &first);
++	if (st == 0) {
++		const uint64_t top = first + cmd->chunk_size, bottom = first + 64;
++		const uint32_t desc[8] = {
++			0x29u,      /* Type Buffer (9), Buffer type Tiler heap (2) [Mesa genxml v11.xml "Tiler Heap"] */
++			cmd->chunk_size,
++			(uint32_t)first, (uint32_t)(first >> 32),
++			(uint32_t)bottom, (uint32_t)(bottom >> 32),
++			(uint32_t)top, (uint32_t)(top >> 32),
++		};
++		memcpy(qs + MALI_QSTATE_HEAP_DESC_OFF, desc, sizeof(desc));
++		res.ctx_gpu_va = ctx;
++		res.first_chunk_gpu_va = first;
++		res.state = 1;
++	} else {
++		res.error = (uint32_t)st;
++	}
++	memcpy(qs + MALI_QSTATE_RESULT_OFF, &res, sizeof(res));
++	mali_backend_ops.dcache_flush(qs, MALI_QSTATE_RESULT_OFF + sizeof(res));
++	r->release();
++	return st == 0 ? kIOGPUStatus_Success : kIOGPUStatus_ParseError;
++}
++
+ IOReturn
+ IOGPUCommandQueue::submitCommandBuffers(const void *structIn, uint32_t count,
+     uint32_t argSize, uint32_t *statusOut)
+@@ -426,9 +490,21 @@ IOGPUCommandQueue::processSegmentKernelCommands(const uint8_t *k, uint32_t start
+ 			break;
+ 		}
+ 
++		case MALI_KCMD_HEAP_OP: {                 /* Vendor 0x16: tiler heap management */
++			if (size != sizeof(struct mali_kcmd_heap_op)) {
++				return kIOGPUStatus_ParseError;
++			}
++			struct mali_kcmd_heap_op cmd;
++			memcpy(&cmd, k + off, sizeof(cmd));
++			uint32_t hs = heapOp(&cmd);
++			if (hs != kIOGPUStatus_Success) {
++				return hs;
++			}
++			break;
++		}
++
+ 		case MALI_KCMD_FENCE:                     /* Vendor 0x13: stamp write completion marker */
+ 		case MALI_KCMD_FILL:                      /* Vendor 0x14: buffer fill */
+-		case MALI_KCMD_HEAP_OP:                   /* Vendor 0x16: tiler heap management */
+ 			/* Decoded and accepted */
+ 			break;
+ 
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.h b/iokit/Families/IOGPU/IOGPUCommandQueue.h
+index 7f22339..e9e97f4 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.h
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.h
+@@ -29,6 +29,7 @@ class IOGPUCommandQueue : public OSObject {
+ 	IOGPUNotificationQueue *fNotifQueue;
+ 	mali_queue_t           *fMaliQueue;
+ 	mali_syncobj_t         *fSync;
++	mali_tiler_heap_t      *fHeap;
+ 	uint64_t                fTraceId;
+ 	uint64_t                fSubmitSeq;     /* Monotonic sync count [spec 06 line 180] */
+ 	uint32_t                fStatus;        /* Last submission status */
+@@ -53,6 +54,8 @@ private:
+ 	/* Process one command buffer and manage notifications */
+ 	uint32_t processOneCommandBuffer(const iogpu_cmdbuf_args_t *cb);
+ 
++	uint32_t heapOp(const struct mali_kcmd_heap_op *cmd);
++
+ 	/* Decode kernel commands inside one segment [spec 01 lines 576-607] */
+ 	uint32_t processSegmentKernelCommands(const uint8_t *k, uint32_t start,
+ 	    uint32_t end, uint32_t *submits_dispatched);
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 5894aed..1b27ad0 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -1175,6 +1175,15 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 	    us < 500000 ? "completed" : "TIMED OUT", us,
+ 	    (unsigned long long)(so != NULL && so->cpu != NULL ? *so->cpu : 0),
+ 	    (unsigned long long)(q->ring_out_cpu != NULL ? q->ring_out_cpu[0] : 0));
++	if (us >= 500000 && q->csout != 0 && q->csgout != 0) {
++		BR_LOG("HUSKY IOGPU bridge: CSG%u ack 0x%x state 0x%x ep 0x%x | CS ack 0x%x cmd_ptr 0x%llx wait 0x%x "
++		    "blocked %u fault 0x%x/0x%llx fatal 0x%x/0x%llx\n", q->csg, rd32(q->csgout, CSG_OUT_ACK),
++		    rd32(q->csgout, CSG_OUT_STATUS_STATE), rd32(q->csgout, CSG_OUT_EP_CURRENT), rd32(q->csout, CS_OUT_ACK),
++		    (unsigned long long)rd64(q->csout, CS_OUT_CMD_PTR), rd32(q->csout, CS_OUT_STATUS_WAIT),
++		    rd32(q->csout, CS_OUT_BLOCKED_REASON), rd32(q->csout, CS_OUT_FAULT),
++		    (unsigned long long)rd64(q->csout, CS_OUT_FAULT_INFO), rd32(q->csout, CS_OUT_FATAL),
++		    (unsigned long long)rd64(q->csout, CS_OUT_FATAL_INFO));
++	}
+ 	q->ring_used += total;
+ 	return (us < 500000) ? 0 : ETIMEDOUT;
+ }
+@@ -1242,23 +1251,91 @@ op_syncobj_read(const mali_syncobj_t *so)
+ 	return *so->cpu;
+ }
+ 
+-/* --- Tiler Heap Operations [spec 06 lines 287-292] --- */
++/*
++ * Tiler heap as kbase_csf_tiler_heap_init builds it: a zeroed heap context and initial_chunks
++ * zeroed chunks, each chunk's first header word linking the next as (va | chunk_size >> 12)
++ * [mali_kbase_csf_tiler_heap.c encode_chunk_ptr]. Growth on CS_TILER_OOM is not implemented.
++ */
++#define HEAP_CTX_SIZE           64u                 /* 32-byte context, cache-line aligned */
++#define HEAP_CHUNK_MIN          (128u << 10)
++#define HEAP_CHUNK_MAX          (8u << 20)
++#define HEAP_MAX_CHUNKS         1024u
++
++struct mali_tiler_heap {
++	mali_bo_t  *ctx;
++	mali_bo_t **chunks;
++	uint32_t    n_chunks, max_chunks, chunk_size;
++};
++
++static void
++tiler_heap_free(mali_tiler_heap_t *h)
++{
++	for (uint32_t i = 0; i < h->n_chunks; i++) {
++		op_bo_free(h->chunks[i]);
++	}
++	if (h->chunks != NULL) {
++		kfree_data(h->chunks, h->max_chunks * sizeof(mali_bo_t *));
++	}
++	op_bo_free(h->ctx);
++	kfree_data(h, sizeof(*h));
++}
++
+ static mali_status_t
+ op_tiler_heap_create(mali_vm_t *vm, uint32_t chunk_size, uint32_t initial_chunks,
+     uint32_t max_chunks, mali_tiler_heap_t **out,
+     mali_gpu_va_t *ctx_va_out, mali_gpu_va_t *first_chunk_va_out)
+ {
+-	(void)vm; (void)chunk_size; (void)initial_chunks; (void)max_chunks;
+-	*out = NULL;
+-	if (ctx_va_out) *ctx_va_out = 0;
+-	if (first_chunk_va_out) *first_chunk_va_out = 0;
++	if (vm == NULL || out == NULL || (chunk_size & (GPU_PAGE - 1)) || chunk_size < HEAP_CHUNK_MIN ||
++	    chunk_size > HEAP_CHUNK_MAX || initial_chunks == 0 || initial_chunks > max_chunks ||
++	    max_chunks > HEAP_MAX_CHUNKS) {
++		return EINVAL;
++	}
++	const uint32_t flags = MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_NONCACHEABLE;
++	mali_tiler_heap_t *h = (mali_tiler_heap_t *)kalloc_data(sizeof(*h), Z_WAITOK | Z_ZERO);
++	if (h == NULL) {
++		return ENOMEM;
++	}
++	h->chunk_size = chunk_size;
++	h->max_chunks = max_chunks;
++	h->chunks = (mali_bo_t **)kalloc_data(max_chunks * sizeof(mali_bo_t *), Z_WAITOK | Z_ZERO);
++	mali_status_t st = h->chunks != NULL ? op_bo_alloc(vm, HEAP_CTX_SIZE, flags, 0, &h->ctx) : ENOMEM;
++	for (uint32_t i = 0; st == 0 && i < initial_chunks; i++) {
++		st = op_bo_alloc(vm, chunk_size, flags, 0, &h->chunks[i]);
++		if (st != 0) {
++			break;
++		}
++		h->n_chunks++;
++		if (i > 0) {
++			volatile uint64_t *prev = (volatile uint64_t *)op_bo_cpu_map(h->chunks[i - 1]);
++			*prev = (h->chunks[i]->gpu_va & ~(uint64_t)0xfff) | (chunk_size >> 12);
++		}
++	}
++	if (st != 0) {
++		BR_LOG("HUSKY IOGPU bridge: tiler heap: allocation failed (%d) after %u chunks\n", st, h->n_chunks);
++		tiler_heap_free(h);
++		return st;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	BR_LOG("HUSKY IOGPU bridge: tiler heap: ctx 0x%llx, %u x %u KiB chunks from 0x%llx (max %u)\n",
++	    (unsigned long long)h->ctx->gpu_va, h->n_chunks, chunk_size >> 10,
++	    (unsigned long long)h->chunks[0]->gpu_va, max_chunks);
++	*out = h;
++	if (ctx_va_out) {
++		*ctx_va_out = h->ctx->gpu_va;
++	}
++	if (first_chunk_va_out) {
++		*first_chunk_va_out = h->chunks[0]->gpu_va;
++	}
+ 	return 0;
+ }
+ 
+ static void
+ op_tiler_heap_destroy(mali_tiler_heap_t *heap)
+ {
+-	(void)heap;
++	if (heap != NULL) {
++		tiler_heap_free(heap);
++	}
+ }
+ 
+ /*
+diff --git a/iokit/Families/IOGPU/iogpu_internal.h b/iokit/Families/IOGPU/iogpu_internal.h
+index 1779f94..7fd3b65 100644
+--- a/iokit/Families/IOGPU/iogpu_internal.h
++++ b/iokit/Families/IOGPU/iogpu_internal.h
+@@ -115,6 +115,10 @@ struct mali_heap_result {
+ 	uint32_t error;
+ };
+ 
++/* Queue-state buffer the plug-in hands to HEAP_OP(CREATE) [MaliMetal core/mali_core.h MALI_QSTATE_*] */
++#define MALI_QSTATE_HEAP_DESC_OFF   0x0000u
++#define MALI_QSTATE_RESULT_OFF      0x0080u
++
+ struct mali_kcmd_fill {
+ 	iogpu_kcmd_header_t header;  /* type MALI_KCMD_FILL (0x14), size 0x20 */
+ 	uint32_t resource_id;
