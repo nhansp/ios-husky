@@ -346,9 +346,6 @@ static id<MTLLibrary> logged_library(NSString *what, id<MTLLibrary> lib, NSError
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)u error:(NSError **)e {
     return logged_library(u.path ?: @"?", [super newLibraryWithURL:u error:e], e);
 }
-- (id<MTLLibrary>)newLibraryWithFile:(NSString *)f error:(NSError **)e {
-    return logged_library(f ?: @"?", [super newLibraryWithFile:f error:e], e);
-}
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)d error:(NSError **)e {
     return logged_library([NSString stringWithFormat:@"data %zu B", d ? dispatch_data_get_size(d) : 0],
                           [super newLibraryWithData:d error:e], e);
