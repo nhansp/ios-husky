@@ -9,7 +9,7 @@
 #define LIBRARY_PATH "/usr/local/share/metal_smoke.metallib"
 #define THREADS 256u
 #define GROUP 64u
-#define STEPS 10
+#define STEPS 11
 #define RT 64u
 #define STR_(x) #x
 #define STR(x) STR_(x)
@@ -99,7 +99,7 @@ static id<MTLRenderPipelineState> render_pipeline(id<MTLDevice> dev, id<MTLLibra
 
 /* Draws one triangle over the lower-left half of a cleared RT x RT texture; returns the command buffer error text or nil. */
 static NSString *draw(id<MTLCommandQueue> queue, id<MTLRenderPipelineState> pso, id<MTLTexture> tex, id<MTLBuffer> pos,
-                      id<MTLBuffer> color)
+                      id<MTLBuffer> color, NSUInteger vertices)
 {
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = tex;
@@ -115,7 +115,7 @@ static NSString *draw(id<MTLCommandQueue> queue, id<MTLRenderPipelineState> pso,
     [enc setVertexBuffer:pos offset:0 atIndex:0];
     if (color)
         [enc setVertexBuffer:color offset:0 atIndex:1];
-    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertices];
     [enc endEncoding];
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
@@ -177,6 +177,60 @@ static NSString *verify(id<MTLTexture> tex, bool colors, unsigned *inside_ok)
                                       f[2], f[3], RT / 2 - 8, RT / 2 + 8, c[0], c[1], c[2], c[3]];
 }
 
+/* About 14 MiB of post-transform positions: more than the initial 5 x 2 MiB tiler heap, so the pass only completes
+ * if the kernel grows the heap on CS_TILER_OOM. The grid's triangles tile the whole target. */
+#define BIG_RT 1024u
+#define GRID 384u
+static int heap_growth(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLRenderPipelineState> flat)
+{
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                   width:BIG_RT
+                                                                                  height:BIG_RT
+                                                                               mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> tex = [dev newTextureWithDescriptor:td];
+    const NSUInteger vertices = GRID * GRID * 6;
+    id<MTLBuffer> grid = [dev newBufferWithLength:vertices * 2 * sizeof(float) options:MTLResourceStorageModeShared];
+    if (!tex || !grid || !grid.contents)
+        return fail(11, @"1024x1024 target / grid vertex buffer");
+    float *v = grid.contents;
+    for (unsigned y = 0; y < GRID; y++) {
+        for (unsigned x = 0; x < GRID; x++) {
+            const float x0 = -1.0f + 2.0f * x / GRID, x1 = -1.0f + 2.0f * (x + 1) / GRID;
+            const float y0 = -1.0f + 2.0f * y / GRID, y1 = -1.0f + 2.0f * (y + 1) / GRID;
+            const float quad[12] = {x0, y0, x1, y0, x0, y1, x1, y0, x1, y1, x0, y1};
+            memcpy(v, quad, sizeof(quad));
+            v += 12;
+        }
+    }
+    NSString *why = draw(queue, flat, tex, grid, nil, vertices);
+    if (why)
+        return fail(11, [@"heap growth pass: " stringByAppendingString:why]);
+    uint8_t *px = malloc(BIG_RT * BIG_RT * 4);
+    if (!px)
+        return fail(11, @"readback buffer");
+    [tex getBytes:px bytesPerRow:BIG_RT * 4 fromRegion:MTLRegionMake2D(0, 0, BIG_RT, BIG_RT) mipmapLevel:0];
+    unsigned bad = 0, first = 0;
+    for (unsigned i = 0; i < BIG_RT * BIG_RT; i++) {
+        const uint8_t *p = px + i * 4;
+        if (p[0] != 0xff || p[1] != 0 || p[2] != 0xff || p[3] != 0xff) {
+            if (bad++ == 0)
+                first = i;
+        }
+    }
+    const uint8_t *f = px + first * 4;
+    NSString *res = bad ? [NSString stringWithFormat:@"%u/%u pixels wrong, first (%u,%u) = %02x %02x %02x %02x", bad,
+                                                     BIG_RT * BIG_RT, first % BIG_RT, first / BIG_RT, f[0], f[1], f[2], f[3]]
+                        : nil;
+    free(px);
+    if (res)
+        return fail(11, [@"heap growth pass: " stringByAppendingString:res]);
+    say("METAL-SMOKE: [11/" STR(STEPS) "] %lu-vertex pass over the initial tiler heap: PASS (%ux%u)\n",
+        (unsigned long)vertices, BIG_RT, BIG_RT);
+    return 0;
+}
+
 static int render(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
 {
     NSError *err = nil;
@@ -203,16 +257,16 @@ static int render(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> l
     say("METAL-SMOKE: [8/" STR(STEPS) "] render pipelines + %ux%u RGBA8 target: PASS\n", RT, RT);
 
     unsigned in_ok = 0;
-    NSString *why = draw(queue, flat, tex, pbuf, nil) ?: verify(tex, false, &in_ok);
+    NSString *why = draw(queue, flat, tex, pbuf, nil, 3) ?: verify(tex, false, &in_ok);
     if (why)
         return fail(9, [@"flat triangle: " stringByAppendingString:why]);
     say("METAL-SMOKE: [9/" STR(STEPS) "] flat triangle: PASS (%u inside pixels, clear outside)\n", in_ok);
 
-    why = draw(queue, colored, tex, pbuf, cbuf) ?: verify(tex, true, &in_ok);
+    why = draw(queue, colored, tex, pbuf, cbuf, 3) ?: verify(tex, true, &in_ok);
     if (why)
         return fail(10, [@"interpolated triangle: " stringByAppendingString:why]);
     say("METAL-SMOKE: [10/" STR(STEPS) "] interpolated triangle: PASS (%u inside pixels within 2/255)\n", in_ok);
-    return 0;
+    return heap_growth(dev, queue, flat);
 }
 
 static int run(void)
