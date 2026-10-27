@@ -1,0 +1,30 @@
+diff --git a/iokit/Families/IOGPU/IOGPUDevice.cpp b/iokit/Families/IOGPU/IOGPUDevice.cpp
+index a494715..33f63cd 100644
+--- a/iokit/Families/IOGPU/IOGPUDevice.cpp
++++ b/iokit/Families/IOGPU/IOGPUDevice.cpp
+@@ -118,7 +118,8 @@ IOGPUDevice::free()
+  *             nextId and returns id. If setObject fails, does NOT increment nextId
+  *             (fixing ID drift: REVIEWS.md:93).
+  *   - NS_LOOKUP: returns pointer under lock if index is in range and valid.
+- *   - NS_REMOVE: replaces entry with kOSBooleanFalse under lock, dropping retain count.
++ *   - NS_REMOVE: replaces entry with kOSBooleanFalse under lock; the table's reference is
++ *             dropped after unlocking, since IOGPUResource::free takes the same lock.
+  */
+ static uint32_t
+ ns_add_internal(IOLock *lock, OSArray *arr, uint32_t *pNextId, OSObject *obj)
+@@ -167,11 +168,15 @@ ns_lookup_internal(IOLock *lock, OSArray *arr, uint32_t id)
+ static void
+ ns_remove_internal(IOLock *lock, OSArray *arr, uint32_t id)
+ {
++	OSObject *old = NULL;
+ 	IOLockLock(lock);
+ 	if (id >= 1 && (id - 1) < arr->getCount()) {
++		old = arr->getObject(id - 1);
++		old->retain();
+ 		arr->replaceObject(id - 1, kOSBooleanFalse);
+ 	}
+ 	IOLockUnlock(lock);
++	OSSafeReleaseNULL(old);
+ }
+ 
+ /* Resource namespace */
