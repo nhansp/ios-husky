@@ -237,6 +237,16 @@ static BOOL link_varyings(MaliShaderProgram *vsp, MaliShaderProgram *fsp, mali_g
 
 - (id)newRenderPipelineWithDescriptor:(MTLRenderPipelineDescriptor *)d vertexVariant:(MaliFunctionVariant *)v
                       fragmentVariant:(MaliFunctionVariant *)f errorMessage:(NSString **)err {
+    NSString *why = nil;
+    id p = [self maliNewRenderPipelineWithDescriptor:d vertexVariant:v fragmentVariant:f errorMessage:&why];
+    if (!p)
+        MaliDiagLine([NSString stringWithFormat:@"render pipeline %@/%@ refused: %@", d.vertexFunction.name, d.fragmentFunction.name, why]);
+    if (err) *err = why;
+    return p;
+}
+
+- (id)maliNewRenderPipelineWithDescriptor:(MTLRenderPipelineDescriptor *)d vertexVariant:(MaliFunctionVariant *)v
+                          fragmentVariant:(MaliFunctionVariant *)f errorMessage:(NSString **)err {
     MaliShaderCompiler *comp = [self maliShaderCompiler];
     if (!comp) { if (err) *err = @"the air2valhall compiler is not available"; return nil; }
     /* Metal lowers the descriptor's vertex fetch into a generated entry (air.vertexFetchFunction) whose AIR calls the
@@ -331,6 +341,16 @@ static BOOL link_varyings(MaliShaderProgram *vsp, MaliShaderProgram *fsp, mali_g
 }
 
 - (id)newComputePipelineWithDescriptor:(MTLComputePipelineDescriptor *)d variant:(MaliFunctionVariant *)v errorMessage:(NSString **)err {
+    NSString *why = nil;
+    id p = [self maliNewComputePipelineWithDescriptor:d variant:v errorMessage:&why];
+    if (!p)
+        MaliDiagLine([NSString stringWithFormat:@"compute pipeline %@ refused: %@", d.computeFunction.name, why]);
+    if (err) *err = why;
+    return p;
+}
+
+- (id)maliNewComputePipelineWithDescriptor:(MTLComputePipelineDescriptor *)d variant:(MaliFunctionVariant *)v
+                              errorMessage:(NSString **)err {
     MaliShaderCompiler *comp = [self maliShaderCompiler];
     if (!comp) { if (err) *err = @"the air2valhall compiler is not available"; return nil; }
     if (!v.input || ![v.input.entry isEqualToString:d.computeFunction.name]) {

@@ -39,7 +39,8 @@ void MaliConsole(const char *fmt, ...) {
 }
 
 __attribute__((constructor)) static void mali_loaded(void) {
-    MaliConsole("MaliMetal: loaded in %s[%d]\n", getprogname(), (int)getpid());
+    const char *dt = getenv("OS_ACTIVITY_DT_MODE");
+    MaliConsole("MaliMetal: loaded in %s[%d] (OS_ACTIVITY_DT_MODE %s)\n", getprogname(), (int)getpid(), dt ? dt : "unset");
 }
 
 static os_log_t mali_log(void) {
@@ -327,7 +328,30 @@ static void MaliLoadDevProps(io_service_t port, mali_dev_props_t *out) {
 /* REQUIRED overrides: _MTLDevice's newCommandQueue / ...WithMaxCommandBufferCount: / ...WithDescriptor: defaults call
  * each other forever (SnapMetal hang sample). */
 - (id<MTLCommandQueue>)newCommandQueueWithDescriptor:(MTLCommandQueueDescriptor *)d {
-    return [[MaliCommandQueue alloc] initWithDevice:self descriptor:d];
+    id<MTLCommandQueue> q = [[MaliCommandQueue alloc] initWithDevice:self descriptor:d];
+    MaliDiagLine([NSString stringWithFormat:@"command queue %@", q ? @"ok" : @"nil"]);
+    return q;
+}
+
+/* Libraries are _MTLDevice's; logged because a client's renderer gives up silently when one fails to load. */
+static id<MTLLibrary> logged_library(NSString *what, id<MTLLibrary> lib, NSError **error) {
+    MaliDiagLine([NSString stringWithFormat:@"library %@ -> %@%@", what, lib ? @"ok" : @"nil",
+                  (!lib && error && *error) ? [@" " stringByAppendingString:(*error).description] : @""]);
+    return lib;
+}
+- (id<MTLLibrary>)newDefaultLibrary { return logged_library(@"default", [super newDefaultLibrary], NULL); }
+- (id<MTLLibrary>)newDefaultLibraryWithBundle:(NSBundle *)b error:(NSError **)e {
+    return logged_library([@"default of " stringByAppendingString:b.bundlePath ?: @"?"], [super newDefaultLibraryWithBundle:b error:e], e);
+}
+- (id<MTLLibrary>)newLibraryWithURL:(NSURL *)u error:(NSError **)e {
+    return logged_library(u.path ?: @"?", [super newLibraryWithURL:u error:e], e);
+}
+- (id<MTLLibrary>)newLibraryWithFile:(NSString *)f error:(NSError **)e {
+    return logged_library(f ?: @"?", [super newLibraryWithFile:f error:e], e);
+}
+- (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)d error:(NSError **)e {
+    return logged_library([NSString stringWithFormat:@"data %zu B", d ? dispatch_data_get_size(d) : 0],
+                          [super newLibraryWithData:d error:e], e);
 }
 - (id<MTLCommandQueue>)newCommandQueue { return [self newCommandQueueWithDescriptor:[MTLCommandQueueDescriptor new]]; }
 - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n {
