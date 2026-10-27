@@ -41,6 +41,16 @@
 #include "iogpu_internal.h"
 #include "husky_gpu_compute.h"
 
+/*
+ * The macOS SDK IOKitLib.h (used on the include path for the iOS build) marks IOConnectTrapN
+ * API_UNAVAILABLE(ios), but iOS IOKit.framework exports them (IOGPU's submit fast path is
+ * IOConnectTrap4 index 0). Bind our own prototypes to the exported symbols.
+ */
+extern kern_return_t smoke_trap4(io_connect_t connect, uint32_t index, uintptr_t p1, uintptr_t p2,
+    uintptr_t p3, uintptr_t p4) __asm__("_IOConnectTrap4");
+extern kern_return_t smoke_trap1(io_connect_t connect, uint32_t index, uintptr_t p1)
+    __asm__("_IOConnectTrap1");
+
 /* Compute input pattern [refs/husky_iogpu_selftest.cpp:110-114] */
 static inline uint32_t comp_in(unsigned i)
 {
@@ -387,7 +397,7 @@ int main(void)
 	cmdbuf.completedRef         = 0x8877665544332211ULL;
 
 	uint32_t submitStatus = 0xdeadbeef;
-	kr = IOConnectTrap4(connect, kIOGPUTrap_SubmitOne,
+	kr = smoke_trap4(connect, kIOGPUTrap_SubmitOne,
 	                    (uintptr_t)queueId,
 	                    (uintptr_t)sizeof(cmdbuf),
 	                    (uintptr_t)&cmdbuf,
@@ -481,7 +491,7 @@ cleanup:
 		/* Release resource via Trap 1 (RELEASE_RESOURCE) [refs/iogpu_uc_abi.h:184; refs/IOGPUDeviceUserClient.cpp:1053-1067] */
 		if (resId != 0) {
 			smoke_log("IOGPU-SMOKE: cleanup: releasing resource %u via trap 1 (RELEASE_RESOURCE)...\n", resId);
-			kern_return_t cl_kr = IOConnectTrap1(connect, kIOGPUTrap_ReleaseResource, (uintptr_t)resId);
+			kern_return_t cl_kr = smoke_trap1(connect, kIOGPUTrap_ReleaseResource, (uintptr_t)resId);
 			smoke_log("IOGPU-SMOKE: cleanup: trap 1 release resource %u ret 0x%x\n", resId, cl_kr);
 			resId = 0;
 		}
