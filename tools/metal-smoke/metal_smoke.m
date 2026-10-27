@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOKit/IOKitLib.h>
+#import <IOSurface/IOSurfaceRef.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -9,7 +10,7 @@
 #define LIBRARY_PATH "/usr/local/share/metal_smoke.metallib"
 #define THREADS 256u
 #define GROUP 64u
-#define STEPS 11
+#define STEPS 13
 #define RT 64u
 #define STR_(x) #x
 #define STR(x) STR_(x)
@@ -86,12 +87,12 @@ static void diagnose_discovery(void)
 }
 
 static id<MTLRenderPipelineState> render_pipeline(id<MTLDevice> dev, id<MTLLibrary> lib, NSString *vs, NSString *fs,
-                                                  NSError **err)
+                                                  MTLPixelFormat format, NSError **err)
 {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [lib newFunctionWithName:vs];
     d.fragmentFunction = [lib newFunctionWithName:fs];
-    d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    d.colorAttachments[0].pixelFormat = format;
     if (!d.vertexFunction || !d.fragmentFunction)
         return nil;
     return [dev newRenderPipelineStateWithDescriptor:d error:err];
@@ -231,13 +232,111 @@ static int heap_growth(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLRende
     return 0;
 }
 
+static int no_copy_buffer(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib);
+
+/* The flat triangle into a BGRA IOSurface (what CoreAnimation renders into), read back through IOSurfaceLock. */
+static int surface_target(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib, id<MTLBuffer> pos)
+{
+    NSError *err = nil;
+    id<MTLRenderPipelineState> pso = render_pipeline(dev, lib, @"flat_vs", @"flat_fs", MTLPixelFormatBGRA8Unorm, &err);
+    if (!pso)
+        return fail(12, [NSString stringWithFormat:@"BGRA pipeline: %@", err]);
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth: @(RT), (id)kIOSurfaceHeight: @(RT), (id)kIOSurfaceBytesPerElement: @4,
+        (id)kIOSurfacePixelFormat: @(0x42475241u), /* 'BGRA' */
+    };
+    IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (!surf)
+        return fail(12, @"IOSurfaceCreate");
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                   width:RT
+                                                                                  height:RT
+                                                                               mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> tex = [dev newTextureWithDescriptor:td iosurface:surf plane:0];
+    NSString *why = tex ? draw(queue, pso, tex, pos, nil, 3) : @"newTextureWithDescriptor:iosurface:plane: returned nil";
+    if (!why) {
+        IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+        const uint8_t *base = IOSurfaceGetBaseAddress(surf);
+        const size_t row = IOSurfaceGetBytesPerRow(surf);
+        unsigned bad = 0, first_x = 0, first_y = 0;
+        for (unsigned y = 0; y < RT; y++) {
+            for (unsigned x = 0; x < RT; x++) {
+                const uint8_t *p = base + y * row + x * 4;      /* B G R A */
+                const bool inside = y > x;
+                if (y == x || (p[0] == 0xff && p[1] == 0 && p[2] == (inside ? 0xff : 0) && p[3] == 0xff))
+                    continue;
+                if (bad++ == 0) {
+                    first_x = x;
+                    first_y = y;
+                }
+            }
+        }
+        const uint8_t *f = base + first_y * row + first_x * 4;
+        if (bad)
+            why = [NSString stringWithFormat:@"%u pixels wrong (row %zu), first (%u,%u) = %02x %02x %02x %02x", bad, row,
+                                             first_x, first_y, f[0], f[1], f[2], f[3]];
+        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+    }
+    const uint32_t sid = IOSurfaceGetID(surf);
+    CFRelease(surf);
+    if (why)
+        return fail(12, [NSString stringWithFormat:@"IOSurface %u target: %@", sid, why]);
+    say("METAL-SMOKE: [12/" STR(STEPS) "] flat triangle into IOSurface %u: PASS\n", sid);
+    return no_copy_buffer(dev, queue, lib);
+}
+
+/* mul_add again, its output in the client's own pages (newBufferWithBytesNoCopy). */
+static int no_copy_buffer(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
+{
+    const size_t len = 16384;
+    void *mem = NULL;
+    if (posix_memalign(&mem, len, len) != 0)
+        return fail(13, @"posix_memalign");
+    uint32_t *dst = mem;
+    for (uint32_t i = 0; i < THREADS; i++)
+        dst[i] = 0xdeadbeefu;
+    id<MTLBuffer> out = [dev newBufferWithBytesNoCopy:mem length:len options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> in = [dev newBufferWithLength:THREADS * 4 options:MTLResourceStorageModeShared];
+    NSError *err = nil;
+    id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mul_add"] error:&err];
+    if (!out || !in || !pso) {
+        free(mem);
+        return fail(13, [NSString stringWithFormat:@"no-copy buffer / pipeline: %@", err]);
+    }
+    uint32_t *src = in.contents;
+    for (uint32_t i = 0; i < THREADS; i++)
+        src[i] = 0x2000u + i * 0x7u;
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:in offset:0 atIndex:0];
+    [enc setBuffer:out offset:0 atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake(THREADS / GROUP, 1, 1) threadsPerThreadgroup:MTLSizeMake(GROUP, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    unsigned good = 0;
+    for (uint32_t i = 0; i < THREADS; i++)
+        good += dst[i] == src[i] * 3u + 7u;
+    const uint32_t first = dst[0];
+    out = nil;
+    free(mem);
+    if (cb.status != MTLCommandBufferStatusCompleted || good != THREADS)
+        return fail(13, [NSString stringWithFormat:@"status %ld error %@, %u/%u correct, [0] = 0x%x", (long)cb.status,
+                                                   cb.error, good, THREADS, first]);
+    say("METAL-SMOKE: [13/" STR(STEPS) "] compute into a no-copy client buffer: PASS (%u/%u)\n", good, THREADS);
+    return 0;
+}
+
 static int render(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
 {
     NSError *err = nil;
-    id<MTLRenderPipelineState> flat = render_pipeline(dev, lib, @"flat_vs", @"flat_fs", &err);
+    id<MTLRenderPipelineState> flat = render_pipeline(dev, lib, @"flat_vs", @"flat_fs", MTLPixelFormatRGBA8Unorm, &err);
     if (!flat)
         return fail(8, [NSString stringWithFormat:@"flat render pipeline: %@", err]);
-    id<MTLRenderPipelineState> colored = render_pipeline(dev, lib, @"color_vs", @"color_fs", &err);
+    id<MTLRenderPipelineState> colored = render_pipeline(dev, lib, @"color_vs", @"color_fs", MTLPixelFormatRGBA8Unorm, &err);
     if (!colored)
         return fail(8, [NSString stringWithFormat:@"color render pipeline: %@", err]);
 
@@ -266,7 +365,10 @@ static int render(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> l
     if (why)
         return fail(10, [@"interpolated triangle: " stringByAppendingString:why]);
     say("METAL-SMOKE: [10/" STR(STEPS) "] interpolated triangle: PASS (%u inside pixels within 2/255)\n", in_ok);
-    return heap_growth(dev, queue, flat);
+    int rc = heap_growth(dev, queue, flat);
+    if (rc == 0)
+        rc = surface_target(dev, queue, lib, pbuf);
+    return rc;
 }
 
 static int run(void)
