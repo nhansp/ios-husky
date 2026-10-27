@@ -220,7 +220,7 @@ static BOOL uses_rgb_blend_constant(const mali_rt_state_t *rt) {
         if (err) *err = v.inputError ?: f.inputError ?: @"compiler variant does not match the render pipeline entry";
         return nil;
     }
-    if (d.rasterSampleCount > 1 || d.sampleCount > 1) { if (err) *err = @"MSAA pipelines are not supported (v1)"; return nil; }
+    if (d.rasterSampleCount > 1) { if (err) *err = @"MSAA pipelines are not supported (v1)"; return nil; }
 
     MaliShaderProgram *vsp = [comp compile:v.input flags:0 vsLayout:nil error:err];
     if (!vsp) return nil;

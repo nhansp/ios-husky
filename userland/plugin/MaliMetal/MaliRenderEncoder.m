@@ -217,10 +217,14 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
 }
 
 /* ---- resource usage ---- */
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { [self maliCheckOpen]; [_cb maliUseResource:r usage:u]; }
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { [self useResource:r usage:u]; }
-- (void)useResources:(const id<MTLResource> [])rs count:(NSUInteger)n usage:(MTLResourceUsage)u { for (NSUInteger i = 0; i < n; i++) [self useResource:rs[i] usage:u]; }
-- (void)useResources:(const id<MTLResource> [])rs count:(NSUInteger)n usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { [self useResources:rs count:n usage:u]; }
+- (void)maliUse:(const id<MTLResource> [])rs count:(NSUInteger)n usage:(MTLResourceUsage)u {
+    [self maliCheckOpen];
+    for (NSUInteger i = 0; i < n; i++) [_cb maliUseResource:rs[i] usage:u];
+}
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { [self maliUse:&r count:1 usage:u]; }
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { [self maliUse:&r count:1 usage:u]; }
+- (void)useResources:(const id<MTLResource> [])rs count:(NSUInteger)n usage:(MTLResourceUsage)u { [self maliUse:rs count:n usage:u]; }
+- (void)useResources:(const id<MTLResource> [])rs count:(NSUInteger)n usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { [self maliUse:rs count:n usage:u]; }
 - (void)useHeap:(id<MTLHeap>)h { MALI_UNSUPPORTED("useHeap"); }
 - (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)s { MALI_UNSUPPORTED("useHeap"); }
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b {}
