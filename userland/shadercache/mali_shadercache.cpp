@@ -56,15 +56,16 @@ uint32_t StageOf(uint8_t mtl_type) {
 bool AddMetallib(const std::string& path, std::vector<Request>* reqs) {
     MtlLibrary lib;
     std::string err;
-    std::vector<uint8_t> bytes;
-    if (!metallib_load(path.c_str(), &lib, &err) || !ReadFile(path, &bytes)) {
-        fprintf(stderr, "%s: %s\n", path.c_str(), err.empty() ? "cannot read" : err.c_str());
+    if (!metallib_load(path.c_str(), &lib, &err)) {
+        fprintf(stderr, "%s: %s\n", path.c_str(), err.c_str());
         return false;
     }
+    // Per-function bitcode, not the container: libair2valhall's MTLB walker rejects Xcode 26
+    // metallibs whose function-list size excludes the count word.
     for (const MtlFunction& f : lib.functions) {
         Request r;
         r.label = path + ":" + f.name;
-        r.air = bytes;
+        r.air.assign(lib.bitcode(f), lib.bitcode(f) + f.bc_size);
         r.entry = f.name;
         r.stage = StageOf(f.type);
         reqs->push_back(std::move(r));
