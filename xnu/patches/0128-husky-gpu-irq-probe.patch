@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 4573380..8c5a10a 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -540,6 +540,22 @@ husky_dcache_clean(vm_offset_t va, size_t len)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/* GPU JOB/MMU/GPU SPIs (zuma.h IRQ_G3D_* + 32): completion can be IRQ-driven only if Non-secure owns them. */
++extern int husky_gic_spi_probe(uint32_t intid, uint32_t *grp, uint32_t *cfg, uint32_t *en, uint64_t *route);
++static void
++husky_gpu_irq_probe(void)
++{
++	static const uint32_t ids[] = { 378, 379, 380 };
++	for (unsigned i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
++		uint32_t grp = 0, cfg = 0, en = 0;
++		uint64_t route = 0;
++		if (husky_gic_spi_probe(ids[i], &grp, &cfg, &en, &route)) {
++			HU_LOG("HUSKY GPU: SPI %u grp %u cfg %u en %u route 0x%llx\n", ids[i], grp, cfg, en,
++			    (unsigned long long)route);
++		}
++	}
++}
++
+ /* Simple word copies: the targets may be Device/NC mappings (no dc zva). */
+ static void
+ copy_bytes(volatile uint8_t *dst, const uint8_t *src, size_t n)
+@@ -1490,6 +1506,7 @@ husky_gpu_mcu_boot(void)
+ 	} else if (husky_gpu_mode >= 7) {
+ 		extern void husky_iogpu_publish(void);
+ 		HU_LOG("HUSKY IOGPU: GPU ready; publishing HuskyGPUReady (MaliAccelerator matches on it)\n");
++		husky_gpu_irq_probe();
+ 		husky_iogpu_publish();
+ 	}
+ }
