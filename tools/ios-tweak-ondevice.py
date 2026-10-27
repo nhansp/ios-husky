@@ -301,6 +301,43 @@ def install_system_apps(tar, dry):
         print(f'deleted installd .../{p}')
 
 
+def install_file(spec, dry):
+    """Copy a host file onto the volume: SRC:DEST[:MODE], DEST absolute on the iOS root, owned
+    root:wheel (test tools and their LaunchDaemon plists, e.g. /usr/local/bin/iogpu_smoke and
+    /Library/LaunchDaemons/com.husky.iogpu-smoke.plist)."""
+    parts = spec.split(':')
+    if len(parts) not in (2, 3) or not parts[1].startswith('/'):
+        sys.exit(f'--install-file wants SRC:/DEST[:MODE], got {spec}')
+    src, dest = parts[0], parts[1]
+    mode = parts[2] if len(parts) == 3 else ('755' if os.access(src, os.X_OK) else '644')
+    if not os.path.isfile(src):
+        sys.exit(f'no such file: {src}')
+    target = f'{MNT}{dest}'
+    if dry:
+        print(f'[dry-run] would install {src} -> {dest} (mode {mode}, root:wheel)')
+        return
+    su(f'mkdir -p {os.path.dirname(target)}')
+    rc = subprocess.run(['adb', '-s', SERIAL, 'exec-in', f"su -c 'cat > {target}'"],
+                        stdin=open(src, 'rb')).returncode
+    if rc != 0:
+        sys.exit(f'copy to {dest} failed (rc {rc})')
+    su(f'chown 0:0 {target}; chmod {mode} {target}')
+    got = su(f'wc -c < {target}').strip()
+    if got != str(os.path.getsize(src)):
+        sys.exit(f'{dest}: wrote {got} bytes, expected {os.path.getsize(src)}')
+    print(f'installed {dest} ({got} bytes, mode {mode})')
+
+
+def remove_file(dest, dry):
+    if not dest.startswith('/') or '..' in dest:
+        sys.exit(f'--remove-file wants an absolute path, got {dest}')
+    if dry:
+        print(f'[dry-run] would remove {dest}')
+        return
+    su(f'rm -f {MNT}{dest}')
+    print(f'removed {dest}')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dry-run', action='store_true', help='mount read-only and report, write nothing')
@@ -312,6 +349,10 @@ def main():
                     'state; implies --rerun-migration so the migrator installs them next boot')
     ap.add_argument('--drop-mg-cache', action='store_true',
                     help='delete the MobileGestalt cache (after an identity change)')
+    ap.add_argument('--install-file', action='append', default=[], metavar='SRC:/DEST[:MODE]',
+                    help='copy a host file onto the iOS root, root:wheel (repeatable)')
+    ap.add_argument('--remove-file', action='append', default=[], metavar='/DEST',
+                    help='delete a file from the iOS root (repeatable)')
     args = ap.parse_args()
     if args.install_system_apps:
         args.rerun_migration = True
@@ -343,6 +384,10 @@ def main():
                 drop_mg_cache(args.dry_run)
             if args.rerun_migration:
                 rerun_migration(args.dry_run)
+            for spec in args.install_file:
+                install_file(spec, args.dry_run)
+            for dest in args.remove_file:
+                remove_file(dest, args.dry_run)
         finally:
             unmount()
     finally:

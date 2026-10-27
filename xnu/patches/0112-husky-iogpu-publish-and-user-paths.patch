@@ -1,0 +1,244 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 85c3abe..391e23b 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -8,6 +8,12 @@
+  *   2  also power the top domain on (if off) and then read the registers.
+  *   3  also boot the CSF firmware on the MCU, ping it and run a first
+  *      command-stream job on group 0 (husky_gpu_first_job).
++ *   4  compute jobs; 5  render jobs (clear + triangle).
++ *   6  then the in-kernel IOGPU user-client self-test (husky_iogpu_selftest).
++ *   7  then publish the IOKit resource HuskyGPUReady, which matches the
++ *      MaliAccelerator personality (KernelConfigTables.cpp) and registers the
++ *      IOAcceleratorES service Metal discovers (boot-arg huskygpu_hide=1 keeps
++ *      it unpublished).
+  *
+  * Facts (zuma-gpu.dtsi, zuma-pm-domains.dtsi, cal-if zuma
+  * flexpmu_cal_local_zuma.h, exynos-pd_el3.c, Arm Mali CSF register map as in
+@@ -1370,13 +1376,17 @@ husky_gpu_mcu_boot(void)
+ 	bool jobs_ok = husky_gpu_first_job(shared_nc, shared_size, gin, gout);
+ 	if (husky_gpu_mode >= 6 && !jobs_ok) {
+ 		HU_LOG("HUSKY IOGPU: earlier jobs failed; self-test skipped\n");
+-	} else if (husky_gpu_mode >= 6 && !husky_iogpu) {
++	} else if (husky_gpu_mode == 6 && !husky_iogpu) {
+ 		HU_LOG("HUSKY IOGPU: self-test skipped (huskyiogpu=0)\n");
+-	} else if (husky_gpu_mode >= 6) {
++	} else if (husky_gpu_mode == 6) {
+ 		extern bool husky_iogpu_selftest(void);
+ 		HU_LOG("HUSKY IOGPU: starting self-test (huskygpu=6)\n");
+ 		bool st_ok = husky_iogpu_selftest();
+ 		HU_LOG("HUSKY IOGPU: self-test %s\n", st_ok ? "PASSED" : "FAILED");
++	} else if (husky_gpu_mode >= 7) {
++		extern void husky_iogpu_publish(void);
++		HU_LOG("HUSKY IOGPU: GPU ready; publishing HuskyGPUReady (MaliAccelerator matches on it)\n");
++		husky_iogpu_publish();
+ 	}
+ }
+ 
+diff --git a/iokit/Families/IOGPU/IOGPUDevice.cpp b/iokit/Families/IOGPU/IOGPUDevice.cpp
+index 944f8f9..8d8ed9e 100644
+--- a/iokit/Families/IOGPU/IOGPUDevice.cpp
++++ b/iokit/Families/IOGPU/IOGPUDevice.cpp
+@@ -96,10 +96,11 @@ IOGPUDevice::initWithAccel(IOGPU *accel, task_t owner)
+ void
+ IOGPUDevice::free()
+ {
++	/* Queues first: queue_destroy terminates the group before the BOs it may still DMA are freed. */
++	OSSafeReleaseNULL(fQueues);
++	OSSafeReleaseNULL(fNotifQueues);
+ 	OSSafeReleaseNULL(fResources);
+ 	OSSafeReleaseNULL(fShmems);
+-	OSSafeReleaseNULL(fNotifQueues);
+-	OSSafeReleaseNULL(fQueues);
+ 	OSSafeReleaseNULL(fTask);
+ 
+ 	if (fLock) {
+diff --git a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+index b572251..986f5a8 100644
+--- a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
++++ b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+@@ -526,7 +526,8 @@ h_get_device_handle(OSObject *target, void *, IOExternalMethodArguments *a)
+ 	if (a->structureOutputSize < 8) {
+ 		return kIOGPUReturnBadArgument;
+ 	}
+-	*(uint64_t *)a->structureOutput = (uint64_t)DEV();
++	/* Opaque but stable per device; never the raw kernel pointer (kASLR). */
++	*(uint64_t *)a->structureOutput = (uint64_t)VM_KERNEL_ADDRPERM(DEV());
+ 	return kIOGPUReturnSuccess;
+ }
+ 
+@@ -1029,7 +1030,7 @@ IOGPUDeviceUserClient::trapSubmitOne(void *p1, void *p2, void *p3, void *p4, voi
+ 
+ 	uint8_t argsBuf[IOGPU_TRAP0_MAX_ARG_SIZE];
+ 	/* Support both userland Mach trap callers and in-kernel self-test callers */
+-	if (fTask == kernel_task || (uintptr_t)p3 >= 0x800000000000ULL) {
++	if (fTask == kernel_task) {
+ 		bcopy(p3, argsBuf, argSize);
+ 	} else if (copyin((user_addr_t)(uintptr_t)p3, argsBuf, (vm_size_t)argSize) != 0) {
+ 		return kIOGPUReturnBadArgument;
+@@ -1040,7 +1041,7 @@ IOGPUDeviceUserClient::trapSubmitOne(void *p1, void *p2, void *p3, void *p4, voi
+ 	q->release();
+ 
+ 	if (p4 != NULL) {
+-		if (fTask == kernel_task || (uintptr_t)p4 >= 0x800000000000ULL) {
++		if (fTask == kernel_task) {
+ 			*(uint32_t *)p4 = status;
+ 		} else {
+ 			copyout(&status, (user_addr_t)(uintptr_t)p4, (vm_size_t)sizeof(uint32_t));
+@@ -1104,7 +1105,7 @@ IOGPUDeviceUserClient::trapSetResourcePurgeable(void *p1, void *p2, void *p3, vo
+ 	}
+ 	r->release();
+ 	uint64_t oldState = 1;   /* 1 = non-volatile (spec 01 line 529) */
+-	if (fTask == kernel_task || (uintptr_t)p3 >= 0x800000000000ULL) {
++	if (fTask == kernel_task) {
+ 		*(uint64_t *)p3 = oldState;
+ 	} else {
+ 		copyout(&oldState, (user_addr_t)(uintptr_t)p3, (vm_size_t)sizeof(uint64_t));
+@@ -1134,7 +1135,7 @@ IOGPUDeviceUserClient::trapGroupAdd(void *p1, void *p2, void *p3, void *, void *
+ 		ret = g->groupAdd(&singleId, 1);
+ 	} else {
+ 		uint32_t stackBuf[0x100];
+-		if (fTask == kernel_task || (uintptr_t)p3 >= 0x800000000000ULL) {
++		if (fTask == kernel_task) {
+ 			bcopy(p3, stackBuf, count * sizeof(uint32_t));
+ 		} else if (copyin((user_addr_t)(uintptr_t)p3, stackBuf, (vm_size_t)(count * sizeof(uint32_t))) != 0) {
+ 			g->release();
+@@ -1168,7 +1169,7 @@ IOGPUDeviceUserClient::trapGroupRemove(void *p1, void *p2, void *p3, void *p4, v
+ 		ret = g->groupRemove(&key, 1);
+ 	} else {
+ 		uint64_t stackBuf[0x100];
+-		if (fTask == kernel_task || (uintptr_t)p3 >= 0x800000000000ULL) {
++		if (fTask == kernel_task) {
+ 			bcopy(p3, stackBuf, count * sizeof(uint64_t));
+ 		} else if (copyin((user_addr_t)(uintptr_t)p3, stackBuf, (vm_size_t)(count * sizeof(uint64_t))) != 0) {
+ 			g->release();
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.cpp b/iokit/Families/IOGPU/IOGPUMemory.cpp
+index 8ce603d..90ef04f 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.cpp
++++ b/iokit/Families/IOGPU/IOGPUMemory.cpp
+@@ -19,6 +19,9 @@
+ #include "IOGPUMemory.h"
+ #include "IOGPU.h"
+ #include "IOGPUDevice.h"
++#include <vm/pmap.h>
++
++extern "C" ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ OSDefineMetaClassAndStructors(IOGPUTask, OSObject);
+ OSDefineMetaClassAndStructors(IOGPUResource, OSObject);
+@@ -185,16 +188,21 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 			 */
+ 			fCpuAddr = (uint64_t)(uintptr_t)kva;
+ 		} else if (kva != NULL) {
++			/*
++			 * Map the BO's DRAM by physical address. Wrapping the kernel VA does not work: for
++			 * NONCACHEABLE BOs it is the ml_io_map_unmappable() alias, whose VM object has no pages
++			 * at the BO (raw pmap_map, osfmk/arm/io_map.c), so the client would get zero-fill pages
++			 * the GPU never sees. The BO is physically contiguous (kmem_alloc_contig in the bridge).
++			 * Write-combined (Normal non-cacheable) for every BO: the GPU is not coherent, and
++			 * kIOMapInhibitCache would be Device memory, where unaligned user accesses fault.
++			 */
+ 			vm_size_t rounded_size = (vm_size_t)round_page(fSize);
+-			fMemDesc = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)kva,
+-			    rounded_size, kIODirectionInOut, kernel_task);
++			addr64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(uintptr_t)kva)) |
++			    ((uintptr_t)kva & PAGE_MASK);
++			fMemDesc = (pa >> PAGE_SHIFT) ? IOMemoryDescriptor::withAddressRange((mach_vm_address_t)pa,
++			    rounded_size, kIOMemoryTypePhysical64 | kIODirectionInOut, TASK_NULL) : NULL;
+ 			if (fMemDesc != NULL) {
+-				IOOptionBits mapOpts = kIOMapAnywhere;
+-				if (flags & MALI_BO_NONCACHEABLE) {
+-					mapOpts |= kIOMapInhibitCache;
+-				} else {
+-					mapOpts |= kIOMapWriteCombineCache;
+-				}
++				IOOptionBits mapOpts = kIOMapAnywhere | kIOMapWriteCombineCache;
+ 				fClientMap = fMemDesc->createMappingInTask(dev->owner(), 0, mapOpts);
+ 				if (fClientMap != NULL) {
+ 					fCpuAddr = (uint64_t)fClientMap->getAddress();
+diff --git a/iokit/Families/IOGPU/MaliAccelerator.cpp b/iokit/Families/IOGPU/MaliAccelerator.cpp
+index ce2722a..aab7a90 100644
+--- a/iokit/Families/IOGPU/MaliAccelerator.cpp
++++ b/iokit/Families/IOGPU/MaliAccelerator.cpp
+@@ -20,6 +20,17 @@
+ 
+ OSDefineMetaClassAndStructors(MaliAccelerator, IOGPU);
+ 
++/*
++ * huskygpu=7: called by husky_gpu.c once the proven jobs passed. The MaliAccelerator personality
++ * (KernelConfigTables.cpp) has IOResourceMatch = HuskyGPUReady, so IOKit starts the accelerator
++ * only now, after the MCU is up, not at IOResources matching time.
++ */
++extern "C" void
++husky_iogpu_publish(void)
++{
++	IOService::publishResource("HuskyGPUReady");
++}
++
+ /* Hook #1: configureDevice [spec 03 lines 128-132] */
+ bool
+ MaliAccelerator::configureDevice(IOService *)
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 4aa9a96..5d1c750 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -712,9 +712,22 @@ op_bo_import_pages(mali_vm_t *vm, const uint64_t *phys, uint32_t n_pages,
+ 	return op_bo_alloc(vm, (uint64_t)n_pages * GPU_PAGE, flags, 0, out);
+ }
+ 
++/*
++ * Set when a CSG terminate was never acked: the group may still DMA into its buffers, so nothing
++ * it could touch goes back to the allocator (CSG1 stays reserved; recovery is a GPU reset, later).
++ */
++static uint32_t g_csg_wedged;
++
+ static void
+ op_bo_free(mali_bo_t *bo)
+ {
++	if (bo != NULL && __atomic_load_n(&g_csg_wedged, __ATOMIC_ACQUIRE)) {
++		/* a wedged group may still DMA into it: keep the pages (and the alias), drop the handle */
++		BR_LOG("HUSKY IOGPU bridge: bo_free: GPU group wedged, leaking %llu bytes\n",
++		    (unsigned long long)bo->size);
++		kfree_data(bo, sizeof(mali_bo_t));
++		return;
++	}
+ 	if (bo != NULL) {
+ 		vm_size_t rsize = round_page(bo->size);
+ 		/* Unmap write-combined CPU alias [fixes REVIEW defect 3] */
+@@ -1012,6 +1025,7 @@ op_queue_destroy(mali_queue_t *q)
+ 	if (!queue_csg_terminate(q)) {
+ 		/* The firmware may still use them: leak rather than free memory under a live group. */
+ 		BR_LOG("HUSKY IOGPU bridge: queue_destroy: leaking queue buffers, CSG%u stays reserved\n", BRIDGE_CSG);
++		__atomic_store_n(&g_csg_wedged, 1u, __ATOMIC_RELEASE);
+ 		kfree_data(q, sizeof(mali_queue_t));
+ 		return;
+ 	}
+@@ -1150,7 +1164,10 @@ static void
+ op_syncobj_destroy(mali_syncobj_t *so)
+ {
+ 	if (so != NULL) {
+-		if (so->bo != NULL) {
++		if (__atomic_load_n(&g_csg_wedged, __ATOMIC_ACQUIRE)) {
++			/* a wedged group may still write its sync object: leak the page */
++			BR_LOG("HUSKY IOGPU bridge: syncobj_destroy: GPU group wedged, leaking sync page\n");
++		} else if (so->bo != NULL) {
+ 			op_bo_free(so->bo);
+ 		}
+ 		kfree_data(so, sizeof(mali_syncobj_t));
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index f07c273..0efdf89 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,12 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = HuskyHIDTouch;"
+     "   },"
++    "   {"
++    "     'IOClass'         = MaliAccelerator;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = MaliAccelerator;"
++    "     'IOResourceMatch' = HuskyGPUReady;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"

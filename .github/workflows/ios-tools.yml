@@ -1,0 +1,40 @@
+name: ios-tools
+
+# Builds small iOS arm64 userland test tools (tools/<name>/) on a macOS runner with the iOS SDK.
+# The iPhoneOS SDK ships IOKit.framework without headers; the user-level IOKitLib API is identical
+# on macOS, so the macOS SDK's IOKit headers are put on the include path as <IOKit/...>.
+on:
+  workflow_dispatch:
+    inputs:
+      tool:
+        description: tool directory under tools/
+        default: iogpu-smoke
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        env:
+          TOOL: ${{ inputs.tool }}
+        run: |
+          set -euxo pipefail
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          MACSDK=$(xcrun --sdk macosx --show-sdk-path)
+          mkdir -p inc out
+          ln -s "$MACSDK/System/Library/Frameworks/IOKit.framework/Headers" inc/IOKit
+          cd "tools/$TOOL"
+          src=$(ls *.c | head -1); bin=${src%.c}
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=26.0 -std=c11 -O1 -Wall \
+            -I "$GITHUB_WORKSPACE/inc" -framework IOKit -framework CoreFoundation "$src" -o "$GITHUB_WORKSPACE/out/$bin"
+          ent=(); [ -f ent.plist ] && ent=(--entitlements ent.plist)
+          codesign -f -s - "${ent[@]}" "$GITHUB_WORKSPACE/out/$bin"
+          codesign -dvvv --entitlements - "$GITHUB_WORKSPACE/out/$bin" || true
+          cp *.plist "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          cd "$GITHUB_WORKSPACE/out" && shasum -a 256 * > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.tool }}
+          path: out
