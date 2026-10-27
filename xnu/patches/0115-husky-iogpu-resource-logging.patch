@@ -1,0 +1,103 @@
+diff --git a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+index 986f5a8..5e51170 100644
+--- a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
++++ b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+@@ -23,6 +23,7 @@
+ #include "IOGPUCommandQueue.h"
+ #include "IOGPUNotificationQueue.h"
+ #include <sys/systm.h>
++#include <sys/proc.h>
+ 
+ OSDefineMetaClassAndStructors(IOGPUDeviceUserClient, IOUserClient);
+ 
+@@ -314,6 +315,23 @@ h_delete_command_queue(OSObject *target, void *, IOExternalMethodArguments *a)
+ 	return kIOGPUReturnSuccess;
+ }
+ 
++static IOReturn
++new_resource_refused(const char *why, const IOExternalMethodArguments *a, const iogpu_new_resource_args_t *in, IOReturn rc)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	if (in == NULL) {
++		IOLog("IOGPU: %s NEW_RESOURCE refused (%s): rc 0x%x in %u out %u\n", name, why, rc,
++		    a->structureInputSize, a->structureOutputSize);
++		return rc;
++	}
++	IOLog("IOGPU: %s NEW_RESOURCE refused (%s): rc 0x%x in %u out %u type 0x%x flags 0x%x cache 0x%x size 0x%llx "
++	    "ptr 0x%llx ptr2 0x%llx gpu 0x%llx len 0x%llx units %u parent %u\n", name, why, rc, a->structureInputSize,
++	    a->structureOutputSize, in->resType, in->flags, in->cacheMode, in->size, in->ptrOrSurface, in->ptrOrField,
++	    in->gpuAddress, in->gpuLength, in->units, in->parentIdOrSparseTile);
++	return rc;
++}
++
+ /* -- sel 8 NEW_RESOURCE (bIn V >= 0x58, bOut V) [spec 01 lines 194, 455-508] -- */
+ static IOReturn
+ h_new_resource(OSObject *target, void *, IOExternalMethodArguments *a)
+@@ -322,16 +340,17 @@ h_new_resource(OSObject *target, void *, IOExternalMethodArguments *a)
+ 	const void *inputPtr = get_struct_input(a, &inMap);
+ 	if (inputPtr == NULL || a->structureInputSize < IOGPU_RESOURCE_ARGS_MIN) {
+ 		OSSafeReleaseNULL(inMap);
+-		return kIOGPUReturnBadArgument;
++		return new_resource_refused("short input", a, NULL, kIOGPUReturnBadArgument);
+ 	}
+ 
++	const iogpu_new_resource_args_t *in = (const iogpu_new_resource_args_t *)inputPtr;
+ 	uint32_t privateSize = ACC()->config()->privateSize;
+ 	if (a->structureOutputSize < 0x58u + privateSize) {
++		new_resource_refused("short output", a, in, kIOGPUReturnBadArgument);
+ 		OSSafeReleaseNULL(inMap);
+ 		return kIOGPUReturnBadArgument;
+ 	}
+ 
+-	const iogpu_new_resource_args_t *in = (const iogpu_new_resource_args_t *)inputPtr;
+ 	IOGPUResource *r = ACC()->newResource();
+ 	if (r == NULL) {
+ 		OSSafeReleaseNULL(inMap);
+@@ -339,11 +358,14 @@ h_new_resource(OSObject *target, void *, IOExternalMethodArguments *a)
+ 	}
+ 
+ 	IOReturn rc = r->createFromArgs(DEV(), in, a->structureInputSize);
+-	OSSafeReleaseNULL(inMap);
+ 	if (rc != kIOGPUReturnSuccess) {
++		new_resource_refused("createFromArgs", a, in, rc);
++		OSSafeReleaseNULL(inMap);
+ 		r->release();
+ 		return rc;
+ 	}
++	uint32_t inFlags = in->flags, inType = in->resType;
++	OSSafeReleaseNULL(inMap);
+ 
+ 	uint32_t id = DEV()->addResource(r);
+ 	/* Release creator refcount so resource is owned only by device array [fixes REVIEWS.md:69] */
+@@ -359,7 +381,7 @@ h_new_resource(OSObject *target, void *, IOExternalMethodArguments *a)
+ 	o->resourceId   = id;
+ 	o->residentSize = r->residentSize();
+ 	o->gpuVALength  = r->gpuLength();
+-	if ((in->flags & kIOGPUResFlag_ZeroFill) && in->resType == kIOGPUResType_KernelMem) {
++	if ((inFlags & kIOGPUResFlag_ZeroFill) && inType == kIOGPUResType_KernelMem) {
+ 		o->replyFlags |= 1;             /* Client zero-fill flag [spec 01 line 496] */
+ 	}
+ 	return kIOGPUReturnSuccess;
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.cpp b/iokit/Families/IOGPU/IOGPUMemory.cpp
+index 90ef04f..3d186e0 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.cpp
++++ b/iokit/Families/IOGPU/IOGPUMemory.cpp
+@@ -208,8 +208,17 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 					fCpuAddr = (uint64_t)fClientMap->getAddress();
+ 				}
+ 			}
++			if (fCpuAddr == 0) {
++				IOLog("IOGPU: CPU mapping of resource type 0x%x size 0x%llx failed (pa 0x%llx, descriptor %p)\n",
++				    in->resType, fSize, (unsigned long long)pa, fMemDesc);
++				return kIOGPUReturnNoMemory;
++			}
+ 		}
+ 	}
++	if (dev->owner() != kernel_task) {
++		IOLog("IOGPU: resource type 0x%x size 0x%llx flags 0x%x bo 0x%x gpu 0x%llx cpu 0x%llx\n", in->resType, fSize,
++		    in->flags, flags, gpuAddress(), fCpuAddr);
++	}
+ 
+ 	return kIOGPUReturnSuccess;
+ }
