@@ -1,0 +1,24 @@
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.cpp b/iokit/Families/IOGPU/IOGPUMemory.cpp
+index dd620cd..830f55d 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.cpp
++++ b/iokit/Families/IOGPU/IOGPUMemory.cpp
+@@ -178,7 +178,8 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 		    dev->owner());
+ 		IOReturn r = md != NULL ? importMemory(md, 0, fSize, flags & ~MALI_BO_GPU_EXEC) : kIOGPUReturnNoMemory;
+ 		OSSafeReleaseNULL(md);
+-		if (r != kIOGPUReturnSuccess) {
++		const bool readOnly = r != kIOGPUReturnSuccess;
++		if (readOnly) {
+ 			/* read-only client memory (constant vertex data) cannot be wired for writing: GPU reads only */
+ 			md = IOMemoryDescriptor::withAddressRange(in->ptrOrSurface, fSize, kIODirectionOut, dev->owner());
+ 			r = md != NULL ? importMemory(md, 0, fSize, flags & ~(MALI_BO_GPU_EXEC | MALI_BO_GPU_WRITE)) :
+@@ -188,7 +189,8 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 		if (r != kIOGPUReturnSuccess) {
+ 			return r;
+ 		}
+-		fKernelMap = fImport->map();
++		/* a read-only range cannot take a writable kernel mapping */
++		fKernelMap = fImport->map(readOnly ? kIOMapReadOnly : 0);
+ 		if (fKernelMap == NULL) {
+ 			IOLog("IOGPU: client-memory resource: kernel map of 0x%llx size 0x%llx failed\n", in->ptrOrSurface, fSize);
+ 			return kIOGPUReturnNoMemory;
