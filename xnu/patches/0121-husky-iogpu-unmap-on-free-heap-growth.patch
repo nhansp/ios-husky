@@ -1,0 +1,715 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 0adaa6e..3d154be 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -552,15 +552,97 @@ pt_entry_table(uint64_t table_pa)
+ 	return (uint64_t *)(pt_kva + (table_pa - pt_pa));
+ }
+ 
++/* Freed table pages (pool indices); a table is zeroed when it goes back. */
++static uint16_t pt_free_stack[PT_PAGES];
++static unsigned pt_free_count;
++
++#define PT_ADDR_MASK            0x0000fffffffff000ULL
++
+ uint64_t
+ pt_alloc(void)
+ {
++	if (pt_free_count > 0) {
++		return pt_pa + (uint64_t)pt_free_stack[--pt_free_count] * GPU_PAGE;
++	}
+ 	if (pt_used >= PT_PAGES) {
+ 		return 0;
+ 	}
+ 	return pt_pa + (uint64_t)(pt_used++) * GPU_PAGE;
+ }
+ 
++static void
++pt_release(uint64_t table)
++{
++	bzero(pt_entry_table(table), GPU_PAGE);
++	pt_free_stack[pt_free_count++] = (uint16_t)((table - pt_pa) / GPU_PAGE);
++}
++
++static bool
++pt_table_empty(const uint64_t *t)
++{
++	for (unsigned i = 0; i < GPU_PAGE / 8; i++) {
++		if (t[i] != 0) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* Clear the leaves of [va, va + size); tables left empty go back to the pool, the root stays. */
++void
++pt_unmap_range(uint64_t root, uint64_t va, uint64_t size)
++{
++	for (uint64_t off = 0; off < size; off += GPU_PAGE) {
++		const uint64_t a = va + off;
++		uint64_t table[4] = {root};
++		unsigned idx[4], level;
++		for (level = 0; level < 3; level++) {
++			idx[level] = (unsigned)((a >> (39 - 9 * level)) & 0x1ff);
++			const uint64_t e = pt_entry_table(table[level])[idx[level]];
++			if ((e & 3) != 3) {
++				break;
++			}
++			table[level + 1] = e & PT_ADDR_MASK;
++		}
++		if (level < 3) {
++			continue;
++		}
++		pt_entry_table(table[3])[(a >> 12) & 0x1ff] = 0;
++		if (((a + GPU_PAGE) & 0x1fffffULL) != 0 && off + GPU_PAGE < size) {
++			continue;               /* emptiness is checked once per L3 table */
++		}
++		for (int l = 3; l > 0 && pt_table_empty(pt_entry_table(table[l])); l--) {
++			pt_entry_table(table[l - 1])[idx[l - 1]] = 0;
++			pt_release(table[l]);
++		}
++	}
++}
++
++static void
++pt_free_level(uint64_t table, int level)
++{
++	uint64_t *t = pt_entry_table(table);
++	for (unsigned i = 0; level < 3 && i < GPU_PAGE / 8; i++) {
++		if ((t[i] & 3) == 3) {
++			pt_free_level(t[i] & PT_ADDR_MASK, level + 1);
++		}
++	}
++	pt_release(table);
++}
++
++/* Every table under root, root included; the AS must no longer translate through it. */
++void
++pt_free_tree(uint64_t root)
++{
++	pt_free_level(root, 0);
++}
++
++unsigned
++pt_pages_in_use(void)
++{
++	return pt_used - pt_free_count;
++}
++
+ /* Map one 4 KiB page va -> pa with leaf attribute bits. */
+ bool
+ pt_map_page(uint64_t root, uint64_t va, uint64_t pa, uint64_t leaf_attrs)
+@@ -575,12 +657,12 @@ pt_map_page(uint64_t root, uint64_t va, uint64_t pa, uint64_t leaf_attrs)
+ 				return false;
+ 			}
+ 			/* table descriptor; kbase also sets AF on table entries */
+-			t[idx] = (next & 0x0000fffffffff000ULL) | (1ULL << 10) | 3;
++			t[idx] = (next & PT_ADDR_MASK) | (1ULL << 10) | 3;
+ 		}
+-		table = t[idx] & 0x0000fffffffff000ULL;
++		table = t[idx] & PT_ADDR_MASK;
+ 	}
+ 	uint64_t *l3 = pt_entry_table(table);
+-	l3[(va >> 12) & 0x1ff] = (pa & 0x0000fffffffff000ULL) | leaf_attrs | 3;
++	l3[(va >> 12) & 0x1ff] = (pa & PT_ADDR_MASK) | leaf_attrs | 3;
+ 	return true;
+ }
+ 
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 1b27ad0..8fdfe88 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -121,6 +121,7 @@ bridge_flush_on(void)
+ #define AS0                     0x2400u             /* [husky_gpu.c:188] */
+ #define AS_TRANSTAB             0x00u               /* [husky_gpu.c:189] */
+ #define AS_MEMATTR              0x08u               /* [husky_gpu.c:190] */
++#define AS_LOCKADDR             0x10u               /* kbase AS_LOCKADDR_LO/HI */
+ #define AS_COMMAND              0x18u               /* [husky_gpu.c:191] */
+ #define AS_STATUS               0x28u               /* [husky_gpu.c:194] */
+ #define AS_TRANSCFG             0x30u               /* [husky_gpu.c:195] */
+@@ -130,6 +131,10 @@ bridge_flush_on(void)
+ #define DOORBELL(i)             (DOORBELL0 + (i) * 0x10000u) /* [husky_gpu.c:198] */
+ 
+ #define AS_CMD_UPDATE           1u                  /* [husky_gpu.c:207] */
++#define AS_CMD_LOCK             2u                  /* kbase AS_COMMAND_COMMAND_LOCK */
++#define AS_CMD_FLUSH_MEM        5u                  /* kbase AS_COMMAND_COMMAND_FLUSH_MEM: flush L2, invalidate, unlock */
++#define AS_LOCK_MIN_LOG2        15u                 /* kbase_get_lock_region_min_size_log2, arch < 12 */
++#define AS_TRANSCFG_UNMAPPED    1u                  /* kbase AS_TRANSCFG_ADRMODE_UNMAPPED */
+ #define AS_MEMATTR_VALUE        0x4C4C4C4C8C4C8F4CULL /* [husky_gpu.c:208] */
+ #define AS_TRANSCFG_VALUE       0x420001C6ULL       /* [husky_gpu.c:209] */
+ 
+@@ -189,6 +194,13 @@ bridge_flush_on(void)
+ #define CS_IN_RING_SIZE         0x18u               /* [husky_gpu.c:294] */
+ #define CS_IN_RING_INPUT        0x30u               /* [husky_gpu.c:295] */
+ #define CS_IN_RING_OUTPUT       0x38u               /* [husky_gpu.c:296] */
++#define CS_IN_HEAP_START        0x20u               /* kbase CS_TILER_HEAP_START_LO */
++#define CS_IN_HEAP_END          0x28u               /* kbase CS_TILER_HEAP_END_LO */
++#define CS_OUT_HEAP_VT_START    0xc0u               /* kbase CS_HEAP_VT_START */
++#define CS_OUT_HEAP_VT_END      0xc4u
++#define CS_OUT_HEAP_FRAG_END    0xccu
++#define CS_OUT_HEAP_ADDRESS     0xd0u
++#define CS_REQ_TILER_OOM        (1u << 26)          /* kbase CS_REQ_TILER_OOM_SHIFT */
+ #define CS_OUT_ACK              0x00u               /* [husky_gpu.c:297] */
+ #define CS_OUT_CMD_PTR          0x40u               /* [husky_gpu.c:298] */
+ #define CS_OUT_STATUS_WAIT      0x48u               /* [husky_gpu.c:299] */
+@@ -268,6 +280,9 @@ rd64(vm_offset_t base, uint32_t off)
+ extern void husky_dcache_flush(vm_offset_t va, size_t len); /* husky_gpu.c:481-492 */
+ extern uint64_t pt_alloc(void); /* husky_gpu.c:520-526 */
+ extern bool pt_map_page(uint64_t root, uint64_t va, uint64_t pa, uint64_t leaf_attrs); /* husky_gpu.c:530-549 */
++extern void pt_unmap_range(uint64_t root, uint64_t va, uint64_t size);
++extern void pt_free_tree(uint64_t root);
++extern unsigned pt_pages_in_use(void);
+ extern void husky_gpu_pt_flush(void); /* clean the page-table pool to DRAM (husky_gpu.c) */
+ extern uint64_t leaf_attrs_for(uint32_t flags); /* husky_gpu.c:552-568 */
+ extern uint64_t mcu_root; /* husky_gpu.c:509 */
+@@ -350,10 +365,19 @@ struct mali_backend {
+ 	mali_dev_props_t props;
+ };
+ 
++/* GPU VA window of a client VM; shader code must sit below 4 GiB (spec 06 D7). */
++#define VM_VA_BASE              0x10000000ULL
++#define VM_VA_END               0x100000000ULL
++#define VM_VA_EXTENTS           256u
++
+ struct mali_vm {
+ 	uint64_t root_pa;
+ 	int as_slot;
+-	mali_gpu_va_t va_next;
++	uint32_t n_bos;               /* live BOs; the VM is torn down when the last one goes */
++	bool dying;
++	uint32_t n_free;
++	struct { mali_gpu_va_t base, size; } free_va[VM_VA_EXTENTS];   /* sorted, disjoint */
++	mali_tiler_heap_t *heaps;     /* found by context VA on CS_TILER_OOM */
+ };
+ 
+ struct mali_bo {
+@@ -522,6 +546,125 @@ as_slot_free(int slot)
+ 	}
+ }
+ 
++/*
++ * Set when a CSG terminate was never acked: the group may still DMA into its buffers, so nothing
++ * it could touch goes back to the allocator (CSG1 stays reserved; recovery is a GPU reset, later).
++ */
++static uint32_t g_csg_wedged;
++
++/* GPU page tables and VM address spaces: one lock (the table pool is shared by every VM). */
++static LCK_GRP_DECLARE(g_vm_grp, "husky_iogpu_vm");
++static LCK_MTX_DECLARE(g_vm_lock, &g_vm_grp);
++
++static mali_gpu_va_t
++va_alloc(mali_vm_t *vm, uint64_t size)
++{
++	for (uint32_t i = 0; i < vm->n_free; i++) {
++		if (vm->free_va[i].size < size) {
++			continue;
++		}
++		const mali_gpu_va_t va = vm->free_va[i].base;
++		vm->free_va[i].base += size;
++		vm->free_va[i].size -= size;
++		if (vm->free_va[i].size == 0) {
++			memmove(&vm->free_va[i], &vm->free_va[i + 1], (vm->n_free - i - 1) * sizeof(vm->free_va[0]));
++			vm->n_free--;
++		}
++		return va;
++	}
++	return 0;
++}
++
++static void
++va_free(mali_vm_t *vm, mali_gpu_va_t va, uint64_t size)
++{
++	uint32_t i = 0;
++	while (i < vm->n_free && vm->free_va[i].base < va) {
++		i++;
++	}
++	const bool join_prev = i > 0 && vm->free_va[i - 1].base + vm->free_va[i - 1].size == va;
++	const bool join_next = i < vm->n_free && va + size == vm->free_va[i].base;
++	if (join_prev && join_next) {
++		vm->free_va[i - 1].size += size + vm->free_va[i].size;
++		memmove(&vm->free_va[i], &vm->free_va[i + 1], (vm->n_free - i - 1) * sizeof(vm->free_va[0]));
++		vm->n_free--;
++	} else if (join_prev) {
++		vm->free_va[i - 1].size += size;
++	} else if (join_next) {
++		vm->free_va[i].base = va;
++		vm->free_va[i].size += size;
++	} else if (vm->n_free < VM_VA_EXTENTS) {
++		memmove(&vm->free_va[i + 1], &vm->free_va[i], (vm->n_free - i) * sizeof(vm->free_va[0]));
++		vm->free_va[i].base = va;
++		vm->free_va[i].size = size;
++		vm->n_free++;
++	} else {
++		BR_LOG("HUSKY IOGPU bridge: VA free list full, dropping 0x%llx+0x%llx\n", (unsigned long long)va,
++		    (unsigned long long)size);
++	}
++}
++
++/* Take [va, va + size) out of the free list; false if any of it is already in use. */
++static bool
++va_reserve(mali_vm_t *vm, mali_gpu_va_t va, uint64_t size)
++{
++	for (uint32_t i = 0; i < vm->n_free; i++) {
++		const mali_gpu_va_t b = vm->free_va[i].base, e = b + vm->free_va[i].size;
++		if (va < b || va + size > e) {
++			continue;
++		}
++		vm->free_va[i].size = va - b;
++		if (va + size < e) {
++			if (vm->free_va[i].size == 0) {
++				vm->free_va[i].base = va + size;
++				vm->free_va[i].size = e - (va + size);
++			} else {
++				va_free(vm, va + size, e - (va + size));
++			}
++		} else if (vm->free_va[i].size == 0) {
++			memmove(&vm->free_va[i], &vm->free_va[i + 1], (vm->n_free - i - 1) * sizeof(vm->free_va[0]));
++			vm->n_free--;
++		}
++		return true;
++	}
++	return false;
++}
++
++static bool
++va_managed(mali_gpu_va_t va, uint64_t size)
++{
++	return va >= VM_VA_BASE && va + size <= VM_VA_END;
++}
++
++/*
++ * After PTEs of [va, va + size) changed: LOCK the self-aligned region holding it, then FLUSH_MEM
++ * (L2 flush, TLB invalidate, unlock) [kbase mali_kbase_mmu_hw_direct.c lock_region, kbase_mmu_hw_do_flush].
++ */
++static mali_status_t
++vm_flush_range(mali_vm_t *vm, mali_gpu_va_t va, uint64_t size)
++{
++	const uint32_t as_reg = AS0 + (uint32_t)vm->as_slot * AS_STRIDE;
++	const uint64_t diff = va ^ (va + size - 1);
++	uint32_t log2 = diff ? 64u - (uint32_t)__builtin_clzll(diff) : 0;
++	if (log2 < AS_LOCK_MIN_LOG2) {
++		log2 = AS_LOCK_MIN_LOG2;
++	}
++	const uint64_t lockaddr = (va & ~((1ULL << log2) - 1)) | (log2 - 1);
++	if (!gpoll(as_reg + AS_STATUS, 3, 0, 100000, NULL)) {
++		return EBUSY;
++	}
++	gwr64(as_reg + AS_LOCKADDR, lockaddr);
++	gwr(as_reg + AS_COMMAND, AS_CMD_LOCK);
++	if (!gpoll(as_reg + AS_STATUS, 3, 0, 100000, NULL)) {
++		return ETIMEDOUT;
++	}
++	gwr(as_reg + AS_COMMAND, AS_CMD_FLUSH_MEM);
++	if (!gpoll(as_reg + AS_STATUS, 3, 0, 100000, NULL)) {
++		return ETIMEDOUT;
++	}
++	return 0;
++}
++
+ /*
+  * Program the VM's AS slot and run AS_COMMAND UPDATE, exactly as husky_gpu.c binds AS1
+  * [husky_gpu.c:915-927]: wait idle, TRANSTAB, MEMATTR, TRANSCFG, UPDATE, wait idle.
+@@ -554,17 +697,6 @@ op_vm_create(mali_backend_t *be, mali_vm_t **out)
+ 	if (vm == NULL) {
+ 		return ENOMEM;
+ 	}
+-
+-	/* Own translation table root from the pool [husky_gpu.c:525-532]; no fallback to mcu_root. */
+-	uint64_t root = pt_alloc();
+-	if (root == 0) {
+-		BR_LOG("HUSKY IOGPU bridge: vm_create: page-table pool exhausted\n");
+-		kfree_data(vm, sizeof(mali_vm_t));
+-		return ENOMEM;
+-	}
+-
+-	vm->root_pa = root;
+-	vm->va_next = 0x10000000ULL;   /* Start user allocations at 256 MiB */
+ 	vm->as_slot = as_slot_alloc(); /* AS2..AS7, one per VM */
+ 	if (vm->as_slot < 0) {
+ 		BR_LOG("HUSKY IOGPU bridge: vm_create: no free AS slot (AS2-AS7)\n");
+@@ -572,26 +704,64 @@ op_vm_create(mali_backend_t *be, mali_vm_t **out)
+ 		return EBUSY;
+ 	}
+ 
+-	/* Empty root to DRAM, then bind (re-bound after every mapping in op_bo_alloc). */
++	/* Own translation table root from the pool; an empty root goes to DRAM before the bind. */
++	lck_mtx_lock(&g_vm_lock);
++	vm->root_pa = pt_alloc();
+ 	husky_gpu_pt_flush();
+-	mali_status_t st = vm_as_update(vm);
++	mali_status_t st = vm->root_pa != 0 ? vm_as_update(vm) : ENOMEM;
+ 	if (st != 0) {
++		if (vm->root_pa != 0) {
++			pt_free_tree(vm->root_pa);
++		}
++		lck_mtx_unlock(&g_vm_lock);
++		BR_LOG("HUSKY IOGPU bridge: vm_create failed (%d), %u page tables in use\n", st, pt_pages_in_use());
+ 		as_slot_free(vm->as_slot);
+ 		kfree_data(vm, sizeof(mali_vm_t));
+ 		return st;
+ 	}
++	vm->free_va[0].base = VM_VA_BASE;
++	vm->free_va[0].size = VM_VA_END - VM_VA_BASE;
++	vm->n_free = 1;
++	lck_mtx_unlock(&g_vm_lock);
+ 
+ 	*out = vm;
+ 	return 0;
+ }
+ 
++/* Unbind the AS (kbase mmu_disable_as: TRANSTAB 0, TRANSCFG unmapped), then free the tables. Holds g_vm_lock. */
+ static void
+-op_vm_destroy(mali_vm_t *vm)
++vm_teardown_locked(mali_vm_t *vm)
+ {
+-	if (vm != NULL) {
++	const uint32_t as_reg = AS0 + (uint32_t)vm->as_slot * AS_STRIDE;
++	bool unbound = !__atomic_load_n(&g_csg_wedged, __ATOMIC_ACQUIRE) && gpoll(as_reg + AS_STATUS, 3, 0, 100000, NULL);
++	if (unbound) {
++		gwr64(as_reg + AS_TRANSTAB, 0);
++		gwr64(as_reg + AS_TRANSCFG, AS_TRANSCFG_UNMAPPED);
++		gwr(as_reg + AS_COMMAND, AS_CMD_UPDATE);
++		unbound = gpoll(as_reg + AS_STATUS, 3, 0, 100000, NULL);
++	}
++	if (unbound) {
++		pt_free_tree(vm->root_pa);
++		husky_gpu_pt_flush();
+ 		as_slot_free(vm->as_slot);
+-		kfree_data(vm, sizeof(mali_vm_t));
++	} else {
++		BR_LOG("HUSKY IOGPU bridge: AS%d did not unbind; its page tables and slot stay reserved\n", vm->as_slot);
+ 	}
++	kfree_data(vm, sizeof(mali_vm_t));
++}
++
++static void
++op_vm_destroy(mali_vm_t *vm)
++{
++	if (vm == NULL) {
++		return;
++	}
++	lck_mtx_lock(&g_vm_lock);
++	vm->dying = true;
++	if (vm->n_bos == 0) {
++		vm_teardown_locked(vm);
++	}
++	lck_mtx_unlock(&g_vm_lock);
+ }
+ 
+ static mali_status_t
+@@ -633,14 +803,6 @@ op_bo_alloc(mali_vm_t *vm, uint64_t size, uint32_t flags,
+ 	bo->size  = size;
+ 	bo->flags = flags;
+ 
+-	/* Assign GPU VA */
+-	if (flags & MALI_BO_FIXED_VA) {
+-		bo->gpu_va = fixed_va;
+-	} else {
+-		bo->gpu_va = vm->va_next;
+-		vm->va_next += (mali_gpu_va_t)round_page(size);
+-	}
+-
+ 	/*
+ 	 * Allocate physically contiguous backing memory [husky_gpu.c:1089-1094].
+ 	 * Allocate with KMA_DATA | KMA_ZERO (without KMA_PERMANENT) so physical
+@@ -680,47 +842,72 @@ op_bo_alloc(mali_vm_t *vm, uint64_t size, uint32_t flags,
+ 	if (!(flags & MALI_BO_NONCACHEABLE)) {
+ 		fw_flags |= (1u << 3);   /* Cacheable inner-shareable */
+ 	}
+-
+ 	uint64_t leaf_attrs = leaf_attrs_for(fw_flags);
+ 
+ 	/* Clean and invalidate newly allocated memory to DRAM [husky_gpu.c:481-492] */
+ 	husky_dcache_flush(bo->kva, rsize);
+ 
+-	/* Map 4 KiB pages into VM translation tables [husky_gpu.c:534-555] */
++	lck_mtx_lock(&g_vm_lock);
+ 	mali_status_t st = 0;
+-	for (uint64_t off = 0; off < rsize; off += GPU_PAGE) {
+-		if (!pt_map_page(vm->root_pa, bo->gpu_va + off, bo->pa + off, leaf_attrs)) {
+-			BR_LOG("HUSKY IOGPU bridge: bo_alloc: page-table pool exhausted at va 0x%llx\n",
+-			    (unsigned long long)(bo->gpu_va + off));
++	bool have_va = false;
++	if (flags & MALI_BO_FIXED_VA) {
++		bo->gpu_va = fixed_va;
++		have_va = va_managed(fixed_va, rsize) && va_reserve(vm, fixed_va, rsize);
++		if (va_managed(fixed_va, rsize) && !have_va) {
++			st = EBUSY;
++		}
++	} else {
++		bo->gpu_va = va_alloc(vm, rsize);
++		have_va = bo->gpu_va != 0;
++		if (!have_va) {
++			st = ENOMEM;
++		}
++	}
++
++	/* Map 4 KiB pages into VM translation tables [husky_gpu.c:534-555] */
++	uint64_t mapped = 0;
++	while (st == 0 && mapped < rsize) {
++		if (!pt_map_page(vm->root_pa, bo->gpu_va + mapped, bo->pa + mapped, leaf_attrs)) {
++			BR_LOG("HUSKY IOGPU bridge: bo_alloc: page-table pool exhausted at va 0x%llx (%u tables in use)\n",
++			    (unsigned long long)(bo->gpu_va + mapped), pt_pages_in_use());
+ 			st = ENOMEM;
+ 			break;
+ 		}
++		mapped += GPU_PAGE;
+ 	}
+ 
+-	/*
+-	 * Page tables were written through the cacheable pt_kva view: clean them to DRAM, then
+-	 * re-run AS UPDATE for the VM's slot (the update in op_vm_create ran before any mapping).
+-	 */
++	/* Page tables were written through the cacheable pool view: clean them, then re-bind the slot. */
+ 	husky_gpu_pt_flush();
+ 	if (st == 0) {
+ 		st = vm_as_update(vm);
+ 	}
+-	if (st != 0) {
+-		/*
+-		 * No pt_unmap exists: PTEs written so far still point at this backing, so the
+-		 * pages are deliberately leaked rather than handed back to the VM system.
+-		 */
+-		BR_LOG("HUSKY IOGPU bridge: bo_alloc failed (%d); leaking %lu bytes still in the GPU page tables\n",
+-		    st, (unsigned long)rsize);
+-		if (bo->cpu_wcomb != 0) {
+-			ml_io_unmap(bo->cpu_wcomb, rsize);
+-		}
+-		kfree_data(bo, sizeof(mali_bo_t));
+-		return st;
++	if (st == 0) {
++		vm->n_bos++;
++		lck_mtx_unlock(&g_vm_lock);
++		*out = bo;
++		return 0;
+ 	}
+ 
+-	*out = bo;
+-	return 0;
++	bool pages_free = true;
++	if (mapped != 0) {
++		pt_unmap_range(vm->root_pa, bo->gpu_va, mapped);
++		husky_gpu_pt_flush();
++		pages_free = vm_flush_range(vm, bo->gpu_va, mapped) == 0;
++	}
++	if (have_va && pages_free) {
++		va_free(vm, bo->gpu_va, rsize);
++	}
++	lck_mtx_unlock(&g_vm_lock);
++	BR_LOG("HUSKY IOGPU bridge: bo_alloc of 0x%llx failed (%d)%s\n", (unsigned long long)size, st,
++	    pages_free ? "" : "; GPU TLB not invalidated, backing leaked");
++	if (bo->cpu_wcomb != 0) {
++		ml_io_unmap(bo->cpu_wcomb, rsize);
++	}
++	if (pages_free) {
++		kmem_free(kernel_map, kva, rsize);
++	}
++	kfree_data(bo, sizeof(mali_bo_t));
++	return st;
+ }
+ 
+ static mali_status_t
+@@ -731,36 +918,45 @@ op_bo_import_pages(mali_vm_t *vm, const uint64_t *phys, uint32_t n_pages,
+ 	return op_bo_alloc(vm, (uint64_t)n_pages * GPU_PAGE, flags, 0, out);
+ }
+ 
+-/*
+- * Set when a CSG terminate was never acked: the group may still DMA into its buffers, so nothing
+- * it could touch goes back to the allocator (CSG1 stays reserved; recovery is a GPU reset, later).
+- */
+-static uint32_t g_csg_wedged;
+-
+ static void
+ op_bo_free(mali_bo_t *bo)
+ {
+-	if (bo != NULL && __atomic_load_n(&g_csg_wedged, __ATOMIC_ACQUIRE)) {
+-		/* a wedged group may still DMA into it: keep the pages (and the alias), drop the handle */
++	if (bo == NULL) {
++		return;
++	}
++	if (__atomic_load_n(&g_csg_wedged, __ATOMIC_ACQUIRE)) {
++		/* a wedged group may still DMA into it: keep the pages, mapping and VM; drop the handle */
+ 		BR_LOG("HUSKY IOGPU bridge: bo_free: GPU group wedged, leaking %llu bytes\n",
+ 		    (unsigned long long)bo->size);
+ 		kfree_data(bo, sizeof(mali_bo_t));
+ 		return;
+ 	}
+-	if (bo != NULL) {
+-		vm_size_t rsize = round_page(bo->size);
+-		/* Unmap write-combined CPU alias [fixes REVIEW defect 3] */
+-		if (bo->cpu_wcomb != 0) {
+-			ml_io_unmap(bo->cpu_wcomb, rsize);
+-			bo->cpu_wcomb = 0;
+-		}
+-		/* Free physical pages to kernel map [fixes REVIEW defect 3] */
+-		if (bo->kva != 0) {
+-			kmem_free(kernel_map, bo->kva, rsize);
+-			bo->kva = 0;
+-		}
+-		kfree_data(bo, sizeof(mali_bo_t));
++
++	/* Unmap and invalidate before the pages can be reused [kbase kbase_mmu_teardown_pages]. */
++	mali_vm_t *vm = bo->vm;
++	vm_size_t rsize = round_page(bo->size);
++	lck_mtx_lock(&g_vm_lock);
++	pt_unmap_range(vm->root_pa, bo->gpu_va, rsize);
++	husky_gpu_pt_flush();
++	const bool released = vm_flush_range(vm, bo->gpu_va, rsize) == 0;
++	if (released && va_managed(bo->gpu_va, rsize)) {
++		va_free(vm, bo->gpu_va, rsize);
++	}
++	if (--vm->n_bos == 0 && vm->dying) {
++		vm_teardown_locked(vm);
++	}
++	lck_mtx_unlock(&g_vm_lock);
++
++	if (bo->cpu_wcomb != 0) {
++		ml_io_unmap(bo->cpu_wcomb, rsize);
++	}
++	if (released) {
++		kmem_free(kernel_map, bo->kva, rsize);
++	} else {
++		BR_LOG("HUSKY IOGPU bridge: bo_free: GPU TLB flush of 0x%llx failed, leaking %llu bytes\n",
++		    (unsigned long long)bo->gpu_va, (unsigned long long)bo->size);
+ 	}
++	kfree_data(bo, sizeof(mali_bo_t));
+ }
+ 
+ static mali_gpu_va_t
+@@ -1095,6 +1291,8 @@ op_queue_destroy(mali_queue_t *q)
+  *   4. Pad to 64-byte lines ((n + 7) & ~7u), write to ring, dsb sy, update ring_in, dsb sy, kick doorbell [husky_gpu.c:658-670]
+  *   5. Poll sync object for hardware completion [husky_gpu.c:672-678]
+  */
++static bool queue_tiler_oom(mali_queue_t *q);
++
+ static mali_status_t
+ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ {
+@@ -1164,10 +1362,15 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 
+ 	/* Poll sync object for hardware completion [husky_gpu.c:672-678] */
+ 	unsigned us;
++	bool oom_handled = true;
+ 	for (us = 0; us < 500000; us += 10) {
+ 		if (so != NULL && so->cpu != NULL && *so->cpu == expected_sync) {
+ 			break;
+ 		}
++		if (oom_handled && q->csout != 0 &&
++		    ((rd32(q->csout, CS_OUT_ACK) ^ rd32(q->csin, CS_IN_REQ)) & CS_REQ_TILER_OOM)) {
++			oom_handled = queue_tiler_oom(q);
++		}
+ 		delay(10);
+ 	}
+ 
+@@ -1261,7 +1464,11 @@ op_syncobj_read(const mali_syncobj_t *so)
+ #define HEAP_CHUNK_MAX          (8u << 20)
+ #define HEAP_MAX_CHUNKS         1024u
+ 
++#define HEAP_BO_FLAGS           (MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_NONCACHEABLE)
++
+ struct mali_tiler_heap {
++	mali_tiler_heap_t *next;
++	mali_vm_t  *vm;
+ 	mali_bo_t  *ctx;
+ 	mali_bo_t **chunks;
+ 	uint32_t    n_chunks, max_chunks, chunk_size;
+@@ -1290,7 +1497,7 @@ op_tiler_heap_create(mali_vm_t *vm, uint32_t chunk_size, uint32_t initial_chunks
+ 	    max_chunks > HEAP_MAX_CHUNKS) {
+ 		return EINVAL;
+ 	}
+-	const uint32_t flags = MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_NONCACHEABLE;
++	const uint32_t flags = HEAP_BO_FLAGS;
+ 	mali_tiler_heap_t *h = (mali_tiler_heap_t *)kalloc_data(sizeof(*h), Z_WAITOK | Z_ZERO);
+ 	if (h == NULL) {
+ 		return ENOMEM;
+@@ -1320,6 +1527,11 @@ op_tiler_heap_create(mali_vm_t *vm, uint32_t chunk_size, uint32_t initial_chunks
+ 	BR_LOG("HUSKY IOGPU bridge: tiler heap: ctx 0x%llx, %u x %u KiB chunks from 0x%llx (max %u)\n",
+ 	    (unsigned long long)h->ctx->gpu_va, h->n_chunks, chunk_size >> 10,
+ 	    (unsigned long long)h->chunks[0]->gpu_va, max_chunks);
++	lck_mtx_lock(&g_vm_lock);
++	h->vm = vm;
++	h->next = vm->heaps;
++	vm->heaps = h;
++	lck_mtx_unlock(&g_vm_lock);
+ 	*out = h;
+ 	if (ctx_va_out) {
+ 		*ctx_va_out = h->ctx->gpu_va;
+@@ -1333,9 +1545,75 @@ op_tiler_heap_create(mali_vm_t *vm, uint32_t chunk_size, uint32_t initial_chunks
+ static void
+ op_tiler_heap_destroy(mali_tiler_heap_t *heap)
+ {
+-	if (heap != NULL) {
+-		tiler_heap_free(heap);
++	if (heap == NULL) {
++		return;
+ 	}
++	lck_mtx_lock(&g_vm_lock);
++	for (mali_tiler_heap_t **p = &heap->vm->heaps; *p != NULL; p = &(*p)->next) {
++		if (*p == heap) {
++			*p = heap->next;
++			break;
++		}
++	}
++	lck_mtx_unlock(&g_vm_lock);
++	tiler_heap_free(heap);
++}
++
++/*
++ * CS_TILER_OOM [kbase mali_kbase_csf.c kbase_csf_cs_get_pending_oom / kbase_csf_program_cs_oom_prepared_chunk,
++ * mali_kbase_csf_tiler_heap.c validate_allocation_request]: give the stream one more zeroed chunk through
++ * CS_TILER_HEAP_START/END, or a null chunk while fragment work that will release chunks is pending.
++ * False when the request cannot be answered; it then stays pending and the submit times out with the state logged.
++ */
++static bool
++queue_tiler_oom(mali_queue_t *q)
++{
++	const uint32_t vt_start = rd32(q->csout, CS_OUT_HEAP_VT_START);
++	const uint32_t vt_end = rd32(q->csout, CS_OUT_HEAP_VT_END);
++	const uint32_t frag_end = rd32(q->csout, CS_OUT_HEAP_FRAG_END);
++	const uint64_t heap_va = rd64(q->csout, CS_OUT_HEAP_ADDRESS);
++	if (frag_end > vt_end || vt_end >= vt_start) {
++		BR_LOG("HUSKY IOGPU bridge: tiler OOM with invalid heap statistics: vt %u/%u frag %u\n", vt_start, vt_end,
++		    frag_end);
++		return false;
++	}
++
++	lck_mtx_lock(&g_vm_lock);
++	mali_tiler_heap_t *h = q->vm->heaps;
++	while (h != NULL && h->ctx->gpu_va != heap_va) {
++		h = h->next;
++	}
++	lck_mtx_unlock(&g_vm_lock);
++	if (h == NULL) {
++		BR_LOG("HUSKY IOGPU bridge: tiler OOM for unknown heap 0x%llx\n", (unsigned long long)heap_va);
++		return false;
++	}
++
++	uint64_t chunk_ptr = 0;
++	mali_bo_t *chunk = NULL;
++	if (h->n_chunks < h->max_chunks && op_bo_alloc(q->vm, h->chunk_size, HEAP_BO_FLAGS, 0, &chunk) == 0) {
++		h->chunks[h->n_chunks++] = chunk;
++		chunk_ptr = (chunk->gpu_va & ~(uint64_t)0xfff) | (h->chunk_size >> 12);
++	} else if (vt_end == frag_end) {
++		BR_LOG("HUSKY IOGPU bridge: tiler heap 0x%llx exhausted at %u chunks, no fragment work pending\n",
++		    (unsigned long long)heap_va, h->n_chunks);
++		return false;
++	}
++
++	wr64(q->csin, CS_IN_HEAP_START, chunk_ptr);
++	wr64(q->csin, CS_IN_HEAP_END, chunk_ptr);
++	wr32(q->csin, CS_IN_REQ, (rd32(q->csin, CS_IN_REQ) & ~CS_REQ_TILER_OOM) |
++	    (rd32(q->csout, CS_OUT_ACK) & CS_REQ_TILER_OOM));
++	__asm__ volatile ("dmb osh" ::: "memory");     /* CS_REQ visible before the doorbell request [kbase_csf_ring_cs_kernel_doorbell] */
++	const uint32_t cs_bit = 1u << BRIDGE_CS;
++	lck_mtx_lock(&g_glb_lock);
++	wr32(q->csgin, CSG_IN_DB_REQ, (rd32(q->csgin, CSG_IN_DB_REQ) & ~cs_bit) | (~rd32(q->csgout, CSG_OUT_DB_ACK) & cs_bit));
++	glb_group_doorbell(q->csg);
++	lck_mtx_unlock(&g_glb_lock);
++	BR_LOG("HUSKY IOGPU bridge: tiler OOM: heap 0x%llx %s (vt %u/%u frag %u, %u chunks)\n",
++	    (unsigned long long)heap_va, chunk ? "grown" : "waits for fragment work", vt_start, vt_end, frag_end,
++	    h->n_chunks);
++	return true;
+ }
+ 
+ /*
