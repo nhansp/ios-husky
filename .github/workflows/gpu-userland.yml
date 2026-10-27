@@ -67,8 +67,9 @@ jobs:
           xcrun -sdk iphoneos metal --version || xcodebuild -downloadComponent MetalToolchain
           xcrun -sdk iphoneos metal -c -mios-version-min=26.0 tools/metal-smoke/metal_smoke.metal -o out/smoke/metal_smoke.air
           xcrun -sdk iphoneos metallib out/smoke/metal_smoke.air -o out/smoke/metal_smoke.metallib
-          xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 -fobjc-arc -O1 -Wall -Werror \
-            tools/metal-smoke/metal_smoke.m -framework Foundation -framework Metal -o out/smoke/metal_smoke
+          mkdir -p out/inc && ln -sfn "$(xcrun --sdk macosx --show-sdk-path)/System/Library/Frameworks/IOKit.framework/Headers" out/inc/IOKit
+          xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 -fobjc-arc -O1 -Wall -Werror -I out/inc \
+            tools/metal-smoke/metal_smoke.m -framework Foundation -framework Metal -framework IOKit -o out/smoke/metal_smoke
           codesign -f -s - --entitlements tools/metal-smoke/ent.plist out/smoke/metal_smoke
           cp tools/metal-smoke/com.husky.metal-smoke.plist out/smoke/
 

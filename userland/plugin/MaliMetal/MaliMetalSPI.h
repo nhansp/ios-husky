@@ -153,3 +153,4 @@ NS_ASSUME_NONNULL_END
 /* Work diagnostics (MaliCommandBuffer.m): per-process file /private/var/tmp/mali-NAME-PID.log, readable from the
  * next boot's single-user shell without launchd or logd, plus os_log. Same idea as SnapMetal's AdrenoDiagLine. */
 void MaliDiagLine(NSString *_Nullable line);
+void MaliConsole(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

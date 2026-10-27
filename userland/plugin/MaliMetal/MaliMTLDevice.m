@@ -18,10 +18,29 @@
 #import <sys/sysctl.h>
 #import <os/log.h>
 #import <dlfcn.h>
+#import <fcntl.h>
+#import <stdarg.h>
+#import <unistd.h>
 
 #ifndef MALI_FEATURE_PROFILE
 #define MALI_FEATURE_PROFILE 10001ull
 #endif
+
+void MaliConsole(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if ((size_t)n >= sizeof buf) n = sizeof buf - 1;
+    int fd = open("/dev/console", O_WRONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+    if (fd >= 0) { (void)write(fd, buf, (size_t)n); close(fd); }
+}
+
+__attribute__((constructor)) static void mali_loaded(void) {
+    MaliConsole("MaliMetal: loaded in %s[%d]\n", getprogname(), (int)getpid());
+}
 
 static os_log_t mali_log(void) {
     static os_log_t l;
@@ -92,13 +111,14 @@ static void MaliLoadDevProps(io_service_t port, mali_dev_props_t *out) {
     const char *e = getenv("MALI_FEATURE_PROFILE");                    /* bring-up experiments only */
     if (e) _featureProfile = strtoull(e, NULL, 0);
 
+    MaliConsole("MaliMetal: initWithAcceleratorPort 0x%x in %s\n", port, getprogname());
     self = [super initWithAcceleratorPort:port];                       /* IOGPUDeviceCreateWithOptions + shmem pools */
-    if (!self) { os_log_error(mali_log(), "IOGPUMetalDevice init failed for port 0x%x", port); return nil; }
+    if (!self) { MaliConsole("MaliMetal: IOGPUMetalDevice init failed for port 0x%x\n", port); return nil; }
     _lazyLock = [NSLock new];
-    if (![self setupSegmentByteThreshold]) return nil;
+    if (![self setupSegmentByteThreshold]) { MaliConsole("MaliMetal: setupSegmentByteThreshold failed\n"); return nil; }
 
     MaliLoadDevProps(port, &_props);
-    if (mali_ctx_init(&_ctx, &_props) != 0) { os_log_error(mali_log(), "mali_ctx_init failed"); return nil; }
+    if (mali_ctx_init(&_ctx, &_props) != 0) { MaliConsole("MaliMetal: mali_ctx_init failed\n"); return nil; }
 
     NSString *why = nil;
     _shaderCompiler = [[MaliShaderCompiler alloc] initWithProps:&_props error:&why];
@@ -110,6 +130,8 @@ static void MaliLoadDevProps(io_service_t port, mali_dev_props_t *out) {
            _props.gpu_id, _shaderCompiler.compilerID ?: @"none");
     MaliDiagLine([NSString stringWithFormat:@"device up port=0x%x gpu_id=0x%llx cores=%u compiler=%@", port, _props.gpu_id, _props.core_count,
                   _shaderCompiler.compilerID ?: @"none"]);
+    MaliConsole("MaliMetal: device up in %s, gpu_id 0x%llx, compiler %s\n", getprogname(), (unsigned long long)_props.gpu_id,
+                (_shaderCompiler.compilerID ?: @"none").UTF8String);
     return self;
 }
 

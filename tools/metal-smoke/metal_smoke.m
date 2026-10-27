@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOKit/IOKitLib.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -35,11 +36,56 @@ static int fail(int step, NSString *what)
     return 1;
 }
 
+@protocol MaliAcceleratorInit
+- (nullable id)initWithAcceleratorPort:(io_service_t)port;
+@end
+
+static void diagnose_discovery(void)
+{
+    NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();
+    say("METAL-SMOKE: diag: MTLCopyAllDevices -> %lu\n", (unsigned long)all.count);
+
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOAcceleratorES"));
+    if (!svc) {
+        say("METAL-SMOKE: diag: no IOAcceleratorES service\n");
+        return;
+    }
+    NSString *name = CFBridgingRelease(IORegistryEntryCreateCFProperty(svc, CFSTR("MetalPluginName"), kCFAllocatorDefault, 0));
+    NSString *cls = CFBridgingRelease(IORegistryEntryCreateCFProperty(svc, CFSTR("MetalPluginClassName"), kCFAllocatorDefault, 0));
+    say("METAL-SMOKE: diag: service 0x%x MetalPluginName=%s MetalPluginClassName=%s\n", svc, name.UTF8String,
+        cls.UTF8String);
+
+    NSString *path = [@"/System/Library/Extensions" stringByAppendingPathComponent:[name stringByAppendingString:@".bundle"]];
+    NSBundle *bundle = [NSBundle bundleWithPath:path];
+    NSError *err = nil;
+    BOOL loaded = [bundle loadAndReturnError:&err];
+    say("METAL-SMOKE: diag: bundle %s: %s loaded=%d error=%s\n", path.UTF8String, bundle ? "found" : "missing", loaded,
+        err ? err.description.UTF8String : "-");
+    if (!loaded)
+        return;
+
+    Class c = [bundle classNamed:cls] ?: bundle.principalClass;
+    Class base = NSClassFromString(@"_MTLDevice");
+    Protocol *spi = NSProtocolFromString(@"MTLDeviceSPI");
+    say("METAL-SMOKE: diag: class %s subclassOf(_MTLDevice)=%d conformsTo(MTLDeviceSPI)=%d\n",
+        c ? NSStringFromClass(c).UTF8String : "nil", c && base ? [c isSubclassOfClass:base] : -1,
+        c && spi ? [c conformsToProtocol:spi] : -1);
+    if (!c)
+        return;
+
+    id d = [(id<MaliAcceleratorInit>)[c alloc] initWithAcceleratorPort:svc];
+    say("METAL-SMOKE: diag: [%s initWithAcceleratorPort:0x%x] -> %s\n", NSStringFromClass(c).UTF8String, svc,
+        d ? "device" : "nil");
+    IOObjectRelease(svc);
+}
+
 static int run(void)
 {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    if (!dev)
+    if (!dev) {
+        diagnose_discovery();
         return fail(1, @"MTLCreateSystemDefaultDevice returned nil");
+    }
     say("METAL-SMOKE: [1/7] device: PASS (%s, class %s)\n", dev.name.UTF8String,
         NSStringFromClass([(NSObject *)dev class]).UTF8String);
 
