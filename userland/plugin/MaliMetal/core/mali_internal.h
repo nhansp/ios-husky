@@ -25,6 +25,7 @@ static inline uint32_t mali_f2u(float f) { union { float f; uint32_t u; } x = {.
 struct pan_earlyzs_state;
 bool mali_state_emit_blend(mali_arena_t *a, const mali_gfx_pipeline_t *pipe, const float constants[4],
                            uint64_t *bds_reg, uint64_t blend_descs_out[MALI_MAX_RTS], bool *any_dest_read);
+void mali_state_rt_conversions(const mali_gfx_pipeline_t *pipe, uint32_t out[MALI_MAX_RTS]);
 void mali_state_dcd(const mali_gfx_pipeline_t *pipe, const mali_draw_state_t *s, bool any_dest_read,
                     uint32_t out[3], struct pan_earlyzs_state *ez);
 void mali_state_prim_flags(const mali_gfx_pipeline_t *pipe, const mali_draw_state_t *s, uint32_t *flags,

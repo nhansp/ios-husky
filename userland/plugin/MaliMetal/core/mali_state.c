@@ -213,6 +213,23 @@ emit_blend_desc(const mali_gfx_pipeline_t *pipe, unsigned i, const float constan
         *dest_read = true;
 }
 
+/* FAU sysval rt_conv[]: the LD_TILE conversion word of each RT a framebuffer-fetch shader reads,
+ * sized like the colour output [M:gallium/drivers/panfrost/pan_cmdstream.c panfrost_upload_rt_conversion_sysval] */
+void
+mali_state_rt_conversions(const mali_gfx_pipeline_t *pipe, uint32_t out[MALI_MAX_RTS])
+{
+    for (unsigned i = 0; i < MALI_MAX_RTS; i++) {
+        mali_fmt_info_t fi;
+        if (i < pipe->rt_count && pipe->rt[i].mtl_format && mali_fmt_lookup(pipe->rt[i].mtl_format, &fi)) {
+            const unsigned size = (pipe->fs.prog.fs.rt[i].base_type & 0x79u) == 16u ? 16u : 32u;
+            out[i] = (uint32_t)(GENX(pan_blend_get_internal_desc)((enum pipe_format)fi.pipe_format, i, size, false) >> 32);
+        } else {
+            pan_cast_and_pack(&out[i], INTERNAL_CONVERSION, cfg)
+                cfg.memory_format = GENX(pan_format_from_pipe_format)(PIPE_FORMAT_NONE)->hw;
+        }
+    }
+}
+
 bool
 mali_state_emit_blend(mali_arena_t *a, const mali_gfx_pipeline_t *pipe, const float constants[4],
                       uint64_t *bds_reg, uint64_t blend_descs_out[MALI_MAX_RTS], bool *any_dest_read)

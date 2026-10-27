@@ -683,6 +683,8 @@ mali_pass_draw(mali_pass_t *p, const mali_draw_state_t *s)
         svf.blend.constants[i] = s->blend_color[i];     /* FS words 0..3 [S07 6.11] */
     memcpy(svf.blend_descs, p->blend_descs, sizeof(svf.blend_descs));
     memcpy(svv.blend_descs, p->blend_descs, sizeof(svv.blend_descs));
+    if (has_fs && fp->fs.uses_fb_fetch)
+        mali_state_rt_conversions(pipe, svf.rt_conv);
 
     int minx = (int)vx, maxx = (int)(vx + vw);
     int miny = (int)(vh < 0 ? vy + vh : vy), maxy = (int)(vh < 0 ? vy : vy + vh);
