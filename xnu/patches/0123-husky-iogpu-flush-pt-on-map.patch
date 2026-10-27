@@ -1,0 +1,153 @@
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 3cb1652..6ee2d8b 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -132,7 +132,11 @@ bridge_flush_on(void)
+ 
+ #define AS_CMD_UPDATE           1u                  /* [husky_gpu.c:207] */
+ #define AS_CMD_LOCK             2u                  /* kbase AS_COMMAND_COMMAND_LOCK */
++#define AS_CMD_FLUSH_PT         4u                  /* kbase AS_COMMAND_COMMAND_FLUSH_PT: after inserting pages */
+ #define AS_CMD_FLUSH_MEM        5u                  /* kbase AS_COMMAND_COMMAND_FLUSH_MEM: flush L2, invalidate, unlock */
++#define AS_FAULTSTATUS          0x1cu               /* kbase AS_FAULTSTATUS */
++#define AS_FAULTADDRESS         0x20u
++#define MMU_IRQ_RAWSTAT         0x2000u             /* kbase MMU_CONTROL_BASE + MMU_IRQ_RAWSTAT */
+ #define AS_LOCK_MIN_LOG2        15u                 /* kbase_get_lock_region_min_size_log2, arch < 12 */
+ #define AS_TRANSCFG_UNMAPPED    1u                  /* kbase AS_TRANSCFG_ADRMODE_UNMAPPED */
+ #define AS_MEMATTR_VALUE        0x4C4C4C4C8C4C8F4CULL /* [husky_gpu.c:208] */
+@@ -201,6 +205,11 @@ bridge_flush_on(void)
+ #define CS_OUT_HEAP_FRAG_END    0xccu
+ #define CS_OUT_HEAP_ADDRESS     0xd0u
+ #define CS_REQ_TILER_OOM        (1u << 26)          /* kbase CS_REQ_TILER_OOM_SHIFT */
++#define CS_OUT_REQ_RESOURCE     0x4cu               /* kbase CS_STATUS_REQ_RESOURCE */
++#define CS_OUT_SCOREBOARDS      0x5cu               /* kbase CS_STATUS_SCOREBOARDS */
++#define CSG_IN_IRQ_ACK          0x0cu               /* kbase CSG_IRQ_ACK */
++#define CSG_OUT_IRQ_REQ         0x0cu               /* kbase CSG_IRQ_REQ */
++#define CSG_REQ_STATUS_UPDATE   (1u << 5)           /* kbase CSG_REQ_STATUS_UPDATE_SHIFT */
+ #define CS_OUT_ACK              0x00u               /* [husky_gpu.c:297] */
+ #define CS_OUT_CMD_PTR          0x40u               /* [husky_gpu.c:298] */
+ #define CS_OUT_STATUS_WAIT      0x48u               /* [husky_gpu.c:299] */
+@@ -638,11 +647,12 @@ va_managed(mali_gpu_va_t va, uint64_t size)
+ }
+ 
+ /*
+- * After PTEs of [va, va + size) changed: LOCK the self-aligned region holding it, then FLUSH_MEM
+- * (L2 flush, TLB invalidate, unlock) [kbase mali_kbase_mmu_hw_direct.c lock_region, kbase_mmu_hw_do_flush].
++ * After PTEs of [va, va + size) changed: LOCK the self-aligned region holding it, then FLUSH_PT (pages
++ * inserted) or FLUSH_MEM (pages removed: L2 flush too), which also unlocks; safe while the AS runs jobs
++ * [kbase mali_kbase_mmu_hw_direct.c lock_region, kbase_mmu_hw_do_flush].
+  */
+ static mali_status_t
+-vm_flush_range(mali_vm_t *vm, mali_gpu_va_t va, uint64_t size)
++vm_flush_range(mali_vm_t *vm, mali_gpu_va_t va, uint64_t size, uint32_t cmd)
+ {
+ 	const uint32_t as_reg = AS0 + (uint32_t)vm->as_slot * AS_STRIDE;
+ 	const uint64_t diff = va ^ (va + size - 1);
+@@ -659,7 +669,7 @@ vm_flush_range(mali_vm_t *vm, mali_gpu_va_t va, uint64_t size)
+ 	if (!gpoll(as_reg + AS_STATUS, 3, 0, 100000, NULL)) {
+ 		return ETIMEDOUT;
+ 	}
+-	gwr(as_reg + AS_COMMAND, AS_CMD_FLUSH_MEM);
++	gwr(as_reg + AS_COMMAND, cmd);
+ 	if (!gpoll(as_reg + AS_STATUS, 3, 0, 100000, NULL)) {
+ 		return ETIMEDOUT;
+ 	}
+@@ -883,10 +893,10 @@ op_bo_alloc(mali_vm_t *vm, uint64_t size, uint32_t flags,
+ 		mapped += GPU_PAGE;
+ 	}
+ 
+-	/* Page tables were written through the cacheable pool view: clean them, then re-bind the slot. */
++	/* Page tables were written through the cacheable pool view: clean them, then flush the walker's view. */
+ 	husky_gpu_pt_flush();
+ 	if (st == 0) {
+-		st = vm_as_update(vm);
++		st = vm_flush_range(vm, bo->gpu_va, rsize, AS_CMD_FLUSH_PT);
+ 	}
+ 	if (st == 0) {
+ 		vm->n_bos++;
+@@ -899,7 +909,7 @@ op_bo_alloc(mali_vm_t *vm, uint64_t size, uint32_t flags,
+ 	if (mapped != 0) {
+ 		pt_unmap_range(vm->root_pa, bo->gpu_va, mapped);
+ 		husky_gpu_pt_flush();
+-		pages_free = vm_flush_range(vm, bo->gpu_va, mapped) == 0;
++		pages_free = vm_flush_range(vm, bo->gpu_va, mapped, AS_CMD_FLUSH_MEM) == 0;
+ 	}
+ 	if (have_va && pages_free) {
+ 		va_free(vm, bo->gpu_va, rsize);
+@@ -952,7 +962,7 @@ op_bo_import_pages(mali_vm_t *vm, const uint64_t *phys, uint32_t n_pages,
+ 	}
+ 	husky_gpu_pt_flush();
+ 	if (st == 0) {
+-		st = vm_as_update(vm);
++		st = vm_flush_range(vm, bo->gpu_va, rsize, AS_CMD_FLUSH_PT);
+ 	}
+ 	if (st == 0) {
+ 		vm->n_bos++;
+@@ -964,7 +974,7 @@ op_bo_import_pages(mali_vm_t *vm, const uint64_t *phys, uint32_t n_pages,
+ 	if (mapped != 0) {
+ 		pt_unmap_range(vm->root_pa, bo->gpu_va, mapped);
+ 		husky_gpu_pt_flush();
+-		va_reusable = vm_flush_range(vm, bo->gpu_va, mapped) == 0;
++		va_reusable = vm_flush_range(vm, bo->gpu_va, mapped, AS_CMD_FLUSH_MEM) == 0;
+ 	}
+ 	if (bo->gpu_va != 0 && va_reusable) {
+ 		va_free(vm, bo->gpu_va, rsize);
+@@ -994,7 +1004,7 @@ op_bo_free(mali_bo_t *bo)
+ 	lck_mtx_lock(&g_vm_lock);
+ 	pt_unmap_range(vm->root_pa, bo->gpu_va, rsize);
+ 	husky_gpu_pt_flush();
+-	const bool released = vm_flush_range(vm, bo->gpu_va, rsize) == 0;
++	const bool released = vm_flush_range(vm, bo->gpu_va, rsize, AS_CMD_FLUSH_MEM) == 0;
+ 	if (released && va_managed(bo->gpu_va, rsize)) {
+ 		va_free(vm, bo->gpu_va, rsize);
+ 	}
+@@ -1352,6 +1362,35 @@ op_queue_destroy(mali_queue_t *q)
+  */
+ static bool queue_tiler_oom(mali_queue_t *q);
+ 
++/* CS status fields are only refreshed on request: ask for CSG_REQ STATUS_UPDATE before reading them. */
++static void
++queue_dump_state(mali_queue_t *q)
++{
++	lck_mtx_lock(&g_glb_lock);
++	const uint32_t want = ~rd32(q->csgout, CSG_OUT_ACK) & CSG_REQ_STATUS_UPDATE;
++	wr32(q->csgin, CSG_IN_REQ, (rd32(q->csgin, CSG_IN_REQ) & ~CSG_REQ_STATUS_UPDATE) | want);
++	glb_group_doorbell(q->csg);
++	lck_mtx_unlock(&g_glb_lock);
++	unsigned us = 0;
++	while (us < 10000 && (rd32(q->csgout, CSG_OUT_ACK) & CSG_REQ_STATUS_UPDATE) != want) {
++		delay(10);
++		us += 10;
++	}
++	const uint32_t as_reg = AS0 + (uint32_t)q->vm->as_slot * AS_STRIDE;
++	BR_LOG("HUSKY IOGPU bridge: CSG%u ack 0x%x state 0x%x irq req/ack 0x%x/0x%x (status %s) | CS req 0x%x ack 0x%x "
++	    "cmd_ptr 0x%llx wait 0x%x res 0x%x sb 0x%x blocked %u fault 0x%x/0x%llx fatal 0x%x/0x%llx | heap vt %u/%u frag %u "
++	    "| MMU irq 0x%x AS%d fault 0x%x at 0x%llx\n", q->csg, rd32(q->csgout, CSG_OUT_ACK),
++	    rd32(q->csgout, CSG_OUT_STATUS_STATE), rd32(q->csgout, CSG_OUT_IRQ_REQ), rd32(q->csgin, CSG_IN_IRQ_ACK),
++	    us < 10000 ? "fresh" : "stale", rd32(q->csin, CS_IN_REQ), rd32(q->csout, CS_OUT_ACK),
++	    (unsigned long long)rd64(q->csout, CS_OUT_CMD_PTR), rd32(q->csout, CS_OUT_STATUS_WAIT),
++	    rd32(q->csout, CS_OUT_REQ_RESOURCE), rd32(q->csout, CS_OUT_SCOREBOARDS), rd32(q->csout, CS_OUT_BLOCKED_REASON),
++	    rd32(q->csout, CS_OUT_FAULT), (unsigned long long)rd64(q->csout, CS_OUT_FAULT_INFO), rd32(q->csout, CS_OUT_FATAL),
++	    (unsigned long long)rd64(q->csout, CS_OUT_FATAL_INFO), rd32(q->csout, CS_OUT_HEAP_VT_START),
++	    rd32(q->csout, CS_OUT_HEAP_VT_END), rd32(q->csout, CS_OUT_HEAP_FRAG_END), grd(MMU_IRQ_RAWSTAT), q->vm->as_slot,
++	    grd(as_reg + AS_FAULTSTATUS), (unsigned long long)(grd(as_reg + AS_FAULTADDRESS) |
++	    ((uint64_t)grd(as_reg + AS_FAULTADDRESS + 4) << 32)));
++}
++
+ static mali_status_t
+ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ {
+@@ -1438,13 +1477,7 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 	    (unsigned long long)(so != NULL && so->cpu != NULL ? *so->cpu : 0),
+ 	    (unsigned long long)(q->ring_out_cpu != NULL ? q->ring_out_cpu[0] : 0));
+ 	if (us >= 500000 && q->csout != 0 && q->csgout != 0) {
+-		BR_LOG("HUSKY IOGPU bridge: CSG%u ack 0x%x state 0x%x ep 0x%x | CS ack 0x%x cmd_ptr 0x%llx wait 0x%x "
+-		    "blocked %u fault 0x%x/0x%llx fatal 0x%x/0x%llx\n", q->csg, rd32(q->csgout, CSG_OUT_ACK),
+-		    rd32(q->csgout, CSG_OUT_STATUS_STATE), rd32(q->csgout, CSG_OUT_EP_CURRENT), rd32(q->csout, CS_OUT_ACK),
+-		    (unsigned long long)rd64(q->csout, CS_OUT_CMD_PTR), rd32(q->csout, CS_OUT_STATUS_WAIT),
+-		    rd32(q->csout, CS_OUT_BLOCKED_REASON), rd32(q->csout, CS_OUT_FAULT),
+-		    (unsigned long long)rd64(q->csout, CS_OUT_FAULT_INFO), rd32(q->csout, CS_OUT_FATAL),
+-		    (unsigned long long)rd64(q->csout, CS_OUT_FATAL_INFO));
++		queue_dump_state(q);
+ 	}
+ 	q->ring_used += total;
+ 	return (us < 500000) ? 0 : ETIMEDOUT;
