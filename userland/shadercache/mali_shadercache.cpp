@@ -1,6 +1,6 @@
 // mali-shadercache: compile AIR with libair2valhall on the host and write an MVP1 pack for the plug-in.
 //
-//   mali-shadercache -o OUT.mvpack [--metallib FILE]... [--air DIR]... [--merge OLD.mvpack]
+//   mali-shadercache -o OUT.mvpack [--metallib FILE]... [--air DIR]... [--merge OLD.mvpack] [--disasm]
 //
 // --air DIR takes <key>.air + <key>.txt pairs dumped by the plug-in on a cache miss.
 #include <dirent.h>
@@ -20,7 +20,11 @@
 #include "metallib.h"
 #include "mvpack.h"
 
+extern "C" void disassemble_valhall(FILE* fp, const void* code, size_t size, bool verbose);
+
 namespace {
+
+bool g_disasm;
 
 struct Request {
     std::string label;
@@ -178,6 +182,12 @@ bool Compile(air2vh_compiler* comp, Request& req, Entry* out) {
     out->index.flags = req.flags;
     out->index.num_constants = info.num_constants;
     printf("ok   %s -> %.16s (%zu bytes code)\n", req.label.c_str(), key, res.code_size);
+    if (g_disasm) {
+        printf("--- %s (%s)\n", req.entry.c_str(), key);
+        fflush(stdout);
+        disassemble_valhall(stdout, res.code, res.code_size, false);
+        fflush(stdout);
+    }
     air2vh_result_free(&res);
     return true;
 }
@@ -236,8 +246,9 @@ int main(int argc, char** argv) {
         else if (a == "--metallib" && i + 1 < argc) { if (!AddMetallib(argv[++i], &reqs)) return 2; }
         else if (a == "--air" && i + 1 < argc) { if (!AddAirDir(argv[++i], &reqs)) return 2; }
         else if (a == "--merge" && i + 1 < argc) merge = argv[++i];
+        else if (a == "--disasm") g_disasm = true;
         else {
-            fprintf(stderr, "usage: %s -o OUT.mvpack [--metallib FILE]... [--air DIR]... [--merge OLD.mvpack]\n", argv[0]);
+            fprintf(stderr, "usage: %s -o OUT.mvpack [--metallib FILE]... [--air DIR]... [--merge OLD.mvpack] [--disasm]\n", argv[0]);
             return 2;
         }
     }
