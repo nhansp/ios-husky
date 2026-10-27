@@ -1,0 +1,97 @@
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 6ee2d8b..789c6d1 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -384,6 +384,9 @@ struct mali_vm {
+ 	int as_slot;
+ 	uint32_t n_bos;               /* live BOs; the VM is torn down when the last one goes */
+ 	bool dying;
++	/* A group of this VM never acked its terminate: it may still DMA through the VM, so nothing the VM
++	 * maps goes back to the allocator and its tables and AS slot stay (recovery is a GPU reset, later). */
++	bool wedged;
+ 	uint32_t n_free;
+ 	struct { mali_gpu_va_t base, size; } free_va[VM_VA_EXTENTS];   /* sorted, disjoint */
+ 	mali_tiler_heap_t *heaps;     /* found by context VA on CS_TILER_OOM */
+@@ -556,12 +559,6 @@ as_slot_free(int slot)
+ 	}
+ }
+ 
+-/*
+- * Set when a CSG terminate was never acked: the group may still DMA into its buffers, so nothing
+- * it could touch goes back to the allocator (CSG1 stays reserved; recovery is a GPU reset, later).
+- */
+-static uint32_t g_csg_wedged;
+-
+ /* GPU page tables and VM address spaces: one lock (the table pool is shared by every VM). */
+ static LCK_GRP_DECLARE(g_vm_grp, "husky_iogpu_vm");
+ static LCK_MTX_DECLARE(g_vm_lock, &g_vm_grp);
+@@ -744,7 +741,7 @@ static void
+ vm_teardown_locked(mali_vm_t *vm)
+ {
+ 	const uint32_t as_reg = AS0 + (uint32_t)vm->as_slot * AS_STRIDE;
+-	bool unbound = !__atomic_load_n(&g_csg_wedged, __ATOMIC_ACQUIRE) && gpoll(as_reg + AS_STATUS, 3, 0, 100000, NULL);
++	bool unbound = !vm->wedged && gpoll(as_reg + AS_STATUS, 3, 0, 100000, NULL);
+ 	if (unbound) {
+ 		gwr64(as_reg + AS_TRANSTAB, 0);
+ 		gwr64(as_reg + AS_TRANSCFG, AS_TRANSCFG_UNMAPPED);
+@@ -990,9 +987,9 @@ op_bo_free(mali_bo_t *bo)
+ 	if (bo == NULL) {
+ 		return;
+ 	}
+-	if (__atomic_load_n(&g_csg_wedged, __ATOMIC_ACQUIRE)) {
++	if (__atomic_load_n(&bo->vm->wedged, __ATOMIC_ACQUIRE)) {
+ 		/* a wedged group may still DMA into it: keep the pages, mapping and VM; drop the handle */
+-		BR_LOG("HUSKY IOGPU bridge: bo_free: GPU group wedged, leaking %llu bytes\n",
++		BR_LOG("HUSKY IOGPU bridge: bo_free: AS%d wedged, leaking %llu bytes\n", bo->vm->as_slot,
+ 		    (unsigned long long)bo->size);
+ 		kfree_data(bo, sizeof(mali_bo_t));
+ 		return;
+@@ -1112,6 +1109,8 @@ glb_group_doorbell(uint32_t csg)
+  * Request CSG_STATE_TERMINATE for the queue's group and wait for the ack, using the same
+  * request/doorbell/ack-poll handshake husky_gpu.c uses for CSG start [husky_gpu.c:974-988].
+  */
++static void queue_dump_state(mali_queue_t *q);
++
+ static bool
+ queue_csg_terminate(mali_queue_t *q)
+ {
+@@ -1132,6 +1131,7 @@ queue_csg_terminate(mali_queue_t *q)
+ 	}
+ 	BR_LOG("HUSKY IOGPU bridge: CSG%u terminate NOT acked after %u us (ack 0x%x state 0x%x)\n",
+ 	    q->csg, us, rd32(q->csgout, CSG_OUT_ACK), rd32(q->csgout, CSG_OUT_STATUS_STATE));
++	queue_dump_state(q);
+ 	return false;
+ }
+ 
+@@ -1163,10 +1163,6 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 		BR_LOG("HUSKY IOGPU bridge: queue_create: CSF interface not up\n");
+ 		return ENXIO;
+ 	}
+-	if (__atomic_load_n(&g_csg_wedged, __ATOMIC_ACQUIRE)) {
+-		BR_LOG("HUSKY IOGPU bridge: queue_create: a GPU group is wedged; refusing new queues\n");
+-		return EBUSY;
+-	}
+ 	int slot = csg_slot_alloc(rd32(shared, GLB_GROUP_NUM));
+ 	if (slot < 0) {
+ 		BR_LOG("HUSKY IOGPU bridge: queue_create: no free group (CSG%u-%u busy, firmware has %u)\n",
+@@ -1342,8 +1338,9 @@ op_queue_destroy(mali_queue_t *q)
+ 	/* Stop the group before its ring/control/suspend buffers go away. */
+ 	if (!queue_csg_terminate(q)) {
+ 		/* The firmware may still use them: leak rather than free memory under a live group. */
+-		BR_LOG("HUSKY IOGPU bridge: queue_destroy: leaking queue buffers, CSG%u stays reserved\n", q->csg);
+-		__atomic_store_n(&g_csg_wedged, 1u, __ATOMIC_RELEASE);
++		BR_LOG("HUSKY IOGPU bridge: queue_destroy: leaking queue buffers, CSG%u and AS%d stay reserved\n", q->csg,
++		    q->vm->as_slot);
++		__atomic_store_n(&q->vm->wedged, true, __ATOMIC_RELEASE);
+ 		kfree_data(q, sizeof(mali_queue_t));
+ 		return;
+ 	}
+@@ -1521,7 +1518,7 @@ static void
+ op_syncobj_destroy(mali_syncobj_t *so)
+ {
+ 	if (so != NULL) {
+-		if (__atomic_load_n(&g_csg_wedged, __ATOMIC_ACQUIRE)) {
++		if (so->bo != NULL && __atomic_load_n(&so->bo->vm->wedged, __ATOMIC_ACQUIRE)) {
+ 			/* a wedged group may still write its sync object: leak the page */
+ 			BR_LOG("HUSKY IOGPU bridge: syncobj_destroy: GPU group wedged, leaking sync page\n");
+ 		} else if (so->bo != NULL) {
