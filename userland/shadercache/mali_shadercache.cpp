@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "air2vh_api.h"
+#include "air2vh_ext.h"
 #include "metallib.h"
 #include "mvpack.h"
 
@@ -156,14 +157,17 @@ bool Compile(air2vh_compiler* comp, Request& req, Entry* out) {
         return false;
     }
 
-    air2vh_program prog = *res.program;
-    prog.vs.layout.blob = nullptr;
+    // The extension block (reflection, tier-A varying tables) follows the program in the same allocation.
+    const air2vh_program_ext* ext = air2vh_program_get_ext(res.program);
+    std::vector<uint8_t> prog(sizeof(air2vh_program) + (ext ? sizeof(air2vh_program_ext) : 0));
+    memcpy(prog.data(), res.program, prog.size());
+    reinterpret_cast<air2vh_program*>(prog.data())->vs.layout.blob = nullptr;
     const void* layout = res.vs_layout_out.blob;
     uint32_t layout_size = layout ? res.vs_layout_out.blob_size : 0;
 
-    mvp_record rec{(uint32_t)sizeof(prog), (uint32_t)res.code_size, (uint32_t)res.sidecar_size, layout_size};
+    mvp_record rec{(uint32_t)prog.size(), (uint32_t)res.code_size, (uint32_t)res.sidecar_size, layout_size};
     Append(&out->record, &rec, sizeof(rec));
-    Append(&out->record, &prog, sizeof(prog));
+    Append(&out->record, prog.data(), prog.size());
     Append(&out->record, (const uint8_t*)res.code, res.code_size);
     Append(&out->record, res.sidecar_json, res.sidecar_size);
     if (layout_size) Append(&out->record, (const uint8_t*)layout, layout_size);

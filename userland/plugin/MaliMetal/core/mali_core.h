@@ -36,6 +36,7 @@
 #include <stdint.h>
 
 #include "air2vh_api.h"        /* contract: shader program + sysval structs  */
+#include "air2vh_ext.h"
 #include "mali_backend_ops.h"  /* contract: mali_dev_props_t, MALI_CS_*      */
 
 #ifdef __cplusplus
@@ -219,6 +220,10 @@ void mali_emit_sampler(const mali_sampler_params_t *p, bool integer_texture, uin
 bool mali_emit_sampled_texture(const mali_texture_t *t, mali_arena_t *payload_arena, uint32_t desc[8]);
 bool mali_emit_storage_texture(const mali_texture_t *t, mali_arena_t *payload_arena, uint32_t desc[8]);
 void mali_emit_buffer_desc(uint64_t gpu, uint64_t size, uint32_t desc[8]);
+/* Tier-A FS varying: an ATTRIBUTE into the VS vertex packet at vs_offset [M:vulkan/csf/panvk_vX_cmd_draw.c
+ * emit_varying_descs]. False when (alu_type, ncomps) has no varying format. */
+bool mali_emit_varying_desc(uint8_t alu_type, uint8_t ncomps, uint32_t vs_offset, uint32_t generic_size_B,
+                            uint32_t desc[8]);
 void mali_emit_null_desc(uint32_t desc[8]);
 void mali_emit_resource_entry(uint64_t table_gpu, uint64_t size_B, bool contains_desc, uint32_t out[4]);
 
@@ -279,6 +284,8 @@ typedef struct mali_gfx_pipeline {
     mali_vertex_layout_t vlayout[MALI_MAX_BUFFERS];
     uint32_t input_prim_class;   /* MTLPrimitiveTopologyClass: 0 unspec 1 point 2 line 3 triangle */
     uint64_t blend_shader_gpu[MALI_MAX_RTS]; /* 0 = fixed function; else blend shader address */
+    uint32_t fs_vary_count;      /* tier-A FS: T0 varying descriptors, 0 = none */
+    uint32_t fs_vary_desc[AIR2VH_EXT_MAX_VARYINGS][8];
 } mali_gfx_pipeline_t;
 
 typedef struct mali_compute_pipeline {

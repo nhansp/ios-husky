@@ -371,6 +371,48 @@ mali_shader_build_spds(mali_shader_t *s, mali_gpu_ptr_t mem)
     return true;
 }
 
+/* pan_varying_format [M:compiler/pan_nir_collect_varyings.c] */
+static enum pipe_format
+varying_pipe_format(uint8_t alu_type, uint8_t ncomps)
+{
+    static const struct { uint8_t type; enum pipe_format f[4]; } conv[] = {
+        {AIR2VH_TYPE_FLOAT32, {PIPE_FORMAT_R32_FLOAT, PIPE_FORMAT_R32G32_FLOAT, PIPE_FORMAT_R32G32B32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT}},
+        {AIR2VH_TYPE_UINT32, {PIPE_FORMAT_R32_UINT, PIPE_FORMAT_R32G32_UINT, PIPE_FORMAT_R32G32B32_UINT, PIPE_FORMAT_R32G32B32A32_UINT}},
+        {AIR2VH_TYPE_INT32, {PIPE_FORMAT_R32_SINT, PIPE_FORMAT_R32G32_SINT, PIPE_FORMAT_R32G32B32_SINT, PIPE_FORMAT_R32G32B32A32_SINT}},
+        {AIR2VH_TYPE_FLOAT16, {PIPE_FORMAT_R16_FLOAT, PIPE_FORMAT_R16G16_FLOAT, PIPE_FORMAT_R16G16B16_FLOAT, PIPE_FORMAT_R16G16B16A16_FLOAT}},
+        {AIR2VH_TYPE_UINT16, {PIPE_FORMAT_R16_UINT, PIPE_FORMAT_R16G16_UINT, PIPE_FORMAT_R16G16B16_UINT, PIPE_FORMAT_R16G16B16A16_UINT}},
+        {AIR2VH_TYPE_INT16, {PIPE_FORMAT_R16_SINT, PIPE_FORMAT_R16G16_SINT, PIPE_FORMAT_R16G16B16_SINT, PIPE_FORMAT_R16G16B16A16_SINT}},
+    };
+    if (ncomps < 1 || ncomps > 4)
+        return PIPE_FORMAT_NONE;
+    for (unsigned i = 0; i < ARRAY_SIZE(conv); i++) {
+        if (conv[i].type == alu_type)
+            return conv[i].f[ncomps - 1];
+    }
+    return PIPE_FORMAT_NONE;
+}
+
+bool
+mali_emit_varying_desc(uint8_t alu_type, uint8_t ncomps, uint32_t vs_offset, uint32_t generic_size_B, uint32_t desc[8])
+{
+    const enum pipe_format f = varying_pipe_format(alu_type, ncomps);
+    const struct pan_format *pf = f != PIPE_FORMAT_NONE ? GENX(pan_format_from_pipe_format)(f) : NULL;
+    if (!pf || !pf->hw)
+        return false;
+    pan_pack((struct mali_attribute_packed *)desc, ATTRIBUTE, cfg) {
+        cfg.attribute_type = MALI_ATTRIBUTE_TYPE_VERTEX_PACKET;
+        cfg.offset_enable = false;
+        cfg.format = pf->hw;
+        cfg.table = 61;
+        cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_VERTEX;
+        cfg.offset = 1024 + vs_offset;
+        cfg.buffer_index = 0;
+        cfg.attribute_stride = generic_size_B;
+        cfg.packet_stride = generic_size_B + 16;
+    }
+    return true;
+}
+
 /* ===================================================================== *
  * Resource tables and FAU  [S07 6.2, 6.11, section 9 items 6-8]
  * ===================================================================== */

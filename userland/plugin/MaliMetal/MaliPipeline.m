@@ -191,6 +191,34 @@ static BOOL uses_rgb_blend_constant(const mali_rt_state_t *rt) {
     return NO;
 }
 
+/* Tier-A FS (LD_VAR): T0[i] describes FS varying i, linked by Metal name to the VS output it reads. */
+static BOOL link_varyings(MaliShaderProgram *vsp, MaliShaderProgram *fsp, mali_gfx_pipeline_t *gp, NSString **err) {
+    const air2vh_program *vs = vsp.programWithExt.bytes, *fs = fsp.programWithExt.bytes;
+    air2vh_varying_link links[AIR2VH_EXT_MAX_VARYINGS];
+    uint32_t generic = 0;
+    const int n = vs && fs ? air2vh_link_varyings(vs, fs, links, AIR2VH_EXT_MAX_VARYINGS, &generic) : -1;
+    if (n < 0) { if (err) *err = @"varying link failed: a program carries no varying tables"; return NO; }
+    const air2vh_program_ext *fe = air2vh_program_get_ext(fs);
+    uint32_t count = fsp->prog.fs.varying_desc_count;
+    for (int i = 0; i < n; i++) {
+        const air2vh_varying_link *l = &links[i];
+        const char *name = fe->varyings[l->fs_index].name;
+        if (!l->matched) {
+            if (err) *err = [NSString stringWithFormat:@"fragment input %s is not written by the vertex function", name];
+            return NO;
+        }
+        if (l->fs_index >= AIR2VH_EXT_MAX_VARYINGS ||
+            !mali_emit_varying_desc(l->alu_type, l->ncomps, l->vs_offset, generic, gp->fs_vary_desc[l->fs_index])) {
+            if (err) *err = [NSString stringWithFormat:@"varying %s: type 0x%x x%u has no varying format", name, l->alu_type, l->ncomps];
+            return NO;
+        }
+        count = MAX(count, l->fs_index + 1);
+    }
+    if (count > AIR2VH_EXT_MAX_VARYINGS) { if (err) *err = @"fragment function reads more varyings than T0 holds"; return NO; }
+    gp->fs_vary_count = count;
+    return YES;
+}
+
 @implementation MaliMTLDevice (Pipeline)
 - (int)llvmVersion { return 32023; }                          /* same value AppleParavirtDevice returns (spec 04) */
 - (MTLTargetDeviceArchitecture *)targetDeviceArchitecture {
@@ -229,7 +257,6 @@ static BOOL uses_rgb_blend_constant(const mali_rt_state_t *rt) {
     if (hasFragment) {
         fsp = [comp compile:f.input flags:0 vsLayout:vsp error:err];
         if (!fsp) return nil;
-        if (fsp->prog.fs.uses_ld_var) { if (err) *err = @"fragment function interpolates with the tier-A varying path (needs reflection the contract does not define)"; return nil; }
     }
 
     MaliRenderPipelineState *ps = [[MaliRenderPipelineState alloc] initWithDevice:self pipelineStateDescriptor:d];
@@ -237,6 +264,7 @@ static BOOL uses_rgb_blend_constant(const mali_rt_state_t *rt) {
     NSMutableArray *res = [ps maliMutableResources];
     if (!MaliUploadShader(self, vsp, &gp->vs, res, err)) return nil;
     if (fsp && !MaliUploadShader(self, fsp, &gp->fs, res, err)) return nil;
+    if (fsp && fsp->prog.fs.uses_ld_var && !link_varyings(vsp, fsp, gp, err)) return nil;
 
     gp->sample_count = 1;
     gp->alpha_to_coverage = d.alphaToCoverageEnabled;

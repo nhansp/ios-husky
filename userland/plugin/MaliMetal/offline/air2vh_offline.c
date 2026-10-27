@@ -3,6 +3,7 @@
  * the request's AIR to MVP_MISS_DIR for the host packer (userland/shadercache).
  */
 #include "mvpack.h"
+#include "air2vh_ext.h"
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -166,11 +167,12 @@ static int fill_result(const mvp_index *e, air2vh_result *r)
     const uint8_t *p = g_pack.base + e->offset;
     const mvp_record *rec = (const mvp_record *)p;
     uint64_t need = (uint64_t)sizeof(*rec) + rec->program_size + rec->code_size + rec->sidecar_size + rec->layout_size;
-    if (need > e->length || rec->program_size != sizeof(air2vh_program))
+    if (need > e->length || (rec->program_size != sizeof(air2vh_program) &&
+                             rec->program_size != sizeof(air2vh_program) + sizeof(air2vh_program_ext)))
         return -1;
     p += sizeof(*rec);
 
-    air2vh_program *prog = malloc(sizeof(*prog));
+    air2vh_program *prog = malloc(rec->program_size);
     void *code = malloc(rec->code_size ? rec->code_size : 1);
     char *sidecar = malloc((size_t)rec->sidecar_size + 1);
     void *layout = rec->layout_size ? malloc(rec->layout_size) : NULL;
@@ -178,7 +180,7 @@ static int fill_result(const mvp_index *e, air2vh_result *r)
         free(prog); free(code); free(sidecar); free(layout);
         return -1;
     }
-    memcpy(prog, p, sizeof(*prog));
+    memcpy(prog, p, rec->program_size);
     p += rec->program_size;
     memcpy(code, p, rec->code_size);
     p += rec->code_size;
@@ -250,6 +252,68 @@ int air2vh_compile(air2vh_compiler *c, const air2vh_compile_info *info, air2vh_r
     memcpy(r->key_hex, key, sizeof(key));
     r->error = dup_str(msg);
     return -1;
+}
+
+const air2vh_program_ext *air2vh_program_get_ext(const air2vh_program *p)
+{
+    if (!p || p->struct_size != sizeof(air2vh_program))
+        return NULL;
+    const air2vh_program_ext *e = (const air2vh_program_ext *)((const uint8_t *)p + p->struct_size);
+    if (e->magic != AIR2VH_EXT_MAGIC || e->version != AIR2VH_EXT_VERSION || e->size != sizeof(air2vh_program_ext))
+        return NULL;
+    return e;
+}
+
+#define VH_ALU_SIZE_MASK   0x79u
+#define VH_ALU_BASE_MASK   0x86u
+#define VH_SECTION_GENERIC 3u
+
+static int generic_varying(const air2vh_varying_slot *s)
+{
+    return s->alu_type && s->section == VH_SECTION_GENERIC;
+}
+
+/* Tier-A linking by Metal varying name, as the compiler library does (P1 vh_desc.c). */
+int air2vh_link_varyings(const air2vh_program *vs, const air2vh_program *fs, air2vh_varying_link *out, uint32_t max,
+                         uint32_t *generic_size_B)
+{
+    const air2vh_program_ext *ve = air2vh_program_get_ext(vs);
+    const air2vh_program_ext *fe = air2vh_program_get_ext(fs);
+    if (!ve || !fe || vs->stage != AIR2VH_STAGE_VERTEX || fs->stage != AIR2VH_STAGE_FRAGMENT || (max && !out))
+        return -1;
+    if (generic_size_B)
+        *generic_size_B = ve->generic_size_B;
+
+    const uint32_t nf = fe->n_varyings < AIR2VH_EXT_MAX_VARYINGS ? fe->n_varyings : AIR2VH_EXT_MAX_VARYINGS;
+    const uint32_t nv = ve->n_varyings < AIR2VH_EXT_MAX_VARYINGS ? ve->n_varyings : AIR2VH_EXT_MAX_VARYINGS;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < nf; i++)
+        total += generic_varying(&fe->varyings[i]);
+    if (!out || max == 0)
+        return (int)total;
+    if (max < total)
+        return -1;
+
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < nf; i++) {
+        const air2vh_varying_slot *f = &fe->varyings[i];
+        if (!generic_varying(f))
+            continue;
+        air2vh_varying_link *l = &out[n++];
+        memset(l, 0, sizeof(*l));
+        l->fs_index = i;
+        for (uint32_t j = 0; j < nv; j++) {
+            const air2vh_varying_slot *v = &ve->varyings[j];
+            if (!generic_varying(v) || !f->name[0] || strncmp(v->name, f->name, AIR2VH_EXT_NAME_LEN) != 0)
+                continue;
+            l->matched = 1;
+            l->vs_offset = v->offset >= 0 ? (uint32_t)v->offset : 0;
+            l->alu_type = (uint8_t)((f->alu_type & VH_ALU_BASE_MASK) | (v->alu_type & VH_ALU_SIZE_MASK));
+            l->ncomps = v->ncomps;
+            break;
+        }
+    }
+    return (int)n;
 }
 
 int air2vh_compile_blend_shader(air2vh_compiler *c, const void *key, size_t key_size, air2vh_result *r)

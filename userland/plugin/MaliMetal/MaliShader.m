@@ -10,6 +10,7 @@
  * bounds-checked, the SHA-256 of the module must equal the HASH tag).
  */
 #import "MaliShader.h"
+#include "air2vh_ext.h"
 #import <CommonCrypto/CommonDigest.h>
 #include <string.h>
 
@@ -171,11 +172,12 @@ static BOOL looks_like_bitcode(const unsigned char *air, uint64_t n) {
  * ---------------------------------------------------------------------- */
 @implementation MaliShaderProgram {
 @public
-    NSData *_code, *_layoutBlob;
+    NSData *_code, *_layoutBlob, *_programWithExt;
     NSString *_key, *_entry;
 }
 - (NSData *)code { return _code; }
 - (NSData *)layoutBlob { return _layoutBlob; }
+- (NSData *)programWithExt { return _programWithExt; }
 - (NSString *)key { return _key; }
 - (NSString *)entry { return _entry; }
 @end
@@ -257,6 +259,8 @@ static void parse_const_samplers(MaliShaderProgram *p, const char *json, size_t 
     memset(&p->prog, 0, sizeof p->prog);
     memcpy(&p->prog, prog, MIN((size_t)prog->struct_size, sizeof p->prog));
     p->_code = [NSData dataWithBytes:r->code length:r->code_size];
+    if (air2vh_program_get_ext(prog))
+        p->_programWithExt = [NSData dataWithBytes:prog length:prog->struct_size + sizeof(air2vh_program_ext)];
     if (r->vs_layout_out.blob && r->vs_layout_out.blob_size) {
         p->_layoutBlob = [NSData dataWithBytes:r->vs_layout_out.blob length:r->vs_layout_out.blob_size];
         p->layout = r->vs_layout_out;

@@ -47,6 +47,8 @@ typedef struct MaliConstSampler {
 }
 @property (nonatomic, readonly) NSData *code;
 @property (nonatomic, readonly) NSData *layoutBlob;
+/* The program followed by its extension block (air2vh_program_get_ext), nil when the compiler gave none. */
+@property (nonatomic, readonly, nullable) NSData *programWithExt;
 @property (nonatomic, readonly) NSString *key;
 @property (nonatomic, readonly) NSString *entry;
 @end

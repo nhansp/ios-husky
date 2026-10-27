@@ -423,6 +423,7 @@ struct mali_pass {
     /* descriptor reuse between draws: a Metal pass issues many draws with unchanged bindings */
     struct { const air2vh_program *prog; const mali_stage_binds_t *b; uint64_t serial, t0; uint64_t val; bool valid; } srt_c[2];
     struct { const air2vh_program *prog; uint8_t blob[sizeof(air2vh_sysvals_gfx)]; uint64_t val; bool valid; } fau_c[2];
+    struct { const mali_gfx_pipeline_t *pipe; mali_gpu_ptr_t t0; } vary_c;
     struct { uint8_t key[160]; uint64_t val; bool valid; } zsd_c;
 };
 
@@ -707,7 +708,19 @@ mali_pass_draw(mali_pass_t *p, const mali_draw_state_t *s)
     const uint64_t vs_fau = pass_fau(p, a, 0, vp, &svv);
     const uint64_t fs_fau = has_fs ? pass_fau(p, a, 1, fp, &svf) : 0;
     const uint64_t vs_srt = pass_srt(p, a, 0, vp, s->vs_binds, &s->t0_vs, s->t0_vs_count);
-    const uint64_t fs_srt = has_fs ? pass_srt(p, a, 1, fp, s->fs_binds, NULL, 0) : 0;
+    mali_gpu_ptr_t *fs_t0 = NULL;
+    if (has_fs && pipe->fs_vary_count) {
+        if (p->vary_c.pipe != pipe) {
+            const uint32_t bytes = pipe->fs_vary_count * MALI_DESC_SIZE;
+            p->vary_c.t0 = mali_arena_alloc(a, bytes, 64);
+            if (!p->vary_c.t0.cpu)
+                return false;
+            memcpy(p->vary_c.t0.cpu, pipe->fs_vary_desc, bytes);
+            p->vary_c.pipe = pipe;
+        }
+        fs_t0 = &p->vary_c.t0;
+    }
+    const uint64_t fs_srt = has_fs ? pass_srt(p, a, 1, fp, s->fs_binds, fs_t0, pipe->fs_vary_count) : 0;
     const uint32_t tls_size = vp->tls_size > (has_fs ? fp->tls_size : 0) ? vp->tls_size : (has_fs ? fp->tls_size : 0);
     const uint64_t tsd = graphics_tsd(cs, a, tls_size);
     /* ZSD depends on a few scalars only: reuse the descriptor while they are unchanged */
