@@ -1,0 +1,555 @@
+diff --git a/iokit/Families/IOGPU/IOGPU.cpp b/iokit/Families/IOGPU/IOGPU.cpp
+index 608346e..a5a7a53 100644
+--- a/iokit/Families/IOGPU/IOGPU.cpp
++++ b/iokit/Families/IOGPU/IOGPU.cpp
+@@ -99,7 +99,7 @@ IOGPU::start(IOService *provider)
+ 	setProperty(IOGPU_PROP_PLUGIN_NAME, "MaliMetal");
+ 	setProperty(IOGPU_PROP_PLUGIN_CLASS, "MaliMTLDevice");
+ 	setProperty("IOGPUName", fConfig.accelName);
+-	setProperty(kIOUserClientClassKey, "IOGPUDeviceUserClient");
++	setProperty("IOUserClientClass", "IOGPUDeviceUserClient");
+ 	publishDevProps();
+ 
+ 	registerService();
+diff --git a/iokit/Families/IOGPU/IOGPU.h b/iokit/Families/IOGPU/IOGPU.h
+index a3cc1e1..47f76cf 100644
+--- a/iokit/Families/IOGPU/IOGPU.h
++++ b/iokit/Families/IOGPU/IOGPU.h
+@@ -12,11 +12,12 @@
+  *   - The kernel GPU task [spec 03 lines 164-168]
+  *   - Dispatch of newUserClient (connect types 1 and 0x21) [spec 01 lines 82, 129]
+  */
+-#ifndef _IOGPU_H
+-#define _IOGPU_H
++#ifndef IOGPU_H
++#define IOGPU_H
+ 
+ #include "iogpu_internal.h"
+ 
++#ifdef __cplusplus
+ /*
+  * IOAcceleratorES: the base class Metal searches for in the IORegistry.
+  * Minimal base: inheritance provides the class identity string [spec 01 lines 108-112].
+@@ -86,5 +87,6 @@ public:
+ 	/* Completion notification kick from backend IRQ [spec 03 lines 148-150] */
+ 	void signalStampsUpdated();
+ };
++#endif /* __cplusplus */
+ 
+-#endif /* _IOGPU_H */
++#endif /* IOGPU_H */
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+index 35be632..4d53072 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+@@ -81,9 +81,9 @@ IOGPUCommandQueue::submitCommandBuffers(const void *structIn, uint32_t count,
+ 	uint32_t status = kIOGPUStatus_Success;
+ 
+ 	for (uint32_t i = 0; i < count; i++) {
+-		const iogpu_cmdbuf_args_t *cb =
+-		    (const iogpu_cmdbuf_args_t *)(base + (uint64_t)i * argSize);
+-		uint32_t s = processOneCommandBuffer(cb);
++		iogpu_cmdbuf_args_t cb;
++		memcpy(&cb, base + (uint64_t)i * argSize, sizeof(cb));
++		uint32_t s = processOneCommandBuffer(&cb);
+ 		if (s != kIOGPUStatus_Success) {
+ 			status = s;   /* Last error reported to client */
+ 		}
+@@ -173,10 +173,11 @@ IOGPUCommandQueue::processOneCommandBuffer(const iogpu_cmdbuf_args_t *cb)
+ 			}
+ 
+ 			if (type == 1 && kbytes != NULL) {
+-				const uint32_t *pairs = (const uint32_t *)(sbytes + off + 0x10);
+ 				for (uint32_t p = 0; p < bh.count; p++) {
+-					uint32_t ks = pairs[2 * p];
+-					uint32_t ke = pairs[2 * p + 1];
++					uint32_t pair[2];
++					memcpy(pair, sbytes + off + 0x10 + p * sizeof(pair), sizeof(pair));
++					uint32_t ks = pair[0];
++					uint32_t ke = pair[1];
+ 					if (ks > ke || ke > klen) {
+ 						status = kIOGPUStatus_ParseError;
+ 						break;
+@@ -358,7 +359,8 @@ IOGPUCommandQueue::processSegmentKernelCommands(const uint8_t *k, uint32_t start
+ 			if (size != IOGPU_KCMD_SETGROUPS_SIZE) {
+ 				return kIOGPUStatus_ParseError;
+ 			}
+-			uint32_t numGroups = *(const uint32_t *)body;
++			uint32_t numGroups = 0;
++			memcpy(&numGroups, body, sizeof(numGroups));
+ 			if (numGroups > IOGPU_KCMD_MAX_GROUPS) {
+ 				return kIOGPUStatus_ParseError;
+ 			}
+@@ -385,21 +387,21 @@ IOGPUCommandQueue::processSegmentKernelCommands(const uint8_t *k, uint32_t start
+ 			break;
+ 
+ 		case MALI_KCMD_SUBMIT_CS: {               /* Vendor 0x15: run user CS chunk [mali_backend_ops.h] */
+-			if (size < sizeof(iogpu_kcmd_header_t) + sizeof(struct mali_kcmd_submit_cs) - sizeof(iogpu_kcmd_header_t)) {
++			if (size < sizeof(struct mali_kcmd_submit_cs)) {
+ 				return kIOGPUStatus_ParseError;
+ 			}
+ 
+-			const struct mali_kcmd_submit_cs *cmd =
+-			    (const struct mali_kcmd_submit_cs *)(k + off);
++			struct mali_kcmd_submit_cs cmd;
++			memcpy(&cmd, k + off, sizeof(cmd));
+ 
+ 			/* Stream address must be 64-byte aligned, size multiple of 8 [mali_backend_ops.h line 180] */
+-			if ((cmd->stream & (MALI_CS_STREAM_ALIGN - 1)) || (cmd->size & 7)) {
++			if ((cmd.stream & (MALI_CS_STREAM_ALIGN - 1)) || (cmd.size & 7)) {
+ 				return kIOGPUStatus_ParseError;
+ 			}
+ 
+ 			/* Validate total record size matches sync count [submit_framing.h line 195] */
+ 			uint32_t expectedSize = (uint32_t)sizeof(struct mali_kcmd_submit_cs) +
+-			    4u * (cmd->n_wait + cmd->n_signal);
++			    4u * (cmd.n_wait + cmd.n_signal);
+ 			if (size != expectedSize) {
+ 				return kIOGPUStatus_ParseError;
+ 			}
+@@ -407,9 +409,9 @@ IOGPUCommandQueue::processSegmentKernelCommands(const uint8_t *k, uint32_t start
+ 			mali_submit_desc_t desc;
+ 			bzero(&desc, sizeof(desc));
+ 			desc.queue_index  = 0;
+-			desc.stream_addr  = cmd->stream;
+-			desc.stream_size  = cmd->size;
+-			desc.latest_flush = cmd->flush_id;
++			desc.stream_addr  = cmd.stream;
++			desc.stream_size  = cmd.size;
++			desc.latest_flush = cmd.flush_id;
+ 
+ 			const mali_syncobj_t *sig = fSync;
+ 			desc.signals   = &sig;
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.h b/iokit/Families/IOGPU/IOGPUCommandQueue.h
+index 9b5d156..b1c4459 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.h
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.h
+@@ -13,11 +13,12 @@
+  *   - Real queue program via the husky CSF path [husky_gpu.c lines 640-680, 947-975]
+  *   - Notification delivery on error and success [spec 01 lines 565-569; fixes REVIEWS.md:120]
+  */
+-#ifndef _IOGPU_COMMAND_QUEUE_H
+-#define _IOGPU_COMMAND_QUEUE_H
++#ifndef IOGPU_COMMAND_QUEUE_H
++#define IOGPU_COMMAND_QUEUE_H
+ 
+ #include "iogpu_internal.h"
+ 
++#ifdef __cplusplus
+ class IOGPUDevice;
+ class IOGPUNotificationQueue;
+ 
+@@ -54,5 +55,6 @@ private:
+ 	uint32_t processSegmentKernelCommands(const uint8_t *k, uint32_t start,
+ 	    uint32_t end, uint32_t *submits_dispatched);
+ };
++#endif /* __cplusplus */
+ 
+-#endif /* _IOGPU_COMMAND_QUEUE_H */
++#endif /* IOGPU_COMMAND_QUEUE_H */
+diff --git a/iokit/Families/IOGPU/IOGPUDevice.h b/iokit/Families/IOGPU/IOGPUDevice.h
+index df4ac66..4c56ac6 100644
+--- a/iokit/Families/IOGPU/IOGPUDevice.h
++++ b/iokit/Families/IOGPU/IOGPUDevice.h
+@@ -15,11 +15,12 @@
+  *   - Thread-safe handle lookup and lifecycle management with IOLock [fixes REVIEWS.md:78]
+  *   - ID drift prevention and leak-free lifecycle [fixes REVIEWS.md:69, 93]
+  */
+-#ifndef _IOGPU_DEVICE_H
+-#define _IOGPU_DEVICE_H
++#ifndef IOGPU_DEVICE_H
++#define IOGPU_DEVICE_H
+ 
+ #include "iogpu_internal.h"
+ 
++#ifdef __cplusplus
+ class IOGPU;
+ class IOGPUTask;
+ class IOGPUResource;
+@@ -100,5 +101,6 @@ public:
+ 	IOGPUCommandQueue *lookupQueue(uint32_t id);
+ 	void               removeQueue(uint32_t id);
+ };
++#endif /* __cplusplus */
+ 
+-#endif /* _IOGPU_DEVICE_H */
++#endif /* IOGPU_DEVICE_H */
+diff --git a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+index 08a081d..b572251 100644
+--- a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
++++ b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+@@ -22,6 +22,7 @@
+ #include "IOGPUMemory.h"
+ #include "IOGPUCommandQueue.h"
+ #include "IOGPUNotificationQueue.h"
++#include <sys/systm.h>
+ 
+ OSDefineMetaClassAndStructors(IOGPUDeviceUserClient, IOUserClient);
+ 
+@@ -977,7 +978,9 @@ IOGPUDeviceUserClient::externalMethod(uint32_t selector,
+ 	/* Dispatch table A (56 entries) [spec 01 line 168] */
+ 	if (selector < IOGPU_UC_NUM_SELECTORS) {
+ 		dispatch = (IOExternalMethodDispatch *)&sMethods[selector];
+-		target   = this;
++		if (!target) {
++			target = this;
++		}
+ 	} else {
+ 		/* Fall through for vendor extensions (> 0x37) [spec 01 line 168] */
+ 		return IOUserClient::externalMethod(selector, args, dispatch, target, reference);
+@@ -1015,7 +1018,7 @@ IOGPUDeviceUserClient::trapSubmitOne(void *p1, void *p2, void *p3, void *p4, voi
+ 	uint32_t argSize = (uint32_t)(uintptr_t)p2;
+ 
+ 	/* Validate argSize <= 0x40 AND argSize == cmdBufArgsSize (0x30) [fixes REVIEWS.md:85] */
+-	if (argSize > IOGPU_TRAP0_MAX_ARG_SIZE || argSize != ACC()->config()->cmdBufArgsSize || p3 == NULL) {
++	if (argSize > IOGPU_TRAP0_MAX_ARG_SIZE || argSize != fAccel->config()->cmdBufArgsSize || p3 == NULL) {
+ 		return kIOGPUReturnBadArgument;
+ 	}
+ 
+@@ -1026,9 +1029,9 @@ IOGPUDeviceUserClient::trapSubmitOne(void *p1, void *p2, void *p3, void *p4, voi
+ 
+ 	uint8_t argsBuf[IOGPU_TRAP0_MAX_ARG_SIZE];
+ 	/* Support both userland Mach trap callers and in-kernel self-test callers */
+-	if ((uintptr_t)p3 >= 0x800000000000ULL) {
++	if (fTask == kernel_task || (uintptr_t)p3 >= 0x800000000000ULL) {
+ 		bcopy(p3, argsBuf, argSize);
+-	} else if (copyin(p3, argsBuf, argSize) != 0) {
++	} else if (copyin((user_addr_t)(uintptr_t)p3, argsBuf, (vm_size_t)argSize) != 0) {
+ 		return kIOGPUReturnBadArgument;
+ 	}
+ 
+@@ -1037,10 +1040,10 @@ IOGPUDeviceUserClient::trapSubmitOne(void *p1, void *p2, void *p3, void *p4, voi
+ 	q->release();
+ 
+ 	if (p4 != NULL) {
+-		if ((uintptr_t)p4 >= 0x800000000000ULL) {
++		if (fTask == kernel_task || (uintptr_t)p4 >= 0x800000000000ULL) {
+ 			*(uint32_t *)p4 = status;
+ 		} else {
+-			copyout(&status, p4, sizeof(uint32_t));
++			copyout(&status, (user_addr_t)(uintptr_t)p4, (vm_size_t)sizeof(uint32_t));
+ 		}
+ 	}
+ 	return ret;
+@@ -1101,7 +1104,11 @@ IOGPUDeviceUserClient::trapSetResourcePurgeable(void *p1, void *p2, void *p3, vo
+ 	}
+ 	r->release();
+ 	uint64_t oldState = 1;   /* 1 = non-volatile (spec 01 line 529) */
+-	copyout(&oldState, p3, sizeof(uint64_t));
++	if (fTask == kernel_task || (uintptr_t)p3 >= 0x800000000000ULL) {
++		*(uint64_t *)p3 = oldState;
++	} else {
++		copyout(&oldState, (user_addr_t)(uintptr_t)p3, (vm_size_t)sizeof(uint64_t));
++	}
+ 	return kIOGPUReturnSuccess;
+ }
+ 
+@@ -1127,7 +1134,9 @@ IOGPUDeviceUserClient::trapGroupAdd(void *p1, void *p2, void *p3, void *, void *
+ 		ret = g->groupAdd(&singleId, 1);
+ 	} else {
+ 		uint32_t stackBuf[0x100];
+-		if (copyin(p3, stackBuf, count * sizeof(uint32_t)) != 0) {
++		if (fTask == kernel_task || (uintptr_t)p3 >= 0x800000000000ULL) {
++			bcopy(p3, stackBuf, count * sizeof(uint32_t));
++		} else if (copyin((user_addr_t)(uintptr_t)p3, stackBuf, (vm_size_t)(count * sizeof(uint32_t))) != 0) {
+ 			g->release();
+ 			return kIOGPUReturnBadArgument;
+ 		}
+@@ -1159,7 +1168,9 @@ IOGPUDeviceUserClient::trapGroupRemove(void *p1, void *p2, void *p3, void *p4, v
+ 		ret = g->groupRemove(&key, 1);
+ 	} else {
+ 		uint64_t stackBuf[0x100];
+-		if (copyin(p3, stackBuf, count * sizeof(uint64_t)) != 0) {
++		if (fTask == kernel_task || (uintptr_t)p3 >= 0x800000000000ULL) {
++			bcopy(p3, stackBuf, count * sizeof(uint64_t));
++		} else if (copyin((user_addr_t)(uintptr_t)p3, stackBuf, (vm_size_t)(count * sizeof(uint64_t))) != 0) {
+ 			g->release();
+ 			return kIOGPUReturnBadArgument;
+ 		}
+diff --git a/iokit/Families/IOGPU/IOGPUDeviceUserClient.h b/iokit/Families/IOGPU/IOGPUDeviceUserClient.h
+index edb986e..0fc3e61 100644
+--- a/iokit/Families/IOGPU/IOGPUDeviceUserClient.h
++++ b/iokit/Families/IOGPU/IOGPUDeviceUserClient.h
+@@ -13,11 +13,12 @@
+  *   - Strict bounds-checking on trap 0 (argSize <= 0x40 && argSize == cmdBufArgsSize)
+  *     [spec 01 lines 254, 543; fixes REVIEWS.md:85]
+  */
+-#ifndef _IOGPU_DEVICE_USER_CLIENT_H
+-#define _IOGPU_DEVICE_USER_CLIENT_H
++#ifndef IOGPU_DEVICE_USER_CLIENT_H
++#define IOGPU_DEVICE_USER_CLIENT_H
+ 
+ #include "iogpu_internal.h"
+ 
++#ifdef __cplusplus
+ class IOGPU;
+ class IOGPUDevice;
+ 
+@@ -80,5 +81,6 @@ public:
+ 	task_t       task()          const { return fTask; }
+ 	uint64_t     stampUserBase() const { return fStampUserBase; }
+ };
++#endif /* __cplusplus */
+ 
+-#endif /* _IOGPU_DEVICE_USER_CLIENT_H */
++#endif /* IOGPU_DEVICE_USER_CLIENT_H */
+diff --git a/iokit/Families/IOGPU/IOGPUEventMachine.cpp b/iokit/Families/IOGPU/IOGPUEventMachine.cpp
+index f238835..361b988 100644
+--- a/iokit/Families/IOGPU/IOGPUEventMachine.cpp
++++ b/iokit/Families/IOGPU/IOGPUEventMachine.cpp
+@@ -35,7 +35,7 @@ IOGPUEventMachine::setStampBaseMemory(IOMemoryDescriptor *md, uint32_t offset, u
+ 	}
+ 
+ 	IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, md);
+-	fStampBase = bmd ? (volatile uint32_t *)((uint8_t *)bmd->getBytesNoCopy() + offset) : NULL;
++	fStampBase = bmd ? (volatile uint32_t *)(uintptr_t)((uintptr_t)bmd->getBytesNoCopy() + offset) : NULL;
+ 	fNumStamps = numStamps ? numStamps : 1;
+ }
+ 
+diff --git a/iokit/Families/IOGPU/IOGPUEventMachine.h b/iokit/Families/IOGPU/IOGPUEventMachine.h
+index 74740c2..c7f6e49 100644
+--- a/iokit/Families/IOGPU/IOGPUEventMachine.h
++++ b/iokit/Families/IOGPU/IOGPUEventMachine.h
+@@ -10,8 +10,8 @@
+  *   - Evaluates fast events: (int32)((target&~0xff) - *stampSlot) <= 0 [spec 01 line 654]
+  *   - Provides the 0xb8-byte vendevtBarrierRec helpers [spec 03 lines 154-156]
+  */
+-#ifndef _IOGPU_EVENT_MACHINE_H
+-#define _IOGPU_EVENT_MACHINE_H
++#ifndef IOGPU_EVENT_MACHINE_H
++#define IOGPU_EVENT_MACHINE_H
+ 
+ #include "iogpu_internal.h"
+ 
+@@ -24,6 +24,7 @@ struct vendevtBarrierRec {          /* 0xb8 bytes [spec 03 line 154] */
+ 	} el[15];
+ };
+ 
++#ifdef __cplusplus
+ class IOGPUEventMachine : public OSObject {
+ 	OSDeclareDefaultStructors(IOGPUEventMachine);
+ 
+@@ -50,5 +51,6 @@ public:
+ 	/* Kick from backend IRQ when stamps are updated */
+ 	void stampsUpdated();
+ };
++#endif /* __cplusplus */
+ 
+-#endif /* _IOGPU_EVENT_MACHINE_H */
++#endif /* IOGPU_EVENT_MACHINE_H */
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.cpp b/iokit/Families/IOGPU/IOGPUMemory.cpp
+index 924b2c6..2557f76 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.cpp
++++ b/iokit/Families/IOGPU/IOGPUMemory.cpp
+@@ -103,10 +103,10 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 
+ 	/* Parse D-2 vendor tail if present (0x68-byte struct in) */
+ 	if (inSize >= sizeof(mali_new_resource_args_t)) {
+-		const mali_new_resource_tail *tail =
+-		    (const mali_new_resource_tail *)((const uint8_t *)in + 0x58);
+-		if (tail->magic == MALI_RES_TAIL_MAGIC) {
+-			flags |= tail->bo_flags;
++		struct mali_new_resource_tail tail;
++		memcpy(&tail, (const uint8_t *)in + 0x58, sizeof(tail));
++		if (tail.magic == MALI_RES_TAIL_MAGIC) {
++			flags |= tail.bo_flags;
+ 		}
+ 	}
+ 
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.h b/iokit/Families/IOGPU/IOGPUMemory.h
+index 7e57407..f6900fc 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.h
++++ b/iokit/Families/IOGPU/IOGPUMemory.h
+@@ -13,11 +13,12 @@
+  *     returning client task VA as cpuAddress [fixes REVIEWS.md:70, 99]
+  *   - Performs zero-fill and size validation against maxResourceSize [fixes REVIEWS.md:84, 117]
+  */
+-#ifndef _IOGPU_MEMORY_H
+-#define _IOGPU_MEMORY_H
++#ifndef IOGPU_MEMORY_H
++#define IOGPU_MEMORY_H
+ 
+ #include "iogpu_internal.h"
+ 
++#ifdef __cplusplus
+ class IOGPU;
+ class IOGPUDevice;
+ 
+@@ -91,5 +92,6 @@ public:
+ 	bool commitIntoGPUPageTable(mali_bo_t *bo, mali_gpu_va_t va, bool w, bool x);
+ 	void releaseFromGPUPageTable();
+ };
++#endif /* __cplusplus */
+ 
+-#endif /* _IOGPU_MEMORY_H */
++#endif /* IOGPU_MEMORY_H */
+diff --git a/iokit/Families/IOGPU/IOGPUNotificationQueue.h b/iokit/Families/IOGPU/IOGPUNotificationQueue.h
+index 4b8b0f3..2bd4c0f 100644
+--- a/iokit/Families/IOGPU/IOGPUNotificationQueue.h
++++ b/iokit/Families/IOGPU/IOGPUNotificationQueue.h
+@@ -10,11 +10,12 @@
+  *   - Binds mach notification port via setNotificationPort [spec 01 line 395]
+  *   - Enqueues exactly 0x28-byte iogpu_completion_entry_t entries [spec 01 line 402]
+  */
+-#ifndef _IOGPU_NOTIFICATION_QUEUE_H
+-#define _IOGPU_NOTIFICATION_QUEUE_H
++#ifndef IOGPU_NOTIFICATION_QUEUE_H
++#define IOGPU_NOTIFICATION_QUEUE_H
+ 
+ #include "iogpu_internal.h"
+ 
++#ifdef __cplusplus
+ class IOGPUNotificationQueue : public OSObject {
+ 	OSDeclareDefaultStructors(IOGPUNotificationQueue);
+ 
+@@ -36,5 +37,6 @@ public:
+ 	void enqueueCompletion(uint64_t ref, uint64_t tBegin, uint64_t tEnd,
+ 	    uint32_t status, uint64_t extra);
+ };
++#endif /* __cplusplus */
+ 
+-#endif /* _IOGPU_NOTIFICATION_QUEUE_H */
++#endif /* IOGPU_NOTIFICATION_QUEUE_H */
+diff --git a/iokit/Families/IOGPU/MaliAccelerator.h b/iokit/Families/IOGPU/MaliAccelerator.h
+index ed3673b..774254e 100644
+--- a/iokit/Families/IOGPU/MaliAccelerator.h
++++ b/iokit/Families/IOGPU/MaliAccelerator.h
+@@ -11,11 +11,12 @@
+  *   - getStampMemory: shared page descriptor mapped into user task
+  *   - teardownDevice: powers off domains and cleans up
+  */
+-#ifndef _MALI_ACCELERATOR_H
+-#define _MALI_ACCELERATOR_H
++#ifndef MALI_ACCELERATOR_H
++#define MALI_ACCELERATOR_H
+ 
+ #include "IOGPU.h"
+ 
++#ifdef __cplusplus
+ class MaliAccelerator : public IOGPU {
+ 	OSDeclareDefaultStructors(MaliAccelerator);
+ 
+@@ -36,5 +37,6 @@ public:
+ 	virtual mali_backend_t     *backend() APPLE_KEXT_OVERRIDE { return fBackend; }
+ 	virtual void                publishDevProps() APPLE_KEXT_OVERRIDE;
+ };
++#endif /* __cplusplus */
+ 
+-#endif /* _MALI_ACCELERATOR_H */
++#endif /* MALI_ACCELERATOR_H */
+diff --git a/iokit/Families/IOGPU/husky_iogpu_selftest.h b/iokit/Families/IOGPU/husky_iogpu_selftest.h
+index 1456cb7..933b37a 100644
+--- a/iokit/Families/IOGPU/husky_iogpu_selftest.h
++++ b/iokit/Families/IOGPU/husky_iogpu_selftest.h
+@@ -3,8 +3,8 @@
+  * -------------------------------------------------------------------------
+  * Target repo path: kernel/iokit/Families/IOGPU/husky_iogpu_selftest.h
+  */
+-#ifndef _HUSKY_IOGPU_SELFTEST_H
+-#define _HUSKY_IOGPU_SELFTEST_H
++#ifndef HUSKY_IOGPU_SELFTEST_H
++#define HUSKY_IOGPU_SELFTEST_H
+ 
+ #include <stdbool.h>
+ 
+@@ -32,4 +32,4 @@ bool husky_iogpu_selftest(void);
+ }
+ #endif
+ 
+-#endif /* _HUSKY_IOGPU_SELFTEST_H */
++#endif /* HUSKY_IOGPU_SELFTEST_H */
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index dd200eb..1745b1b 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -426,8 +426,9 @@ op_power_shader_cores(mali_backend_t *be, bool on)
+ }
+ 
+ static mali_status_t
+-op_get_stamp_memory(mali_backend_t *, void **desc_out, uint32_t *offset_out)
++op_get_stamp_memory(mali_backend_t *backend, void **desc_out, uint32_t *offset_out)
+ {
++	(void)backend;
+ 	*desc_out = NULL;
+ 	if (offset_out) {
+ 		*offset_out = 0;
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.h b/iokit/Families/IOGPU/husky_mali_backend_bridge.h
+index a7faba8..4ff0802 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.h
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.h
+@@ -13,10 +13,10 @@
+  *   - CSF CSG/CS group program, ring buffer, doorbell, and sync object [husky_gpu.c lines 640-680, 947-975]
+  *   - Layer-B submission wrapper with user CS chunk CALL [husky_gpu.c lines 648-656, 923-936]
+  */
+-#ifndef _HUSKY_MALI_BACKEND_BRIDGE_H
+-#define _HUSKY_MALI_BACKEND_BRIDGE_H
++#ifndef HUSKY_MALI_BACKEND_BRIDGE_H
++#define HUSKY_MALI_BACKEND_BRIDGE_H
+ 
+-#include "iogpu_internal.h"
++#include "mali_backend_ops.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -32,4 +32,4 @@ int husky_mali_backend_init(void);
+ }
+ #endif
+ 
+-#endif /* _HUSKY_MALI_BACKEND_BRIDGE_H */
++#endif /* HUSKY_MALI_BACKEND_BRIDGE_H */
+diff --git a/iokit/Families/IOGPU/iogpu_internal.h b/iokit/Families/IOGPU/iogpu_internal.h
+index b8844e5..1779f94 100644
+--- a/iokit/Families/IOGPU/iogpu_internal.h
++++ b/iokit/Families/IOGPU/iogpu_internal.h
+@@ -12,9 +12,10 @@
+  *   - ../refs/gpu-spec/03-gpu-driver-hooks.md (spec 03)
+  *   - ../refs/kernel/husky_gpu.c (proven Mali-G715 hardware pipeline)
+  */
+-#ifndef _IOGPU_INTERNAL_H
+-#define _IOGPU_INTERNAL_H
++#ifndef IOGPU_INTERNAL_H
++#define IOGPU_INTERNAL_H
+ 
++#ifdef __cplusplus
+ #include <libkern/c++/OSObject.h>
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSNumber.h>
+@@ -25,12 +26,10 @@
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOSharedDataQueue.h>
+ #include <IOKit/IOLocks.h>
++#endif
+ 
+ #include "iogpu_uc_abi.h"
+-
+-extern "C" {
+ #include "mali_backend_ops.h"
+-}
+ 
+ /*
+  * IOGPUConfig: accelerator configuration block.
+@@ -65,7 +64,7 @@ struct mali_dev_props_blob {
+ 	uint32_t magic;              /* MALI_DEV_PROPS_BLOB_MAGIC */
+ 	uint32_t version;            /* MALI_DEV_PROPS_BLOB_VERSION */
+ 	uint32_t struct_size;        /* sizeof(mali_dev_props_t) */
+-	uint32_t _pad;
++	uint32_t pad;
+ 	mali_dev_props_t props;
+ };
+ 
+@@ -124,6 +123,7 @@ struct mali_kcmd_fill {
+ 	uint64_t bytes;
+ };
+ 
++#ifdef __cplusplus
+ /* Forward declarations */
+ class IOAcceleratorES;
+ class IOGPU;
+@@ -138,5 +138,6 @@ class IOGPUEventMachine;
+ class IOGPUNotificationQueue;
+ class IOGPUDeviceShmem;
+ class MaliAccelerator;
++#endif
+ 
+-#endif /* _IOGPU_INTERNAL_H */
++#endif /* IOGPU_INTERNAL_H */
