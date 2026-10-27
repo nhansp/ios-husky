@@ -1,0 +1,50 @@
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index f0d870c..4aa9a96 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -270,6 +270,15 @@ extern uint64_t mcu_root; /* husky_gpu.c:509 */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size); /* husky_gpu.c:1328 */
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size); /* husky_gpu.c:902 */
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t size);
++/*
++ * ml_io_map*() allocate with KMA_PERMANENT (osfmk/arm/io_map.c), so ml_io_unmap() of them panics
++ * in kmem_free: boots 0107/0110 died in setupDevice exactly there (power_shader_cores). Anything the
++ * bridge unmaps again is mapped with ml_io_map_unmappable(); one-time mappings stay permanent.
++ */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++#ifndef VM_WIMG_WCOMB
++#define VM_WIMG_WCOMB           0x6u                /* osfmk/arm/memory_types.h:43 */
++#endif
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va); /* husky_gpu.c:1095 */
+ extern int64_t husky_smc4(uint64_t fid, uint64_t a1, uint64_t a2, uint64_t a3); /* husky_gpu.c:122-133 */
+ extern void delay(int microseconds);
+@@ -439,7 +448,10 @@ op_power_shader_cores(mali_backend_t *be, bool on)
+ 		be->cores_powered = on;
+ 	}
+ 	if (on) {
+-		vm_offset_t pmu = ml_io_map(PMU_PA, PMU_SIZE);
++		static vm_offset_t pmu;         /* mapped once, never unmapped (permanent io_map) */
++		if (pmu == 0) {
++			pmu = ml_io_map(PMU_PA, PMU_SIZE);
++		}
+ 		if (pmu != 0) {
+ 			if (!(rd32(pmu, PMU_G3D_STATUS) & PMU_PWR_ON)) {
+ 				wr32(pmu, PMU_G3D_CONFIG, rd32(pmu, PMU_G3D_CONFIG) | PMU_PWR_ON);
+@@ -450,7 +462,6 @@ op_power_shader_cores(mali_backend_t *be, bool on)
+ 				husky_smc4(SMC_CMD_PREPARE_PD_ONOFF, EXYNOS_WAKEUP_PD_DOWN, G3D_NEED_SMC,
+ 				    RUNTIME_PM_TZPC_GROUP);
+ 			}
+-			ml_io_unmap(pmu, PMU_SIZE);
+ 		}
+ 	}
+ 	return 0;
+@@ -630,7 +641,8 @@ op_bo_alloc(mali_vm_t *vm, uint64_t size, uint32_t flags,
+ 
+ 	/* Map write-combined CPU alias for non-cacheable mappings [husky_gpu.c:902] */
+ 	if (flags & MALI_BO_NONCACHEABLE) {
+-		bo->cpu_wcomb = ml_io_map_wcomb((vm_offset_t)bo->pa, rsize);
++		/* unmappable: op_bo_free and the failure path ml_io_unmap() it */
++		bo->cpu_wcomb = ml_io_map_unmappable((vm_offset_t)bo->pa, rsize, VM_WIMG_WCOMB);
+ 	}
+ 
+ 	/*
