@@ -1,0 +1,17 @@
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.cpp b/iokit/Families/IOGPU/IOGPUMemory.cpp
+index 44718e6..310bf63 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.cpp
++++ b/iokit/Families/IOGPU/IOGPUMemory.cpp
+@@ -167,8 +167,10 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 		break;
+ 	}
+ 	case kIOGPUResType_ClientMem: {    /* type 0x80: the client's own pages, wired for the resource's life */
+-		if (in->ptrOrField != 0 || (in->ptrOrSurface & PAGE_MASK) || (fSize & PAGE_MASK)) {
+-			IOLog("IOGPU: client-memory resource refused: ptr 0x%llx size 0x%llx ranges %llu (one page-aligned range only)\n",
++		/* +0x40 repeats the pointer for one range (boot 0125); other values (range lists) are not decoded yet */
++		const bool one_range = in->ptrOrField == 0 || in->ptrOrField == in->ptrOrSurface;
++		if (!one_range || (in->ptrOrSurface & PAGE_MASK) || (fSize & PAGE_MASK)) {
++			IOLog("IOGPU: client-memory resource refused: ptr 0x%llx size 0x%llx +0x40 0x%llx (one page-aligned range only)\n",
+ 			    in->ptrOrSurface, fSize, in->ptrOrField);
+ 			return kIOGPUReturnBadArgument;
+ 		}
