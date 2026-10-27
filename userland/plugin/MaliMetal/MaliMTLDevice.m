@@ -10,7 +10,7 @@
  *   isSubclassOfClass:_MTLDevice (A18 correction: NOT IOGPUMetalDevice, which is a subclass of it)
  *   -> [[cls alloc] initWithAcceleratorPort:] -> MTLAddDevice() which asserts MTLDevice + MTLDeviceSPI conformance
  *   and calls -initLimits / -initFeatureQueries / -initWorkarounds. initLimits derives every limit from
- *   -featureProfile (the plug-in picks 10001, "Mac2 + Common1-3": no Apple-GPU families are claimed).
+ *   -featureProfile.
  */
 #import "MaliMTLObjectsPrivate.h"
 #import <CommonCrypto/CommonDigest.h>
@@ -23,7 +23,7 @@
 #import <unistd.h>
 
 #ifndef MALI_FEATURE_PROFILE
-#define MALI_FEATURE_PROFILE 10001ull
+#define MALI_FEATURE_PROFILE 7ull       /* iOS -[_MTLDevice initLimits] accepts 0, 4-8; AGXA13FamilyDevice returns 7 */
 #endif
 
 void MaliConsole(const char *fmt, ...) {
