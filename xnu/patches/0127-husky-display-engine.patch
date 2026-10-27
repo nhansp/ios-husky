@@ -1,0 +1,2579 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 3d154be..4573380 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -502,6 +502,9 @@ gpu_fault_dump(const char *why)
+ 	s2mpu_dump(why);
+ }
+ 
++void husky_dcache_flush(vm_offset_t va, size_t len);
++void husky_dcache_clean(vm_offset_t va, size_t len);
++
+ /*
+  * Clean+invalidate to PoC by VA. XNU's flush_dcache64 is a bare dsb here:
+  * the HUSKY config inherits Apple's __ARM_COHERENT_IO__ (all DMA coherent),
+@@ -522,6 +525,21 @@ husky_dcache_flush(vm_offset_t va, size_t len)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/* Clean to PoC by VA, lines stay valid: CPU-written scanout pixels for the DPU. */
++void
++husky_dcache_clean(vm_offset_t va, size_t len)
++{
++	uint64_t ctr;
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	size_t line = 4u << ((ctr >> 16) & 0xf);
++	vm_offset_t p = va & ~(vm_offset_t)(line - 1);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (; p < va + len; p += line) {
++		__asm__ volatile ("dc cvac, %0" : : "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ /* Simple word copies: the targets may be Device/NC mappings (no dc zva). */
+ static void
+ copy_bytes(volatile uint8_t *dst, const uint8_t *src, size_t n)
+diff --git a/iokit/Kernel/arm/HuskyDisplay.cpp b/iokit/Kernel/arm/HuskyDisplay.cpp
+new file mode 100644
+index 0000000..de807c7
+--- /dev/null
++++ b/iokit/Kernel/arm/HuskyDisplay.cpp
+@@ -0,0 +1,1632 @@
++/*
++ * Display engine for HUSKY.
++ *
++ * The ABL leaves DECON0 idle with the DPP0 RDMA pointing at its splash
++ * buffer; the DSI command-mode panel keeps its last frame and DECON0 sends
++ * one frame per shadow-update request, started by the panel's TE through the
++ * hardware trigger. This engine keeps that arrangement and changes only what
++ * a frame reads: the RDMA base address register is pointed at the physical
++ * pages of the IOSurface CoreAnimation just finished, so GPU-rendered frames
++ * reach the panel without a CPU copy. Surfaces CoreAnimation creates for the
++ * panel come from a physically contiguous pool below 4 GiB (the DPU SysMMU is
++ * left in bypass); anything else still takes the CPU copy into the splash.
++ *
++ * Everything runs only when boot-arg huskydisp=N is set; the steps are
++ * cumulative:
++ *   1  read-only register probe and TE measurement
++ *   2  scanout pool, swap statistics, SwapWait argument logging
++ *   3  direct flips, polled
++ *   4  GIC interrupts, vsync from the panel's TE
++ *   5  panel to 120 Hz (huskydisp_hz=60 skips it)
++ *   6  failure injection (huskydisp_inject=1|2)
++ * huskydisp_slots=2..6 sizes the pool (default 4 x 16 MiB).
++ */
++#include "HuskyDisplay.h"
++
++#if defined(HUSKY)
++#include <IOKit/system.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <machine/atomic.h>
++#include <libkern/OSAtomic.h>
++#include <pexpert/pexpert.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" int husky_irq_register(uint32_t intid, void (*fn)(void *arg, uint32_t intid), void *arg);
++extern "C" void husky_gic_spi_enable(uint32_t intid, uint8_t prio);
++extern "C" int husky_gic_spi_probe(uint32_t intid, uint32_t *grp, uint32_t *cfg, uint32_t *en, uint64_t *route);
++extern unsigned long gPhysBase, gPhysSize;
++
++#define HD_DECON_PHYS           0x19470000ULL
++#define HD_WIN_PHYS             0x19480000ULL
++#define HD_WINCON_PHYS          0x194A0000ULL
++#define HD_DSIM_PHYS            0x19440000ULL
++#define HD_RDMA_PHYS            0x19900000ULL
++#define HD_SYSMMU_PHYS          0x19840000ULL
++#define HD_WINDOWS              14
++#define HD_WIN_STRIDE           0x1000
++
++/* DECON0 main */
++#define DECON_GLOBAL_CON        0x20
++#define DECON_TRIG_CON          0x30
++#define DECON_HW_TE_CNT         0x38
++#define DECON_SHD_REG_UP_REQ    0x50
++#define DECON_INT_EN            0x60
++#define DECON_INT_EN_EXTRA      0x64
++#define DECON_INT_PEND          0x70
++#define DECON_INT_PEND_EXTRA    0x74
++#define GCON_CMD                (1u << 8)
++#define TRIG_HW_EN              (1u << 0)
++#define TRIG_MASK_DECON         (1u << 4)
++#define TRIG_SEL_MASK           (3u << 24)
++#define INT_EN_MASTER           (1u << 0)
++#define INT_EXTRA               (1u << 4)
++#define INT_FRAME_START         (1u << 12)
++#define INT_FRAME_DONE          (1u << 13)
++#define EXTRA_TIME_OUT          (1u << 0)
++#define EXTRA_RES_CONFLICT      (1u << 4)
++#define EXTRA_TE_RISE           (1u << 16)
++#define EXTRA_ALL               (EXTRA_TIME_OUT | EXTRA_RES_CONFLICT | EXTRA_TE_RISE)
++#define SHD_REQUEST             0x80003FFFu
++
++/* DPP0 RDMA */
++#define RDMA_IRQ                0x04
++#define RDMA_IN_CTRL_0          0x08
++#define RDMA_SRC_SIZE           0x10
++#define RDMA_SRC_OFFSET         0x14
++#define RDMA_IMG_SIZE           0x18
++#define RDMA_BASEADDR_Y8        0x40
++#define RDMA_SRC_STRIDE_0       0x50
++#define RDMA_SRC_STRIDE_1       0x54
++#define RDMA_SHADOW             0x400
++#define RDMA_IRQ_EN             (1u << 0)
++#define RDMA_IRQ_FD_MASK        (1u << 1)
++#define RDMA_IRQ_ALL_MASK       (0x7FBu << 1)
++#define RDMA_IRQ_PEND           (0x7FFu << 16)
++#define RDMA_IRQ_DEADLOCK       (1u << 17)
++#define RDMA_IRQ_CONFIG_ERR     (1u << 21)
++
++/* DSIM0 */
++#define DSIM_ESCMODE            0x2C
++#define DSIM_UNDERRUN_CTRL      0x34
++#define DSIM_CONFIG             0x4C
++#define DSIM_INTSRC             0x50
++#define DSIM_PKTHDR             0x58
++#define DSIM_PAYLOAD            0x5C
++#define DSIM_FIFOCTRL           0x68
++#define DSIM_CMD_CONFIG         0x80
++#define DSIM_CMD_TE_CTRL0       0x84
++#define DSIM_CMD_TE_CTRL1       0x88
++#define DSIM_PLL_CTRL           0xA0
++#define DSIM_INT_UNDER_RUN      (1u << 19)
++#define DSIM_FIFO_EMPTY_PL      (1u << 8)
++#define DSIM_FIFO_FULL_PL       (1u << 9)
++#define DSIM_FIFO_EMPTY_PH      (1u << 10)
++#define DSIM_FIFO_FULL_PH       (1u << 11)
++#define DSIM_CMD_PKT_GO_EN      (1u << 16)
++#define DSIM_CONFIG_VIDEO       (1u << 18)
++#define SYSMMU_CTRL_VM          0x8000
++
++/* GIC INTIDs (SPI + 32) of DECON0 and the DPP0 RDMA, from the zuma DT */
++#define HD_INTID_EXTRA          273
++#define HD_INTID_FRAME_DONE     274
++#define HD_INTID_FRAME_START    275
++#define HD_INTID_RDMA           288
++#define HD_IRQ_PRIO             0xA0
++
++/* DSIM timer values for 60 and 120 fps with hk3's te_idle_us = 350, te_var = 1 */
++#define HD_URUN_60              0x2235
++#define HD_URUN_120             0x06A7
++#define HD_TE1_60               0x34E13D3Bu
++#define HD_TE1_120              0x1A701E9Du
++
++#define HD_SLOT_SIZE            (16u << 20)
++#define HD_MAX_SLOTS            6
++#define HD_ARM_TIMEOUT_MS       50
++#define HD_XFER_TIMEOUT_US      20000
++#define HD_TE_LOST_US           100000
++#define HD_WATCH_MS             20
++#define HD_POLL_US              250
++#define HD_STATS_TICKS          500
++
++enum {
++	ERR_DECON       = 1,
++	ERR_RDMA        = 2,
++	ERR_MISM        = 4,
++	ERR_RING        = 8,
++};
++
++static uint64_t
++hd_us_to_abs(uint64_t us)
++{
++	uint64_t a;
++	nanoseconds_to_absolutetime(us * 1000, &a);
++	return a;
++}
++
++static uint32_t
++hd_abs_to_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return (uint32_t)(ns / 1000);
++}
++
++static uint32_t
++hd_boot_arg(const char *name, uint32_t def)
++{
++	uint32_t v;
++	return PE_parse_boot_argn(name, &v, sizeof(v)) ? v : def;
++}
++
++/* ---- scanout pool ---- */
++
++static struct {
++	IOSimpleLock             *lock;
++	bool                      ready;
++	uint32_t                  n, used;
++	uint32_t                  width, height, stride;
++	uint64_t                  pa[HD_MAX_SLOTS];
++	void                     *kva[HD_MAX_SLOTS];
++	IOBufferMemoryDescriptor *md[HD_MAX_SLOTS];
++	IOBufferMemoryDescriptor *whole;
++} husky_pool;
++
++bool
++husky_scanout_geometry(uint32_t *width, uint32_t *height, uint32_t *bytesPerRow)
++{
++	if (!husky_pool.ready) {
++		return false;
++	}
++	*width = husky_pool.width;
++	*height = husky_pool.height;
++	*bytesPerRow = husky_pool.stride;
++	return true;
++}
++
++bool
++husky_scanout_slot_get(uint64_t size, uint64_t *pa, void **kva, int *slot)
++{
++	bool found = false;
++
++	if (!husky_pool.ready || size > HD_SLOT_SIZE) {
++		return false;
++	}
++	IOInterruptState st = IOSimpleLockLockDisableInterrupt(husky_pool.lock);
++	for (uint32_t i = 0; i < husky_pool.n; i++) {
++		if (!(husky_pool.used & (1u << i))) {
++			husky_pool.used |= 1u << i;
++			*pa = husky_pool.pa[i];
++			*kva = husky_pool.kva[i];
++			*slot = (int)i;
++			found = true;
++			break;
++		}
++	}
++	IOSimpleLockUnlockEnableInterrupt(husky_pool.lock, st);
++	return found;
++}
++
++void
++husky_scanout_slot_put(int slot)
++{
++	if (!husky_pool.ready || slot < 0 || (uint32_t)slot >= husky_pool.n) {
++		return;
++	}
++	IOInterruptState st = IOSimpleLockLockDisableInterrupt(husky_pool.lock);
++	husky_pool.used &= ~(1u << slot);
++	IOSimpleLockUnlockEnableInterrupt(husky_pool.lock, st);
++}
++
++/* ---- panel DCS batches, bytes on the DSI link ---- */
++
++struct husky_dcs {
++	uint8_t len;
++	uint8_t b[13];
++};
++
++/*
++ * 60 -> 120 Hz and back: the byte sequences hk3_set_panel_feat
++ * (panel-google-hk3.c) emits for HS op mode, manual frame mode, early exit on
++ * and fixed TE at 120 Hz, and for early exit off, changeable TE at 60 Hz. Each
++ * batch must go out whole (the driver warns of a black screen otherwise). The
++ * IRC and TE2 blocks are deliberately not sent: this code never changes them.
++ */
++static const struct husky_dcs husky_dcs_120[] = {
++	{ 3, { 0xF0, 0x5A, 0x5A } },
++	{ 2, { 0xB9, 0x51 } },
++	{ 4, { 0xB0, 0x00, 0x02, 0xB9 } },
++	{ 2, { 0xB9, 0x00 } },
++	{ 4, { 0xB0, 0x00, 0x08, 0xB9 } },
++	{ 9, { 0xB9, 0x0B, 0xBB, 0x00, 0x2F, 0x0B, 0xBB, 0x00, 0x2F } },
++	{ 2, { 0xF2, 0x01 } },
++	{ 2, { 0x60, 0x00 } },
++	{ 6, { 0xBD, 0x21, 0x01, 0x83, 0x03, 0x03 } },
++	{ 4, { 0xB0, 0x00, 0x10, 0xBD } },
++	{ 2, { 0xBD, 0x22 } },
++	{ 4, { 0xB0, 0x00, 0x82, 0xBD } },
++	{ 5, { 0xBD, 0x22, 0x22, 0x22, 0x22 } },
++	{ 4, { 0xB0, 0x00, 0x1E, 0xBD } },
++	{ 13, { 0xBD, 0x00, 0x00, 0x00, 0x02, 0x00, 0x06, 0x00, 0x16, 0x00, 0x2E, 0x00, 0xEE } },
++	{ 2, { 0xBD, 0x21 } },
++	{ 2, { 0x60, 0x00 } },
++	{ 2, { 0xF7, 0x0F } },
++	{ 3, { 0xF0, 0xA5, 0xA5 } },
++};
++
++static const struct husky_dcs husky_dcs_60[] = {
++	{ 3, { 0xF0, 0x5A, 0x5A } },
++	{ 2, { 0xB9, 0x04 } },
++	{ 4, { 0xB0, 0x00, 0x04, 0xB9 } },
++	{ 5, { 0xB9, 0x0B, 0xBB, 0x00, 0x2F } },
++	{ 6, { 0xBD, 0x21, 0x81, 0x83, 0x03, 0x03 } },
++	{ 4, { 0xB0, 0x00, 0x10, 0xBD } },
++	{ 2, { 0xBD, 0x00 } },
++	{ 4, { 0xB0, 0x00, 0x82, 0xBD } },
++	{ 5, { 0xBD, 0x00, 0x00, 0x00, 0x00 } },
++	{ 4, { 0xB0, 0x00, 0x1E, 0xBD } },
++	{ 13, { 0xBD, 0x00, 0x00, 0x00, 0x02, 0x00, 0x06, 0x00, 0x16, 0x00, 0x2E, 0x00, 0xEE } },
++	{ 2, { 0xBD, 0x21 } },
++	{ 2, { 0x60, 0x01 } },
++	{ 2, { 0xF7, 0x0F } },
++	{ 3, { 0xF0, 0xA5, 0xA5 } },
++};
++
++/* ---- work loop event source ---- */
++
++class HuskyDispEventSource : public IOEventSource {
++	OSDeclareDefaultStructors(HuskyDispEventSource);
++
++public:
++	static HuskyDispEventSource *create(HuskyDisplay *disp);
++	bool checkForWork() APPLE_KEXT_OVERRIDE;
++	void signal(void)
++	{
++		signalWorkAvailable();
++	}
++};
++
++OSDefineMetaClassAndStructors(HuskyDispEventSource, IOEventSource);
++
++HuskyDispEventSource *
++HuskyDispEventSource::create(HuskyDisplay *disp)
++{
++	HuskyDispEventSource *es = OSTypeAlloc(HuskyDispEventSource);
++	if (es != NULL && !es->init(disp, NULL)) {
++		OSSafeReleaseNULL(es);
++	}
++	return es;
++}
++
++bool
++HuskyDispEventSource::checkForWork()
++{
++	return ((HuskyDisplay *)owner)->doWork();
++}
++
++OSDefineMetaClassAndStructors(HuskyDisplay, OSObject);
++
++static void
++husky_disp_irq(void *arg, uint32_t intid)
++{
++	((HuskyDisplay *)arg)->irq(intid);
++}
++
++uint32_t
++HuskyDisplay::level(void)
++{
++	static uint32_t v = ~0u;
++	if (v == ~0u) {
++		v = hd_boot_arg("huskydisp", 0);
++	}
++	return v;
++}
++
++HuskyDisplay *
++HuskyDisplay::create(IOWorkLoop *loop, uint64_t splashPA, uint32_t width, uint32_t height,
++    uint32_t rowBytes, HuskySurface *splash, const HuskyDisplayOps *ops, void *ctx)
++{
++	uint32_t lvl = level();
++	if (lvl == 0) {
++		return NULL;
++	}
++	HuskyDisplay *d = OSTypeAlloc(HuskyDisplay);
++	if (d == NULL || !d->init()) {
++		OSSafeReleaseNULL(d);
++		return NULL;
++	}
++	d->fLoop = loop;
++	d->fOps = *ops;
++	d->fCtx = ctx;
++	d->fSplash = splash;
++	d->fSplashPA = splashPA;
++	d->fWidth = width;
++	d->fHeight = height;
++	d->fRowBytes = rowBytes;
++	d->fFrameBytes = rowBytes * height;
++	d->fLevel = lvl;
++	d->fHz = hd_boot_arg("huskydisp_hz", 120);
++	d->fInject = lvl >= 6 ? hd_boot_arg("huskydisp_inject", 0) : 0;
++	d->fPeriodUS = 16667;
++	d->fDispLock = IOSimpleLockAlloc();
++	d->fWaitLock = IOLockAlloc();
++	d->fEvent = HuskyDispEventSource::create(d);
++	d->fWatch = IOTimerEventSource::timerEventSource(d, &HuskyDisplay::watchFired);
++	d->fPoll = IOTimerEventSource::timerEventSource(d, &HuskyDisplay::pollFired);
++	if (d->fDispLock == NULL || d->fWaitLock == NULL || d->fEvent == NULL || d->fWatch == NULL ||
++	    d->fPoll == NULL || loop->addEventSource(d->fEvent) != kIOReturnSuccess ||
++	    loop->addEventSource(d->fWatch) != kIOReturnSuccess ||
++	    loop->addEventSource(d->fPoll) != kIOReturnSuccess || !d->setup()) {
++		HUSKY_DISP_LOG("HUSKY DISP: setup failed, copy mode\n");
++		d->release();
++		return NULL;
++	}
++	HUSKY_DISP_LOG("HUSKY DISP: huskydisp=%u hz=%u inject=%u\n", lvl, d->fHz, d->fInject);
++	d->probe();
++	if (lvl >= 2 && d->fPoolOK) {
++		d->allocPool();
++	}
++	thread_t thread;
++	d->retain();
++	if (kernel_thread_start(HuskyDisplay::bringupEntry, d, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		HUSKY_DISP_LOG("HUSKY DISP: kernel_thread_start failed\n");
++		d->release();
++	}
++	return d;
++}
++
++void
++HuskyDisplay::free()
++{
++	if (fLoop != NULL) {
++		if (fEvent != NULL) {
++			fLoop->removeEventSource(fEvent);
++		}
++		if (fWatch != NULL) {
++			fLoop->removeEventSource(fWatch);
++		}
++		if (fPoll != NULL) {
++			fLoop->removeEventSource(fPoll);
++		}
++	}
++	OSSafeReleaseNULL(fEvent);
++	OSSafeReleaseNULL(fWatch);
++	OSSafeReleaseNULL(fPoll);
++	if (fDispLock != NULL) {
++		IOSimpleLockFree(fDispLock);
++		fDispLock = NULL;
++	}
++	if (fWaitLock != NULL) {
++		IOLockFree(fWaitLock);
++		fWaitLock = NULL;
++	}
++	OSObject::free();
++}
++
++bool
++HuskyDisplay::setup(void)
++{
++	fDecon = (volatile uint32_t *)ml_io_map(HD_DECON_PHYS, 0x8000);
++	fWin = (volatile uint32_t *)ml_io_map(HD_WIN_PHYS, 0x10000);
++	fWinCon = (volatile uint32_t *)ml_io_map(HD_WINCON_PHYS, 0x10000);
++	fRdma = (volatile uint32_t *)ml_io_map(HD_RDMA_PHYS, 0x4000);
++	fDsim = (volatile uint32_t *)ml_io_map(HD_DSIM_PHYS, 0x4000);
++	fSysmmu = (volatile uint32_t *)ml_io_map(HD_SYSMMU_PHYS, 0x10000);
++	return fDecon != NULL && fWin != NULL && fWinCon != NULL && fRdma != NULL && fDsim != NULL &&
++	       fSysmmu != NULL;
++}
++
++/* ---- step 1: probe ---- */
++
++void
++HuskyDisplay::probe(void)
++{
++	uint32_t gcon = fDecon[DECON_GLOBAL_CON / 4];
++	uint32_t trig = fDecon[DECON_TRIG_CON / 4];
++	uint32_t shd = fDecon[DECON_SHD_REG_UP_REQ / 4];
++
++	HUSKY_DISP_LOG("HUSKY DISP: probe decon gcon=%08x trig=%08x shd=%08x en=%08x enx=%08x pend=%08x "
++	    "pendx=%08x tecnt=%08x\n", gcon, trig, shd, fDecon[DECON_INT_EN / 4], fDecon[DECON_INT_EN_EXTRA / 4],
++	    fDecon[DECON_INT_PEND / 4], fDecon[DECON_INT_PEND_EXTRA / 4], fDecon[DECON_HW_TE_CNT / 4]);
++	for (uint32_t n = 0; n < HD_WINDOWS; n++) {
++		uint32_t con = fWinCon[(n * HD_WIN_STRIDE) / 4];
++		if (con & 1) {
++			HUSKY_DISP_LOG("HUSKY DISP: probe win%u con=%08x start=%08x end=%08x\n", n, con,
++			    fWin[(n * HD_WIN_STRIDE + 0xC) / 4], fWin[(n * HD_WIN_STRIDE + 0x10) / 4]);
++		}
++	}
++
++	uint32_t ctrl0 = fRdma[RDMA_IN_CTRL_0 / 4];
++	uint32_t src = fRdma[RDMA_SRC_SIZE / 4];
++	uint32_t off = fRdma[RDMA_SRC_OFFSET / 4];
++	uint32_t img = fRdma[RDMA_IMG_SIZE / 4];
++	uint32_t base = fRdma[RDMA_BASEADDR_Y8 / 4];
++	uint32_t sbase = fRdma[(RDMA_SHADOW + RDMA_BASEADDR_Y8) / 4];
++	HUSKY_DISP_LOG("HUSKY DISP: probe rdma0 en=%08x ctrl0=%08x src=%08x off=%08x img=%08x base=%08x "
++	    "sbase=%08x st0=%08x st1=%08x\n", fRdma[0], ctrl0, src, off, img, base, sbase,
++	    fRdma[RDMA_SRC_STRIDE_0 / 4], fRdma[RDMA_SRC_STRIDE_1 / 4]);
++
++	fDsimUrun = fDsim[DSIM_UNDERRUN_CTRL / 4] & 0xFFFF;
++	fDsimTe1 = fDsim[DSIM_CMD_TE_CTRL1 / 4];
++	uint32_t dcfg = fDsim[DSIM_CONFIG / 4];
++	HUSKY_DISP_LOG("HUSKY DISP: probe dsim cfg=%08x esc=%08x urun=%08x te0=%08x te1=%08x cmdcfg=%08x "
++	    "fifo=%08x pll=%08x\n", dcfg, fDsim[DSIM_ESCMODE / 4], fDsim[DSIM_UNDERRUN_CTRL / 4],
++	    fDsim[DSIM_CMD_TE_CTRL0 / 4], fDsimTe1, fDsim[DSIM_CMD_CONFIG / 4], fDsim[DSIM_FIFOCTRL / 4],
++	    fDsim[DSIM_PLL_CTRL / 4]);
++
++	uint32_t mmu = fSysmmu[SYSMMU_CTRL_VM / 4];
++	HUSKY_DISP_LOG("HUSKY DISP: probe sysmmu ctrl=%08x\n", mmu);
++
++	static const uint32_t ids[] = { HD_INTID_EXTRA, HD_INTID_FRAME_DONE, HD_INTID_FRAME_START, HD_INTID_RDMA };
++	fIrqOK = true;
++	for (uint32_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
++		uint32_t grp = 0, cfg = 0, en = 0;
++		uint64_t route = 0;
++		if (!husky_gic_spi_probe(ids[i], &grp, &cfg, &en, &route)) {
++			grp = 0;
++		}
++		fIrqOK = fIrqOK && grp == 1;
++		HUSKY_DISP_LOG("HUSKY DISP: probe gic %u grp=%u cfg=%u en=%u route=%016llx\n", ids[i], grp, cfg, en,
++		    route);
++	}
++
++	bool inDram = fSplashPA >= gPhysBase && fSplashPA < (uint64_t)gPhysBase + gPhysSize;
++	HUSKY_DISP_LOG("HUSKY DISP: probe dram base=%llx size=%llx splash=%llx in_dram=%d low_managed=%d\n",
++	    (uint64_t)gPhysBase, (uint64_t)gPhysSize, fSplashPA, inDram, gPhysBase < 0x100000000ULL);
++
++	const char *why = NULL;
++	uint32_t w = src & 0xFFFF, h = src >> 16;
++	if (((ctrl0 >> 8) & 0x3F) != 0) {
++		why = "rdma-fmt";
++	} else if (w != fWidth || h != fHeight || (img & 0x3FFF) != w || ((img >> 16) & 0x3FFF) != h || off != 0) {
++		why = "geometry";
++	} else if (fRowBytes != fWidth * 4) {
++		why = "stride";
++	} else if (base != (uint32_t)fSplashPA || sbase != base || fSplashPA >= 0x100000000ULL) {
++		why = "base";
++	} else if (inDram) {
++		why = "splash-in-dram";
++	}
++	fPoolOK = why == NULL;
++	if (why == NULL && (mmu & 1)) {
++		why = "sysmmu";
++	} else if (why == NULL && !(gcon & GCON_CMD)) {
++		why = "gcon";
++	} else if (why == NULL && (trig & (TRIG_HW_EN | TRIG_MASK_DECON | TRIG_SEL_MASK)) != TRIG_HW_EN) {
++		HUSKY_DISP_LOG("HUSKY DISP: trig %08x not TE/DDI0, staying in copy mode\n", trig);
++		why = "trig";
++	}
++	if (dcfg & DSIM_CONFIG_VIDEO) {
++		why = why != NULL ? why : "dsim-video";
++	}
++	fProbeOK = why == NULL;
++	HUSKY_DISP_LOG("HUSKY DISP: probe verdict pool=%d direct=%d (%s)\n", fPoolOK, fProbeOK,
++	    why != NULL ? why : "ok");
++}
++
++bool
++HuskyDisplay::allocPool(void)
++{
++	uint32_t want = hd_boot_arg("huskydisp_slots", 4);
++	const uint64_t mask = 0x00000000FFFFC000ULL;
++	const IOOptionBits opts = kIODirectionInOut | kIOMemoryPhysicallyContiguous;
++	uint32_t n = 0;
++
++	if (want < 2 || want > HD_MAX_SLOTS) {
++		want = 4;
++	}
++	husky_pool.lock = IOSimpleLockAlloc();
++	if (husky_pool.lock == NULL) {
++		return false;
++	}
++	IOBufferMemoryDescriptor *one = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, opts,
++	    (uint64_t)want * HD_SLOT_SIZE, mask);
++	if (one != NULL) {
++		IOByteCount seg = 0;
++		uint64_t pa = one->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
++		if (pa != 0 && seg >= (uint64_t)want * HD_SLOT_SIZE &&
++		    pa + (uint64_t)want * HD_SLOT_SIZE <= 0x100000000ULL) {
++			for (uint32_t i = 0; i < want; i++) {
++				husky_pool.pa[i] = pa + (uint64_t)i * HD_SLOT_SIZE;
++				husky_pool.kva[i] = (uint8_t *)one->getBytesNoCopy() + (uint64_t)i * HD_SLOT_SIZE;
++			}
++			husky_pool.whole = one;
++			n = want;
++		} else {
++			one->release();
++		}
++	}
++	for (; n < want && husky_pool.whole == NULL; n++) {
++		IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    opts, HD_SLOT_SIZE, mask);
++		IOByteCount seg = 0;
++		uint64_t pa = md != NULL ? md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone) : 0;
++		if (pa == 0 || seg < HD_SLOT_SIZE || pa + HD_SLOT_SIZE > 0x100000000ULL) {
++			OSSafeReleaseNULL(md);
++			break;
++		}
++		husky_pool.md[n] = md;
++		husky_pool.pa[n] = pa;
++		husky_pool.kva[n] = md->getBytesNoCopy();
++	}
++	if (n == 0) {
++		HUSKY_DISP_LOG("HUSKY DISP: pool alloc failed (slots 0)\n");
++		return false;
++	}
++	husky_pool.n = n;
++	husky_pool.width = fWidth;
++	husky_pool.height = fHeight;
++	husky_pool.stride = fRowBytes;
++	OSMemoryBarrier();
++	husky_pool.ready = true;
++	HUSKY_DISP_LOG("HUSKY DISP: pool %u slots pa=%llx-%llx kva=%p\n", n, husky_pool.pa[0],
++	    husky_pool.pa[n - 1] + HD_SLOT_SIZE, husky_pool.kva[0]);
++	return true;
++}
++
++/* ---- bring-up thread ---- */
++
++void
++HuskyDisplay::bringupEntry(void *arg, wait_result_t)
++{
++	HuskyDisplay *d = (HuskyDisplay *)arg;
++	d->bringup();
++	d->release();
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++uint32_t
++HuskyDisplay::hwTe(void)
++{
++	return (fDecon[DECON_HW_TE_CNT / 4] >> fHwShift) & 0xFFFF;
++}
++
++/* Edges between two teSample() values: TE_RISE is a 32-bit count, the HW_TE_CNT field wraps at 16. */
++uint32_t
++HuskyDisplay::teDelta(uint32_t cur, uint32_t last)
++{
++	return fTeRise ? cur - last : (cur - last) & 0xFFFF;
++}
++
++uint32_t
++HuskyDisplay::teSample(void)
++{
++	return fTeRise ? fTeCount : hwTe();
++}
++
++void
++HuskyDisplay::pollNow(void)
++{
++	IOInterruptState st = IOSimpleLockLockDisableInterrupt(fDispLock);
++	servicePoll();
++	IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
++}
++
++/* Counts TE edges for ms, returning them and their mean period. */
++uint32_t
++HuskyDisplay::teWait(uint32_t ms, uint32_t *periodUS)
++{
++	uint32_t n = 0, nFirst = 0, seen = teSample();
++	uint64_t tFirst = 0, tLast = 0;
++	uint64_t t0 = mach_absolute_time();
++	uint64_t span = hd_us_to_abs((uint64_t)ms * 1000);
++
++	do {
++		IOSleep(1);
++		if (!fIrqOn) {
++			pollNow();
++		}
++		uint32_t cur = teSample();
++		if (cur != seen) {
++			uint64_t stamp = fTeRise ? fTeTime : mach_absolute_time();
++			n += teDelta(cur, seen);
++			seen = cur;
++			if (tFirst == 0) {
++				tFirst = stamp;
++				nFirst = n;
++			}
++			tLast = stamp;
++		}
++	} while (mach_absolute_time() - t0 < span);
++	if (periodUS != NULL) {
++		uint64_t ns = 0;
++		if (n > nFirst) {
++			absolutetime_to_nanoseconds(tLast - tFirst, &ns);
++			ns = ns / (n - nFirst) / 1000;
++		}
++		*periodUS = (uint32_t)ns;
++	}
++	return n;
++}
++
++/*
++ * TE_RISE is not enabled by the Linux driver (it takes TE from a GPIO), so
++ * whether the DECON latches it with te_from = DDI0 is unproven: count it by
++ * polling the pending bit, and fall back to HW_TE_CNT if it never shows.
++ */
++bool
++HuskyDisplay::teMeasure(uint32_t ms, uint32_t *edges, uint32_t *hw0, uint32_t *hw1)
++{
++	uint32_t n = 0;
++	uint64_t span = hd_us_to_abs((uint64_t)ms * 1000);
++
++	fDecon[DECON_INT_PEND_EXTRA / 4] = EXTRA_TE_RISE;
++	*hw0 = fDecon[DECON_HW_TE_CNT / 4];
++	uint64_t t0 = mach_absolute_time();
++	do {
++		IOSleep(1);
++		if (fDecon[DECON_INT_PEND_EXTRA / 4] & EXTRA_TE_RISE) {
++			fDecon[DECON_INT_PEND_EXTRA / 4] = EXTRA_TE_RISE;
++			n++;
++		}
++	} while (mach_absolute_time() - t0 < span);
++	*hw1 = fDecon[DECON_HW_TE_CNT / 4];
++	*edges = n;
++	return n != 0;
++}
++
++/*
++ * HW_TE_CNT is two 16-bit counters, CNT_A [15:0] and CNT_B [31:16]; the zuma
++ * CAL defines both and reads neither, so which one counts TE is proven only
++ * by the probe: its count over the 500 ms window must match the TE_RISE
++ * edges, or without TE_RISE sit between 20 and 70 (60 or 120 Hz panel).
++ */
++static bool
++hd_hwcnt_is_te(uint32_t edges, uint32_t d)
++{
++	if (edges != 0) {
++		return d + 2 >= edges && d <= edges + 2;
++	}
++	return d >= 20 && d <= 70;
++}
++
++void
++HuskyDisplay::bringup(void)
++{
++	uint32_t edges = 0, hw0 = 0, hw1 = 0;
++	bool forced = false;
++
++	fTeRise = teMeasure(500, &edges, &hw0, &hw1);
++	if (!fTeRise) {
++		fDecon[DECON_INT_EN_EXTRA / 4] |= EXTRA_TE_RISE;
++		forced = true;
++		fTeRise = teMeasure(500, &edges, &hw0, &hw1);
++	}
++	uint32_t dA = (hw1 - hw0) & 0xFFFF;
++	uint32_t dB = ((hw1 >> 16) - (hw0 >> 16)) & 0xFFFF;
++	fHwCnt = true;
++	if (hd_hwcnt_is_te(edges, dA)) {
++		fHwShift = 0;
++	} else if (hd_hwcnt_is_te(edges, dB)) {
++		fHwShift = 16;
++	} else {
++		fHwCnt = false;
++	}
++	fTeHz = edges * 2;
++	fPeriodUS = (fTeHz >= 115 && fTeHz <= 125) ? 8333 : 16667;
++	HUSKY_DISP_LOG("HUSKY DISP: probe te pend=%u hwcnt=%08x->%08x dA=%u dB=%u use=%s in 500 ms (enx_forced=%d)\n",
++	    edges, hw0, hw1, dA, dB, fHwCnt ? (fHwShift ? "B" : "A") : "none", forced);
++	if (fLevel < 3) {
++		return;
++	}
++	if (!fProbeOK) {
++		HUSKY_DISP_LOG("HUSKY DISP: direct scanout off (probe)\n");
++		return;
++	}
++
++	husky_disp_splash_pa = (uint32_t)fSplashPA;
++	husky_rdma0 = fRdma;
++	fMode = kModeBringup;
++	husky_disp_direct = 1;
++	enableDecon();
++	if (fLevel >= 4) {
++		if (fIrqOK) {
++			irqOn();
++		} else {
++			HUSKY_DISP_LOG("HUSKY DISP: no IRQ mode (gic-group)\n");
++		}
++	}
++	if (fLevel >= 5) {
++		panelTo120();
++	}
++	if (fLevel >= 4) {
++		pickVsync(true);
++	}
++	if (fMode == kModeFallback) {
++		return;
++	}
++	fTeTime = mach_absolute_time();
++	IOInterruptState st = IOSimpleLockLockDisableInterrupt(fDispLock);
++	fMode = kModeDirect;
++	IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
++	HUSKY_DISP_LOG("HUSKY DISP: direct on splash=%08x mask=%08x\n", (uint32_t)fSplashPA, SHD_REQUEST);
++	fWatch->setTimeoutMS(HD_WATCH_MS);
++	armWait(fSplash, fSplashPA, 0);
++}
++
++void
++HuskyDisplay::enableDecon(void)
++{
++	fDecon[DECON_INT_PEND / 4] = INT_FRAME_START | INT_FRAME_DONE | INT_EXTRA;
++	fDecon[DECON_INT_PEND_EXTRA / 4] = EXTRA_ALL;
++	fDecon[DECON_INT_EN_EXTRA / 4] |= EXTRA_TIME_OUT | EXTRA_RES_CONFLICT | (fTeRise ? EXTRA_TE_RISE : 0);
++	fDecon[DECON_INT_EN / 4] |= INT_EN_MASTER | INT_EXTRA | INT_FRAME_START | INT_FRAME_DONE;
++	uint32_t v = fRdma[RDMA_IRQ / 4] & ~(RDMA_IRQ_ALL_MASK | RDMA_IRQ_PEND);
++	fRdma[RDMA_IRQ / 4] = v | RDMA_IRQ_FD_MASK | RDMA_IRQ_EN | RDMA_IRQ_PEND;
++	HUSKY_DISP_LOG("HUSKY DISP: decon irq en=%08x enx=%08x rdma_irq=%08x\n", fDecon[DECON_INT_EN / 4],
++	    fDecon[DECON_INT_EN_EXTRA / 4], fRdma[RDMA_IRQ / 4]);
++}
++
++bool
++HuskyDisplay::irqOn(void)
++{
++	static const uint32_t ids[] = { HD_INTID_EXTRA, HD_INTID_FRAME_DONE, HD_INTID_FRAME_START, HD_INTID_RDMA };
++	const uint32_t n = sizeof(ids) / sizeof(ids[0]);
++
++	for (uint32_t i = 0; i < n; i++) {
++		if (husky_irq_register(ids[i], husky_disp_irq, this) != 0) {
++			HUSKY_DISP_LOG("HUSKY DISP: irq %u register failed\n", ids[i]);
++			return false;
++		}
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t grp, cfg, en;
++		uint64_t route = 0;
++		husky_gic_spi_enable(ids[i], HD_IRQ_PRIO);
++		husky_gic_spi_probe(ids[i], &grp, &cfg, &en, &route);
++		HUSKY_DISP_LOG("HUSKY DISP: irq %u on (prio %x route %016llx)\n", ids[i], HD_IRQ_PRIO, route);
++	}
++	fIrqOn = true;
++	return true;
++}
++
++/* Vsync from TE when its interrupt works, else HW_TE_CNT, else the software timer. */
++void
++HuskyDisplay::pickVsync(bool measure)
++{
++	uint32_t src = (fIrqOn && fTeRise) ? kVsyncTE : (fHwCnt ? kVsyncHWCnt : kVsyncTimer);
++
++	if (measure && src != kVsyncTimer) {
++		uint32_t period = 0;
++		uint32_t edges = teWait(500, &period);
++		if (edges > 1 && period != 0) {
++			fPeriodUS = period;
++		}
++	}
++	IOInterruptState st = IOSimpleLockLockDisableInterrupt(fDispLock);
++	fVsyncSrc = src;
++	fTeSent = fTeCount;
++	fHwCntLast = hwTe();
++	fWantTimer = src == kVsyncTimer;
++	fWantPeriodUS = fPeriodUS;
++	fVsyncDirty = true;
++	IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
++	fEvent->signal();
++	if (src == kVsyncHWCnt) {
++		fPoll->setTimeoutUS(fPeriodUS / 4);
++	}
++	static const char *const names[] = { "timer", "te", "hwcnt" };
++	if (measure) {
++		HUSKY_DISP_LOG("HUSKY DISP: vsync src=%s period %u us\n", names[src], fPeriodUS);
++	}
++}
++
++/* ---- step 5: panel at 120 Hz ---- */
++
++bool
++HuskyDisplay::dsimSend(const void *packets, uint32_t count, uint32_t *drainedUS)
++{
++	const struct husky_dcs *pk = (const struct husky_dcs *)packets;
++	uint32_t cc = fDsim[DSIM_CMD_CONFIG / 4];
++
++	/* Packet-go holds packets until PKT_GO_RDY; the host sends each one at once. */
++	if (cc & DSIM_CMD_PKT_GO_EN) {
++		fDsim[DSIM_CMD_CONFIG / 4] = cc & ~DSIM_CMD_PKT_GO_EN;
++	}
++	uint64_t t0 = mach_absolute_time();
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t waited = 0;
++		while (fDsim[DSIM_FIFOCTRL / 4] & (DSIM_FIFO_FULL_PH | DSIM_FIFO_FULL_PL)) {
++			if (++waited > 500) {
++				return false;
++			}
++			IODelay(10);
++		}
++		const uint8_t *b = pk[i].b;
++		uint32_t len = pk[i].len;
++		uint32_t hdr;
++		if (len == 1) {
++			hdr = 0x05 | (uint32_t)b[0] << 8;
++		} else if (len == 2) {
++			hdr = 0x15 | (uint32_t)b[0] << 8 | (uint32_t)b[1] << 16;
++		} else {
++			for (uint32_t o = 0; o < len; o += 4) {
++				uint32_t word = 0;
++				for (uint32_t k = 0; k < 4 && o + k < len; k++) {
++					word |= (uint32_t)b[o + k] << (8 * k);
++				}
++				fDsim[DSIM_PAYLOAD / 4] = word;
++			}
++			hdr = 0x39 | (len & 0xFF) << 8 | (len >> 8) << 16;
++		}
++		fDsim[DSIM_PKTHDR / 4] = hdr;
++	}
++	for (uint32_t waited = 0;; waited++) {
++		uint32_t f = fDsim[DSIM_FIFOCTRL / 4];
++		if ((f & (DSIM_FIFO_EMPTY_PH | DSIM_FIFO_EMPTY_PL)) == (DSIM_FIFO_EMPTY_PH | DSIM_FIFO_EMPTY_PL)) {
++			break;
++		}
++		if (waited > 1000) {
++			return false;
++		}
++		IODelay(50);
++	}
++	*drainedUS = hd_abs_to_us(mach_absolute_time() - t0);
++	return true;
++}
++
++void
++HuskyDisplay::dsimTimers(uint32_t urun, uint32_t te1)
++{
++	fDsim[DSIM_UNDERRUN_CTRL / 4] = (fDsim[DSIM_UNDERRUN_CTRL / 4] & ~0xFFFFu) | (urun & 0xFFFF);
++	fDsim[DSIM_CMD_TE_CTRL1 / 4] = te1;
++}
++
++void
++HuskyDisplay::requestFrame(uint64_t pa)
++{
++	IOInterruptState st = IOSimpleLockLockDisableInterrupt(fDispLock);
++	programFlip(pa);
++	IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
++}
++
++/* Waits for n TE edges, at most 100 ms. */
++void
++HuskyDisplay::teSkip(uint32_t n)
++{
++	uint32_t s0 = teSample();
++	uint64_t t0 = mach_absolute_time();
++	uint64_t span = hd_us_to_abs(100000);
++
++	while (teDelta(teSample(), s0) < n && mach_absolute_time() - t0 < span) {
++		IOSleep(1);
++		if (!fIrqOn) {
++			pollNow();
++		}
++	}
++}
++
++/*
++ * No flip may be in flight while the trigger is masked and the DSIM timers
++ * change: wait for the shadow request to clear, then for a frame in
++ * transfer (5.9 ms of link time) to finish.
++ */
++bool
++HuskyDisplay::panelQuiesce(void)
++{
++	uint64_t t0 = mach_absolute_time();
++	uint64_t span = hd_us_to_abs(50000);
++
++	while (fDecon[DECON_SHD_REG_UP_REQ / 4] != 0) {
++		if (mach_absolute_time() - t0 > span) {
++			return false;
++		}
++		IOSleep(1);
++	}
++	IOSleep(10);
++	fDecon[DECON_TRIG_CON / 4] |= TRIG_MASK_DECON;
++	return true;
++}
++
++void
++HuskyDisplay::panelTo60(void)
++{
++	uint32_t us = 0;
++
++	if (!panelQuiesce() || !dsimSend(husky_dcs_60, sizeof(husky_dcs_60) / sizeof(husky_dcs_60[0]), &us)) {
++		HUSKY_DISP_LOG("HUSKY DISP: panel revert to 60Hz failed\n");
++	}
++	dsimTimers(HD_URUN_60, HD_TE1_60);
++	teSkip(2);
++	fDecon[DECON_TRIG_CON / 4] &= ~TRIG_MASK_DECON;
++	requestFrame(fSplashPA);
++}
++
++void
++HuskyDisplay::panelTo120(void)
++{
++	uint32_t period = 0, us = 0;
++
++	if (fHz == 60) {
++		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz skipped (huskydisp_hz=60)\n");
++		return;
++	}
++	if (!fTeRise && !fHwCnt) {
++		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz skipped (no TE to verify the switch)\n");
++		return;
++	}
++	fTeHz = teWait(250, &period) * 4;
++	HUSKY_DISP_LOG("HUSKY DISP: panel te %u Hz before switch\n", fTeHz);
++	if (fTeHz >= 115 && fTeHz <= 125) {
++		fPeriodUS = 8333;
++		return;
++	}
++	if (fDsimUrun != HD_URUN_60 || fDsimTe1 != HD_TE1_60) {
++		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz skipped (dsim-timers urun %04x te1 %08x)\n", fDsimUrun,
++		    fDsimTe1);
++		return;
++	}
++	if (!panelQuiesce()) {
++		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz skipped (quiesce)\n");
++		return;
++	}
++	if (!dsimSend(husky_dcs_120, sizeof(husky_dcs_120) / sizeof(husky_dcs_120[0]), &us)) {
++		fDecon[DECON_TRIG_CON / 4] &= ~TRIG_MASK_DECON;
++		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz FAILED (dcs-timeout), staying at 60\n");
++		return;
++	}
++	HUSKY_DISP_LOG("HUSKY DISP: dcs %u pkts drained in %u us\n",
++	    (uint32_t)(sizeof(husky_dcs_120) / sizeof(husky_dcs_120[0])), us);
++
++	uint32_t urun = fDsim[DSIM_UNDERRUN_CTRL / 4] & 0xFFFF;
++	uint32_t te1 = fDsim[DSIM_CMD_TE_CTRL1 / 4];
++	if (urun == HD_URUN_60 && te1 == HD_TE1_60) {
++		dsimTimers(HD_URUN_120, HD_TE1_120);
++	} else if (urun != HD_URUN_120 || te1 != HD_TE1_120) {
++		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz FAILED (dsim-timers urun %04x te1 %08x), reverting\n", urun,
++		    te1);
++		panelTo60();
++		return;
++	}
++	HUSKY_DISP_LOG("HUSKY DISP: dsim urun %04x->%04x te1 %08x->%08x\n", urun,
++	    fDsim[DSIM_UNDERRUN_CTRL / 4] & 0xFFFF, te1, fDsim[DSIM_CMD_TE_CTRL1 / 4]);
++
++	teSkip(2);
++	fDecon[DECON_TRIG_CON / 4] &= ~TRIG_MASK_DECON;
++	requestFrame(fSplashPA);
++	uint32_t edges = teWait(250, &period);
++	if (edges >= 28 && edges <= 32) {
++		fPeriodUS = period != 0 ? period : 8333;
++		fHz = 120;
++		HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz ok period %u us\n", fPeriodUS);
++		return;
++	}
++	panelTo60();
++	HUSKY_DISP_LOG("HUSKY DISP: panel 120Hz FAILED (te %u/250ms), reverted to 60\n", edges);
++}
++
++/* ---- flip engine (fDispLock held unless noted) ---- */
++
++void
++HuskyDisplay::programFlip(uint64_t pa)
++{
++	fRdma[RDMA_BASEADDR_Y8 / 4] = (uint32_t)pa;
++	__builtin_arm_dsb(DSB_SY);
++	fDecon[DECON_GLOBAL_CON / 4] |= 0x3;
++	/*
++	 * 0x80003FFF (global + windows 0..13) is the value that moves a frame on
++	 * silicon; the CAL's FOR_DECON covers only windows 0..5.
++	 */
++	fDecon[DECON_SHD_REG_UP_REQ / 4] = SHD_REQUEST;
++}
++
++void
++HuskyDisplay::arm(HuskySurface *s, uint64_t pa, uint32_t swapID)
++{
++	fFlipSeq++;
++	fArmed.surf = s;
++	fArmed.pa = pa;
++	fArmed.swapID = swapID;
++	fArmed.seq = fFlipSeq;
++	fArmed.tArm = mach_absolute_time();
++	fArmed.tLatch = fArmed.tDone = 0;
++	fArmed.retried = false;
++	fFlips++;
++	if (fInject == 1 && fFlipSeq == 100) {
++		return;
++	}
++	if (fInject == 2 && fFlipSeq == 200) {
++		fErr |= ERR_RDMA;
++		fErrArg = 0;
++		fErrInject = true;
++	}
++	programFlip(pa);
++}
++
++/* Thread context. True when s is armed for scanout; false when the engine left direct mode. */
++bool
++HuskyDisplay::armWait(HuskySurface *s, uint64_t pa, uint32_t swapID)
++{
++	uint64_t deadline;
++	bool waited = false;
++
++	clock_interval_to_deadline(HD_ARM_TIMEOUT_MS, NSEC_PER_MSEC, &deadline);
++	IOLockLock(fWaitLock);
++	for (;;) {
++		IOInterruptState st = IOSimpleLockLockDisableInterrupt(fDispLock);
++		if (fMode != kModeDirect) {
++			IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
++			IOLockUnlock(fWaitLock);
++			return false;
++		}
++		if (fArmed.surf == NULL) {
++			if (fScanning.surf == s && s != fSplash) {
++				fReuse++;
++			}
++			s->retain();
++			arm(s, pa, swapID);
++			IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
++			IOLockUnlock(fWaitLock);
++			startPoll();
++			return true;
++		}
++		if (!waited) {
++			waited = true;
++			fArmWaits++;
++		}
++		IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
++		if (IOLockSleepDeadline(fWaitLock, &fArmed, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
++			IOLockUnlock(fWaitLock);
++			fallback("armed-timeout");
++			return false;
++		}
++	}
++}
++
++void
++HuskyDisplay::startPoll(void)
++{
++	if (!fIrqOn) {
++		fPoll->setTimeoutUS(HD_POLL_US);
++	}
++}
++
++void
++HuskyDisplay::retire(struct husky_flip *f)
++{
++	if (f->surf == NULL) {
++		return;
++	}
++	if (fRingCount == sizeof(fRing) / sizeof(fRing[0])) {
++		/* The retain cannot be dropped here; the slot stays held. */
++		fRingOverflow++;
++		fErr |= ERR_RING;
++		fErrSeen |= ERR_RING;
++	} else {
++		fRing[(fRingHead + fRingCount) % (sizeof(fRing) / sizeof(fRing[0]))] = *f;
++		fRingCount++;
++	}
++	f->surf = NULL;
++	fWakeSlots = true;
++}
++
++/*
++ * The RDMA shadow bank at +0x400 holds the base the DECON latched for this
++ * frame; reading it ties the bookkeeping to what the hardware took, not to
++ * what was requested.
++ */
++void
++HuskyDisplay::onFrameStart(void)
++{
++	fDecon[DECON_INT_PEND / 4] = INT_FRAME_START;
++	fFs++;
++	if (fScanning.surf != NULL) {
++		fFdMissed++;
++		fScanning.tDone = mach_absolute_time();
++		retire(&fScanning);
++	}
++	if (fArmed.surf == NULL) {
++		fFsOrphan++;
++		return;
++	}
++	uint32_t sbase = fRdma[(RDMA_SHADOW + RDMA_BASEADDR_Y8) / 4];
++	if (sbase == (uint32_t)fArmed.pa) {
++		fArmed.tLatch = mach_absolute_time();
++		fScanning = fArmed;
++		fArmed.surf = NULL;
++		fMismRun = 0;
++		fWakeSlots = true;
++	} else {
++		fMism++;
++		fMismRun++;
++		if (fMismRun == 1) {
++			fMismSBase0 = sbase;
++			fMismSame = true;
++		} else if (sbase != fMismSBase0) {
++			fMismSame = false;
++		}
++		fMismNew = true;
++		fMismSBase = sbase;
++		fMismArmed = (uint32_t)fArmed.pa;
++		if (fMismRun > 8) {
++			fErr |= ERR_MISM;
++			fErrSeen |= ERR_MISM;
++		}
++	}
++}
++
++void
++HuskyDisplay::onFrameDone(void)
++{
++	fDecon[DECON_INT_PEND / 4] = INT_FRAME_DONE;
++	fFd++;
++	if (fScanning.surf == NULL) {
++		fFdSpurious++;
++		return;
++	}
++	fScanning.tDone = mach_absolute_time();
++	retire(&fScanning);
++}
++
++void
++HuskyDisplay::onExtra(void)
++{
++	uint32_t seen = fDecon[DECON_INT_PEND_EXTRA / 4] & EXTRA_ALL;
++
++	fDecon[DECON_INT_PEND_EXTRA / 4] = seen;
++	fDecon[DECON_INT_PEND / 4] = INT_EXTRA;
++	if (seen & EXTRA_TE_RISE) {
++		fTeCount++;
++		fTeTime = mach_absolute_time();
++	}
++	if (seen & (EXTRA_TIME_OUT | EXTRA_RES_CONFLICT)) {
++		fErr |= ERR_DECON;
++		fErrArg = seen;
++		fErrSeen |= ERR_DECON;
++	}
++}
++
++void
++HuskyDisplay::onRdma(void)
++{
++	uint32_t v = fRdma[RDMA_IRQ / 4];
++	uint32_t pend = v & RDMA_IRQ_PEND;
++
++	fRdma[RDMA_IRQ / 4] = v;
++	if (pend & (RDMA_IRQ_DEADLOCK | RDMA_IRQ_CONFIG_ERR)) {
++		fErr |= ERR_RDMA;
++		fErrArg = pend >> 16;
++		fErrSeen |= ERR_RDMA;
++	}
++}
++
++void
++HuskyDisplay::servicePoll(void)
++{
++	if (fDecon[DECON_INT_PEND_EXTRA / 4] & EXTRA_ALL) {
++		onExtra();
++	}
++	uint32_t p = fDecon[DECON_INT_PEND / 4];
++	if (p & INT_FRAME_DONE) {
++		onFrameDone();
++	}
++	if (p & INT_FRAME_START) {
++		onFrameStart();
++	}
++	if (fRdma[RDMA_IRQ / 4] & (RDMA_IRQ_DEADLOCK | RDMA_IRQ_CONFIG_ERR)) {
++		onRdma();
++	}
++}
++
++void
++HuskyDisplay::irq(uint32_t)
++{
++	IOSimpleLockLock(fDispLock);
++	uint32_t p = fDecon[DECON_INT_PEND / 4];
++	bool handled = false;
++
++	if ((p & INT_EXTRA) || (fDecon[DECON_INT_PEND_EXTRA / 4] & EXTRA_ALL)) {
++		onExtra();
++		handled = true;
++	}
++	if (p & INT_FRAME_DONE) {
++		onFrameDone();
++		handled = true;
++	}
++	if (p & INT_FRAME_START) {
++		onFrameStart();
++		handled = true;
++	}
++	if (fRdma[RDMA_IRQ / 4] & RDMA_IRQ_PEND) {
++		onRdma();
++		handled = true;
++	}
++	if (!handled) {
++		fIrqSpur++;
++		IOSimpleLockUnlock(fDispLock);
++		return;
++	}
++	/* The W1C acks are posted and the SPIs are level: read back so the lines are low before EOI. */
++	(void)fDecon[DECON_INT_PEND / 4];
++	(void)fRdma[RDMA_IRQ / 4];
++	IOSimpleLockUnlock(fDispLock);
++	__builtin_arm_dsb(DSB_SY);
++	fEvent->signal();
++}
++
++/* ---- swap interface (thread context) ---- */
++
++void
++HuskyDisplay::noteSwap(HuskySurface *s)
++{
++	if (fLevel < 2) {
++		return;
++	}
++	uint32_t n = (uint32_t)OSIncrementAtomic((volatile SInt32 *)&fSwapStats) + 1;
++	if (s != NULL && s->scanoutSlot >= 0) {
++		fSwapPool++;
++	} else {
++		fSwapNonPool++;
++	}
++	if (s != NULL) {
++		bool seen = false;
++		for (uint32_t i = 0; i < fDistinctN; i++) {
++			seen = seen || fDistinct[i] == s->id;
++		}
++		if (!seen && fDistinctN < sizeof(fDistinct) / sizeof(fDistinct[0])) {
++			fDistinct[fDistinctN++] = s->id;
++		}
++	}
++	if (n == 300 || n % 3000 == 0) {
++		HUSKY_DISP_LOG("HUSKY DISP: swap stats n=%u pool=%u nonpool=%u distinct=%u\n", n, fSwapPool,
++		    fSwapNonPool, fDistinctN);
++	}
++}
++
++bool
++HuskyDisplay::gpuWritten(HuskySurface *s)
++{
++	uint32_t seed = s->seed();
++	bool gpu = seed == s->scanoutSeed;
++
++	s->scanoutSeed = seed;
++	return gpu;
++}
++
++bool
++HuskyDisplay::swapDirect(HuskySurface *s, uint32_t swapID)
++{
++	/* The seed counts read-write unlocks: CPU-written pixels sit in the cache and must reach the DPU. */
++	if (!gpuWritten(s)) {
++		husky_dcache_clean((vm_offset_t)s->scanoutKVA, fFrameBytes);
++	}
++	return armWait(s, s->scanoutPA, swapID);
++}
++
++/* Both slots empty before the CPU writes the splash: the DPU may be reading it. */
++void
++HuskyDisplay::copyBegin(void)
++{
++	uint64_t deadline;
++
++	if (fMode != kModeDirect) {
++		return;
++	}
++	clock_interval_to_deadline(HD_ARM_TIMEOUT_MS, NSEC_PER_MSEC, &deadline);
++	IOLockLock(fWaitLock);
++	for (;;) {
++		IOInterruptState st = IOSimpleLockLockDisableInterrupt(fDispLock);
++		bool idle = fMode != kModeDirect || (fArmed.surf == NULL && fScanning.surf == NULL);
++		IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
++		if (idle) {
++			break;
++		}
++		if (IOLockSleepDeadline(fWaitLock, &fArmed, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
++			IOLockUnlock(fWaitLock);
++			fallback("armed-timeout");
++			return;
++		}
++	}
++	IOLockUnlock(fWaitLock);
++}
++
++void
++HuskyDisplay::copyEnd(uint32_t swapID)
++{
++	uint32_t mode = fMode;
++
++	if (mode == kModeDirect || mode == kModeFallback) {
++		OSIncrementAtomic((volatile SInt32 *)&fCopies);
++	}
++	if (mode == kModeDirect) {
++		if (armWait(fSplash, fSplashPA, swapID)) {
++			return;
++		}
++		mode = fMode;
++	}
++	if (mode == kModeFallback) {
++		husky_fb_kick();
++		markRetired(swapID);
++	} else if (mode == kModeBringup) {
++		markRetired(swapID);
++	}
++}
++
++void
++HuskyDisplay::markRetired(uint32_t swapID)
++{
++	IOLockLock(fWaitLock);
++	if (swapID > fRetiredSwapID) {
++		fRetiredSwapID = swapID;
++	}
++	IOLockWakeup(fWaitLock, &fRetiredSwapID, false);
++	IOLockWakeup(fWaitLock, &fArmed, false);
++	IOLockUnlock(fWaitLock);
++}
++
++/*
++ * sel 6 is shared by _kern_SwapWait and _kern_SwapWaitWithTimeout; until the
++ * scalar order is confirmed from the userland disassembly, in[0] is the swap
++ * id and in[1], when present, a timeout in ms, capped at 100 ms. The first 32
++ * calls are logged to settle it.
++ */
++IOReturn
++HuskyDisplay::swapWait(uint32_t inCount, const uint64_t *in, uint32_t maxSwapID)
++{
++	if (fLevel >= 2 && fSwapWaitLogged < 32) {
++		fSwapWaitLogged++;
++		HUSKY_DISP_LOG("HUSKY DISP: swapwait in=%u [%llx %llx %llx %llx]\n", inCount, inCount > 0 ? in[0] : 0,
++		    inCount > 1 ? in[1] : 0, inCount > 2 ? in[2] : 0, inCount > 3 ? in[3] : 0);
++	}
++	if (fMode != kModeDirect || inCount < 1) {
++		return kIOReturnSuccess;
++	}
++	uint32_t id = (uint32_t)in[0];
++	uint64_t timeout = 100;
++	uint64_t deadline;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (id > maxSwapID) {
++		return kIOReturnBadArgument;
++	}
++	if (inCount > 1 && in[1] < timeout) {
++		timeout = in[1];
++	}
++	clock_interval_to_deadline((uint32_t)timeout, NSEC_PER_MSEC, &deadline);
++	IOLockLock(fWaitLock);
++	while (fRetiredSwapID < id && fMode == kModeDirect) {
++		if (IOLockSleepDeadline(fWaitLock, &fRetiredSwapID, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
++			ret = fRetiredSwapID >= id ? kIOReturnSuccess : kIOReturnTimeout;
++			break;
++		}
++	}
++	IOLockUnlock(fWaitLock);
++	return ret;
++}
++
++/* ---- work loop ---- */
++
++/* Everything that sleeps, messages, or releases: never from the interrupt. */
++bool
++HuskyDisplay::doWork(void)
++{
++	struct husky_flip done[8];
++	uint32_t nDone = 0, err, errArg, te, mismArmed = 0, mismSBase = 0, src;
++	uint32_t period;
++	uint64_t teT;
++	bool wake, dirty, wantTimer, inject, mism, announce, mismSame;
++
++	IOInterruptState st = IOSimpleLockLockDisableInterrupt(fDispLock);
++	while (fRingCount > 0) {
++		done[nDone++] = fRing[fRingHead];
++		fRingHead = (fRingHead + 1) % (sizeof(fRing) / sizeof(fRing[0]));
++		fRingCount--;
++	}
++	wake = fWakeSlots;
++	fWakeSlots = false;
++	te = fTeCount;
++	teT = fTeTime;
++	src = fVsyncSrc;
++	err = fErr;
++	errArg = fErrArg;
++	inject = fErrInject;
++	fErr = 0;
++	fErrInject = false;
++	mism = fMismNew;
++	mismSame = fMismSame;
++	if (mism) {
++		mismArmed = fMismArmed;
++		mismSBase = fMismSBase;
++		fMismNew = false;
++	}
++	dirty = fVsyncDirty;
++	wantTimer = fWantTimer;
++	period = fWantPeriodUS;
++	fVsyncDirty = false;
++	announce = fFallbackPending;
++	fFallbackPending = false;
++	IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
++
++	uint32_t maxID = 0;
++	for (uint32_t i = 0; i < nDone; i++) {
++		struct husky_flip *f = &done[i];
++		if (f->tLatch != 0 && f->tDone != 0 && (f->seq <= 32 || f->seq % 512 == 0)) {
++			HUSKY_DISP_LOG("HUSKY DISP: flip #%u sid %u pa %08x latch %u us xfer %u us\n", f->seq, f->swapID,
++			    (uint32_t)f->pa, hd_abs_to_us(f->tLatch - f->tArm), hd_abs_to_us(f->tDone - f->tLatch));
++		}
++		maxID = f->swapID > maxID ? f->swapID : maxID;
++		f->surf->release();
++	}
++	if (nDone != 0) {
++		markRetired(maxID);
++	} else if (wake) {
++		IOLockLock(fWaitLock);
++		IOLockWakeup(fWaitLock, &fArmed, false);
++		IOLockUnlock(fWaitLock);
++	}
++	if (mism && fMism <= 8) {
++		HUSKY_DISP_LOG("HUSKY DISP: latch mismatch armed %08x latched %08x\n", mismArmed, mismSBase);
++	}
++	if (dirty) {
++		fOps.vsyncTimer(fCtx, wantTimer, period);
++	}
++	if ((src == kVsyncTE) && te != fTeSent) {
++		uint32_t delta = te - fTeSent;
++		fTeSent = te;
++		fDrops += delta - 1;
++		fOps.vsync(fCtx, delta, teT);
++	}
++	if (announce) {
++		HUSKY_DISP_LOG("HUSKY DISP: fallback (%s) -> copy mode\n", fFallbackMsg);
++	}
++	if (err != 0) {
++		char why[40];
++		if ((err & ERR_RDMA) && inject) {
++			snprintf(why, sizeof(why), "rdma-err inject");
++		} else if (err & ERR_RDMA) {
++			snprintf(why, sizeof(why), "rdma-err %x", errArg);
++		} else if (err & ERR_DECON) {
++			snprintf(why, sizeof(why), "decon-err %x", errArg);
++		} else if ((err & ERR_MISM) && mismSame) {
++			snprintf(why, sizeof(why), "rdma-shadow");
++		} else if (err & ERR_MISM) {
++			snprintf(why, sizeof(why), "latch-mismatch");
++		} else {
++			snprintf(why, sizeof(why), "ring-full");
++		}
++		fallback(why);
++	}
++	return false;
++}
++
++/*
++ * Sticky for the boot: the display returns to the CPU copy into the splash,
++ * so its state is deterministic and cannot flap. Thread context.
++ */
++void
++HuskyDisplay::fallback(const char *reason)
++{
++	IOInterruptState st = IOSimpleLockLockDisableInterrupt(fDispLock);
++	if (fMode != kModeDirect && fMode != kModeBringup) {
++		IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
++		return;
++	}
++	fMode = kModeFallback;
++	bool teIrq = fIrqOn && fTeRise;
++	fDecon[DECON_INT_EN / 4] = teIrq ? (INT_EN_MASTER | INT_EXTRA) : 0;
++	fDecon[DECON_INT_EN_EXTRA / 4] = teIrq ? EXTRA_TE_RISE : 0;
++	fRdma[RDMA_IRQ / 4] = ((fRdma[RDMA_IRQ / 4] & ~(RDMA_IRQ_EN | RDMA_IRQ_PEND)) | RDMA_IRQ_ALL_MASK) | RDMA_IRQ_PEND;
++	retire(&fArmed);
++	retire(&fScanning);
++	programFlip(fSplashPA);
++	husky_disp_direct = 0;
++	snprintf(fFallbackMsg, sizeof(fFallbackMsg), "%s", reason);
++	fFallbackPending = true;
++	fWakeSlots = true;
++	IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
++
++	IOLockLock(fWaitLock);
++	IOLockWakeup(fWaitLock, &fArmed, false);
++	IOLockWakeup(fWaitLock, &fRetiredSwapID, false);
++	IOLockUnlock(fWaitLock);
++	pickVsync(false);
++	fEvent->signal();
++}
++
++/* ---- timers ---- */
++
++void
++HuskyDisplay::watchFired(OSObject *owner, IOTimerEventSource *)
++{
++	((HuskyDisplay *)owner)->watch();
++}
++
++void
++HuskyDisplay::pollFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	HuskyDisplay *d = (HuskyDisplay *)owner;
++	bool again = false;
++
++	if (d->fVsyncSrc == kVsyncHWCnt) {
++		uint32_t cnt = d->hwTe();
++		if (cnt != d->fHwCntLast) {
++			uint32_t delta = (cnt - d->fHwCntLast) & 0xFFFF;
++			d->fHwCntLast = cnt;
++			d->fOps.vsync(d->fCtx, delta, mach_absolute_time());
++		}
++		again = true;
++	}
++	bool inFlight = false;
++	if (d->fMode == kModeDirect && !d->fIrqOn) {
++		IOInterruptState st = IOSimpleLockLockDisableInterrupt(d->fDispLock);
++		d->servicePoll();
++		inFlight = d->fArmed.surf != NULL || d->fScanning.surf != NULL;
++		IOSimpleLockUnlockEnableInterrupt(d->fDispLock, st);
++		d->doWork();
++	}
++	if (inFlight) {
++		sender->setTimeoutUS(HD_POLL_US);
++	} else if (again) {
++		sender->setTimeoutUS(d->fPeriodUS / 4 > 1000 ? d->fPeriodUS / 4 : 1000);
++	}
++}
++
++void
++HuskyDisplay::watch(void)
++{
++	char reason[32] = "";
++	uint32_t latchRetryPA = 0;
++	bool retried = false;
++	uint64_t now = mach_absolute_time();
++
++	IOInterruptState st = IOSimpleLockLockDisableInterrupt(fDispLock);
++	if (fMode == kModeDirect) {
++		if (!fIrqOn) {
++			servicePoll();
++		}
++		if (fArmed.surf != NULL && now - fArmed.tArm > hd_us_to_abs(3 * (uint64_t)fPeriodUS + 2000)) {
++			if (!fArmed.retried) {
++				fArmed.retried = true;
++				fArmed.tArm = now;
++				latchRetryPA = (uint32_t)fArmed.pa;
++				retried = true;
++				programFlip(fArmed.pa);
++			} else {
++				snprintf(reason, sizeof(reason), fMismRun != 0 ? "rdma-shadow" : "latch-timeout");
++			}
++		}
++		if (reason[0] == '\0' && fScanning.surf != NULL && now - fScanning.tLatch > hd_us_to_abs(HD_XFER_TIMEOUT_US)) {
++			snprintf(reason, sizeof(reason), "xfer-timeout");
++		}
++		if (reason[0] == '\0' && fTeRise && now - fTeTime > hd_us_to_abs(HD_TE_LOST_US)) {
++			snprintf(reason, sizeof(reason), "te-lost");
++		}
++		if (fLevel >= 5 && (fDsim[DSIM_INTSRC / 4] & DSIM_INT_UNDER_RUN)) {
++			fDsim[DSIM_INTSRC / 4] = DSIM_INT_UNDER_RUN;
++			fDsimUnder++;
++		}
++	}
++	IOSimpleLockUnlockEnableInterrupt(fDispLock, st);
++
++	if (retried) {
++		HUSKY_DISP_LOG("HUSKY DISP: latch-timeout retry pa %08x\n", latchRetryPA);
++	}
++	if (reason[0] != '\0') {
++		fallback(reason);
++	}
++	if (fMode == kModeDirect || fMode == kModeFallback) {
++		doWork();
++		if (++fWatchTick % HD_STATS_TICKS == 0) {
++			stats();
++		}
++		fWatch->setTimeoutMS(HD_WATCH_MS);
++	}
++}
++
++void
++HuskyDisplay::stats(void)
++{
++	HUSKY_DISP_LOG("HUSKY DISP: stats te=%u fs=%u fd=%u flips=%u copies=%u mism=%u reuse=%u drops=%u "
++	    "under=%u err=%x orphfs=%u spurfd=%u missfd=%u armwait=%u ringovf=%u spurirq=%u\n", fTeCount, fFs, fFd, fFlips,
++	    fCopies, fMism, fReuse, fDrops, fDsimUnder, fErrSeen, fFsOrphan, fFdSpurious, fFdMissed, fArmWaits,
++	    fRingOverflow, fIrqSpur);
++}
++#endif /* HUSKY */
+diff --git a/iokit/Kernel/arm/HuskyDisplay.h b/iokit/Kernel/arm/HuskyDisplay.h
+new file mode 100644
+index 0000000..6c49042
+--- /dev/null
++++ b/iokit/Kernel/arm/HuskyDisplay.h
+@@ -0,0 +1,196 @@
++/*
++ * Display engine for HUSKY (see HuskyDisplay.cpp): scans CoreAnimation's
++ * IOSurfaces out of the scanout pool through DECON0/DPP0 without a CPU copy,
++ * paces vsync from the panel's TE, and switches the panel to 120 Hz.
++ *
++ * Owned by AppleCLCD (HuskyFramebuffer.cpp). Everything is behind the
++ * huskydisp=N boot-arg; with N absent or 0 no instance exists.
++ */
++#ifndef _HUSKY_DISPLAY_H
++#define _HUSKY_DISPLAY_H
++
++#include "HuskySurface.h"
++
++#if defined(HUSKY)
++#include <IOKit/IOEventSource.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOWorkLoop.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++
++/* Lines that must survive a hang: msgbuf and the persistent log. */
++#define HUSKY_DISP_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
++
++extern "C" {
++extern volatile int husky_disp_direct;          /* pe_serial.c: console must not kick */
++extern volatile uint32_t husky_disp_splash_pa;
++extern volatile uint32_t *husky_rdma0;
++void husky_fb_kick(void);
++}
++
++/* Entry points into AppleCLCD; always called on its work loop. */
++struct HuskyDisplayOps {
++	/* edges TE edges since the previous call, time = mach_absolute_time of the latest */
++	void (*vsync)(void *ctx, uint32_t edges, uint64_t time);
++	/* start or stop the software vsync timer */
++	void (*vsyncTimer)(void *ctx, bool run, uint32_t periodUS);
++};
++
++/* One display swap owned by the engine. */
++struct husky_flip {
++	HuskySurface *surf;                     /* NULL: slot empty */
++	uint64_t      pa;
++	uint32_t      swapID;
++	uint32_t      seq;
++	uint64_t      tArm, tLatch, tDone;      /* mach_absolute_time */
++	bool          retried;
++};
++
++class HuskyDispEventSource;
++
++class HuskyDisplay : public OSObject {
++	OSDeclareDefaultStructors(HuskyDisplay);
++	friend class HuskyDispEventSource;
++
++public:
++	enum {
++		kModeCopy,                      /* today's behavior */
++		kModeBringup,                   /* engine thread owns DECON0; swaps copy silently */
++		kModeDirect,
++		kModeFallback,
++	};
++	enum {
++		kVsyncTimer,
++		kVsyncTE,
++		kVsyncHWCnt,
++	};
++
++	/* huskydisp, 0 when absent. */
++	static uint32_t level(void);
++
++	/* NULL when huskydisp is 0 or the register windows cannot be mapped. */
++	static HuskyDisplay *create(IOWorkLoop *loop, uint64_t splashPA, uint32_t width, uint32_t height,
++	    uint32_t rowBytes, HuskySurface *splash, const HuskyDisplayOps *ops, void *ctx);
++
++	void free() APPLE_KEXT_OVERRIDE;
++
++	bool direct(void) { return fMode == kModeDirect; }
++	void noteSwap(HuskySurface *s);
++	/* No read-write unlock since the surface's previous presentation: the GPU wrote it. */
++	bool gpuWritten(HuskySurface *s);
++	/* True when the swap is armed for scanout; s stays owned by the caller. */
++	bool swapDirect(HuskySurface *s, uint32_t swapID);
++	void copyBegin(void);
++	void copyEnd(uint32_t swapID);
++	IOReturn swapWait(uint32_t inCount, const uint64_t *in, uint32_t maxSwapID);
++
++	/* GIC SPI handler, interrupt context. */
++	void irq(uint32_t intid);
++
++private:
++	IOWorkLoop            *fLoop;
++	HuskyDispEventSource  *fEvent;
++	IOTimerEventSource    *fWatch;          /* 20 ms watchdog */
++	IOTimerEventSource    *fPoll;           /* 250 us DECON poll, HW_TE_CNT vsync */
++	HuskyDisplayOps        fOps;
++	void                  *fCtx;
++	HuskySurface          *fSplash;
++	uint64_t               fSplashPA;
++	uint32_t               fWidth, fHeight, fRowBytes, fFrameBytes;
++	uint32_t               fLevel, fHz, fInject;
++
++	volatile uint32_t *fDecon;
++	volatile uint32_t *fWin;
++	volatile uint32_t *fWinCon;
++	volatile uint32_t *fRdma;
++	volatile uint32_t *fDsim;
++	volatile uint32_t *fSysmmu;
++
++	/* fDispLock: spin, thread side takes it with interrupts disabled. Order: fWaitLock, then fDispLock. */
++	IOSimpleLock *fDispLock;
++	IOLock       *fWaitLock;                /* sleeps on &fArmed and &fRetiredSwapID */
++	volatile uint32_t fMode;
++	volatile uint32_t fVsyncSrc;
++
++	struct husky_flip fArmed, fScanning;
++	struct husky_flip fRing[8];
++	uint32_t fRingHead, fRingCount;
++	uint32_t fFlipSeq;
++	bool     fWakeSlots;                    /* a latch or retire happened since doWork last ran */
++	uint32_t fErr, fErrArg, fErrSeen;
++	bool     fErrInject;
++	uint32_t fMismRun, fMismArmed, fMismSBase, fMismSBase0;
++	bool     fMismNew, fMismSame;
++
++	volatile uint32_t fTeCount;
++	volatile uint64_t fTeTime;
++	uint32_t fTeSent, fDrops;
++	uint32_t fFs, fFd, fFdSpurious, fFsOrphan, fFdMissed, fIrqSpur;
++	uint32_t fFlips, fCopies, fMism, fReuse, fArmWaits, fRingOverflow;
++	uint32_t fDsimUnder;
++
++	uint32_t fRetiredSwapID;                /* fWaitLock */
++
++	bool     fPoolOK, fProbeOK;
++	bool     fIrqOK, fIrqOn;
++	bool     fTeRise, fHwCnt;               /* TE_RISE latches; HW_TE_CNT counts */
++	uint32_t fPeriodUS;
++	uint32_t fTeHz;
++	uint32_t fDsimUrun, fDsimTe1;           /* ABL's values, probed */
++	uint32_t fWatchTick;
++	uint32_t fHwCntLast;
++	uint32_t fHwShift;                      /* HW_TE_CNT field that counts TE: 0 = CNT_A, 16 = CNT_B */
++	bool     fVsyncDirty, fWantTimer;
++	uint32_t fWantPeriodUS;
++	char     fFallbackMsg[64];
++	bool     fFallbackPending;
++
++	uint32_t fSwapStats, fSwapPool, fSwapNonPool, fDistinctN;
++	uint32_t fDistinct[16];
++	uint32_t fSwapWaitLogged;
++
++	static void watchFired(OSObject *owner, IOTimerEventSource *sender);
++	static void pollFired(OSObject *owner, IOTimerEventSource *sender);
++	static void bringupEntry(void *arg, wait_result_t wr);
++
++	bool setup(void);
++	void probe(void);
++	bool allocPool(void);
++	void bringup(void);
++	bool teMeasure(uint32_t ms, uint32_t *edges, uint32_t *hw0, uint32_t *hw1);
++	uint32_t teWait(uint32_t ms, uint32_t *periodUS);
++	uint32_t hwTe(void);
++	uint32_t teDelta(uint32_t cur, uint32_t last);
++	uint32_t teSample(void);
++	void teSkip(uint32_t n);
++	void enableDecon(void);
++	bool irqOn(void);
++	void pickVsync(bool measure);
++	void panelTo120(void);
++	void panelTo60(void);
++	bool panelQuiesce(void);
++	bool dsimSend(const void *packets, uint32_t count, uint32_t *drainedUS);
++	void dsimTimers(uint32_t urun, uint32_t te1);
++	void requestFrame(uint64_t pa);
++
++	void programFlip(uint64_t pa);
++	void arm(HuskySurface *s, uint64_t pa, uint32_t swapID);
++	bool armWait(HuskySurface *s, uint64_t pa, uint32_t swapID);
++	void startPoll(void);
++	void retire(struct husky_flip *f);
++	void onFrameStart(void);
++	void onFrameDone(void);
++	void onExtra(void);
++	void onRdma(void);
++	void servicePoll(void);
++	void pollNow(void);
++	void fallback(const char *reason);
++	void markRetired(uint32_t swapID);
++	bool doWork(void);
++	void watch(void);
++	void stats(void);
++};
++
++#endif /* HUSKY */
++#endif /* _HUSKY_DISPLAY_H */
+diff --git a/iokit/Kernel/arm/HuskyFramebuffer.cpp b/iokit/Kernel/arm/HuskyFramebuffer.cpp
+index e9a97f6..cfa52eb 100644
+--- a/iokit/Kernel/arm/HuskyFramebuffer.cpp
++++ b/iokit/Kernel/arm/HuskyFramebuffer.cpp
+@@ -1,28 +1,36 @@
+ /*
+  * Built-in IOMobileFramebuffer for HUSKY: the ABL's continuous-splash
+- * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
+- * itself) as the main display, driven by CoreAnimation's CPU renderer.
++ * framebuffer (1344x2992 BGRA8888 in RAM at the address the DPP0 RDMA reads,
++ * 5376 bytes per row; the DSI command-mode panel keeps its last frame and the
++ * DECON sends a new one per shadow-update request) as the main display,
++ * driven by CoreAnimation.
+  *
+  * IOMobileFramebuffer.framework (iOS 16.7) counts /arm-io children with
+  * device_type "display-subsystem", waits for that many services matching
+  * IOServiceMatching("IOMobileFramebuffer"), opens each with type 0 and
+  * reads canvas-width/canvas-height from the service's provider. The class
+- * here (AppleCLCD, an IOMobileFramebuffer) matches the /arm-io/disp0 nub.
++ * here (AppleCLCD, an IOMobileFramebuffer) matches the "husky,display" nub
++ * (IONameMatch in KernelConfigTables.cpp).
+  *
+  * User client selectors used by CoreAnimation:
+  *   3  GetLayerDefaultSurface [layer, ?] -> [IOSurface port name]
+  *   4  SwapBegin -> [swap id]
+- *   5  SwapEnd, struct 0x46c: +0x50 swap id, +0x54 IOSurface id per layer
+- *      (4 layers), +0x64 rect a / +0xc4 rect b per layer (int x,y,w,h),
+- *      +0x104 enabled layer mask
++ *   5  SwapEnd, struct 0x588: +0x98 swap id, +0x9c IOSurface id per layer
++ *      (4 layers), +0xac rect a / +0x10c rect b per layer (int x,y,w,h),
++ *      +0x14c enabled layer mask
+  *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h], 18 IsMainDisplay,
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+  *
+  * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
+- * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+- * enabled it, through the port they registered (IOConnectSetNotificationPort).
++ * scaling, CPU copy). With boot-arg huskydisp=N (HuskyDisplay.cpp) a
++ * panel-sized surface from the scanout pool is instead scanned out in place,
++ * and SwapWait blocks until the swap has reached the panel. Vsync
++ * (notification type 5) sends (count, mach_absolute_time, 0) as 32-bit
++ * halves to clients that enabled it, through the port they registered
++ * (IOConnectSetNotificationPort): from the panel's TE edge when the display
++ * engine can count it, else from a 60 Hz software timer (16667 us, so
++ * 59.99 Hz).
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+@@ -30,6 +38,7 @@
+  * the first swap on (it still reaches the persistent log; panics draw).
+  */
+ #include "HuskySurface.h"
++#include "HuskyDisplay.h"
+ 
+ extern "C" int husky_console_muted;     /* osfmk/console/serial_console.c */
+ 
+@@ -83,10 +92,17 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
+ 	uint64_t            fVsyncCount;
++	uint32_t            fVsyncPeriodUS;
++	bool                fVsyncTimerRun;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	void sendVsync(uint64_t count, uint64_t time);
++	bool swapDirect(const uint8_t *rec, uint32_t mask, uint32_t swapID);
+ 
+ public:
++	static void dispVsync(void *ctx, uint32_t edges, uint64_t time);
++	static void dispTimer(void *ctx, bool run, uint32_t periodUS);
++
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+@@ -96,6 +112,7 @@ public:
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
++	HuskyDisplay *fDisp;            /* NULL unless huskydisp is set */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -107,6 +124,11 @@ public:
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++static const HuskyDisplayOps husky_fb_disp_ops = {
++	&AppleCLCD::dispVsync,
++	&AppleCLCD::dispTimer,
++};
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -226,6 +248,10 @@ AppleCLCD::start(IOService *provider)
+ 		return false;
+ 	}
+ 	fVsync->setTimeoutUS(HUSKY_FB_VSYNC_US);
++	fVsyncPeriodUS = HUSKY_FB_VSYNC_US;
++	fVsyncTimerRun = true;
++	fDisp = HuskyDisplay::create(fWorkLoop, fPhys, fWidth, fHeight, fRowBytes, fSurface,
++	    &husky_fb_disp_ops, this);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -249,25 +275,57 @@ AppleCLCD::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+ }
+ 
+ void
+-AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
++AppleCLCD::sendVsync(uint64_t count, uint64_t now)
+ {
+-	AppleCLCD *fb = (AppleCLCD *)owner;
+-	uint64_t now = mach_absolute_time();
+-	uint64_t count = ++fb->fVsyncCount;
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+ 		0, 0,
+ 	};
+ 
+-	IOLockLock(fb->fLock);
+-	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
++	IOLockLock(fLock);
++	for (unsigned int i = 0; i < fClients->getCount(); i++) {
+ 		IOMobileFramebufferUserClient *client =
+-		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
++		    (IOMobileFramebufferUserClient *)fClients->getObject(i);
+ 		client->notify(HUSKY_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+-	IOLockUnlock(fb->fLock);
+-	sender->setTimeoutUS(HUSKY_FB_VSYNC_US);
++	IOLockUnlock(fLock);
++}
++
++void
++AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++
++	if (!fb->fVsyncTimerRun) {
++		return;
++	}
++	fb->sendVsync(++fb->fVsyncCount, mach_absolute_time());
++	sender->setTimeoutUS(fb->fVsyncPeriodUS);
++}
++
++void
++AppleCLCD::dispVsync(void *ctx, uint32_t edges, uint64_t time)
++{
++	AppleCLCD *fb = (AppleCLCD *)ctx;
++
++	fb->fVsyncCount += edges;
++	fb->sendVsync(fb->fVsyncCount, time);
++}
++
++void
++AppleCLCD::dispTimer(void *ctx, bool run, uint32_t periodUS)
++{
++	AppleCLCD *fb = (AppleCLCD *)ctx;
++
++	fb->fVsyncPeriodUS = periodUS;
++	if (run && !fb->fVsyncTimerRun) {
++		fb->fVsyncTimerRun = true;
++		fb->fVsync->setTimeoutUS(periodUS);
++	} else if (!run && fb->fVsyncTimerRun) {
++		fb->fVsyncTimerRun = false;
++		fb->fVsync->cancelTimeout();
++	}
+ }
+ 
+ void
+@@ -299,6 +357,43 @@ get32(const uint8_t *p, uint32_t off)
+ 
+ static uint32_t husky_fb_swaps_logged;
+ 
++/*
++ * A swap of exactly one panel-sized pool surface, shown whole, is scanned out
++ * in place; anything else takes the copy below.
++ */
++bool
++AppleCLCD::swapDirect(const uint8_t *rec, uint32_t mask, uint32_t swapID)
++{
++	HuskySurface *s = NULL;
++	uint32_t layers = 0, layer = 0;
++	bool ok = false;
++
++	for (uint32_t i = 0; i < HUSKY_FB_LAYERS; i++) {
++		if ((mask & (1u << i)) && get32(rec, 0x9c + 4 * i) != 0) {
++			layers++;
++			layer = i;
++		}
++	}
++	if (layers == 1) {
++		s = husky_surface_copy(get32(rec, 0x9c + 4 * layer));
++	}
++	fDisp->noteSwap(s);
++	if (s != NULL && s != fSurface && s->scanoutSlot >= 0 && fDisp->direct()) {
++		const uint8_t *a = rec + 0xac + 16 * layer;
++		const uint8_t *b = rec + 0x10c + 16 * layer;
++		int32_t aw = (int32_t)get32(a, 8), ah = (int32_t)get32(a, 12);
++		int32_t bw = (int32_t)get32(b, 8), bh = (int32_t)get32(b, 12);
++		ok = get32(a, 0) == 0 && get32(a, 4) == 0 && get32(b, 0) == 0 && get32(b, 4) == 0 &&
++		    (aw <= 0 || aw == (int32_t)fWidth) && (ah <= 0 || ah == (int32_t)fHeight) &&
++		    (bw <= 0 || bw == (int32_t)fWidth) && (bh <= 0 || bh == (int32_t)fHeight);
++	}
++	if (ok) {
++		ok = fDisp->swapDirect(s, swapID);
++	}
++	OSSafeReleaseNULL(s);
++	return ok;
++}
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+@@ -322,6 +417,14 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	uint32_t swapID = get32(rec, 0x98);
++	if (fDisp != NULL) {
++		if (swapDirect(rec, mask, swapID)) {
++			return;
++		}
++		fDisp->copyBegin();
++	}
++
+ 	for (uint32_t layer = 0; layer < HUSKY_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x9c + 4 * layer);
+ 		const uint8_t *a = rec + 0xac + 16 * layer;
+@@ -376,6 +479,11 @@ AppleCLCD::swap(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			if (s->scanoutSlot >= 0 && fDisp->gpuWritten(s)) {
++				/* The GPU wrote these pages to DRAM: drop stale cached lines before reading. */
++				husky_dcache_flush(src + s->offset + (uint64_t)sy * s->bytesPerRow,
++				    (size_t)h * s->bytesPerRow);
++			}
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+@@ -384,6 +492,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	if (fDisp != NULL) {
++		fDisp->copyEnd(swapID);
++	}
+ }
+ 
+ bool
+@@ -541,6 +652,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		break;
+ 	}
+ 	case kHuskyFBSwapWait:
++		if (fFB->fDisp != NULL) {
++			ret = fFB->fDisp->swapWait(args->scalarInputCount, args->scalarInput, fFB->fSwapID);
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/iokit/Kernel/arm/HuskySurface.cpp b/iokit/Kernel/arm/HuskySurface.cpp
+index f70ee99..c443f6e 100644
+--- a/iokit/Kernel/arm/HuskySurface.cpp
++++ b/iokit/Kernel/arm/HuskySurface.cpp
+@@ -26,6 +26,7 @@
+  * ignored (logged once per selector).
+  */
+ #include "HuskySurface.h"
++#include "HuskyDisplay.h"
+ 
+ #if defined(HUSKY)
+ #include <IOKit/IOService.h>
+@@ -35,8 +36,11 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/system.h>
+ #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSSymbol.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/proc.h>
+@@ -67,6 +71,8 @@ enum {
+ #define HUSKY_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define HUSKY_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
++#define HUSKY_SURFACE_FMT_BGRA          0x42475241
++#define HUSKY_SCANOUT_SLOT_SIZE         (16u << 20)
+ 
+ static IOLock       *husky_surface_lock;
+ static HuskySurface *husky_surface_table[HUSKY_SURFACE_MAX_ID];
+@@ -86,6 +92,9 @@ HuskySurface::free()
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
++	if (scanoutSlot >= 0) {
++		husky_scanout_slot_put(scanoutSlot);
++	}
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+ }
+@@ -93,6 +102,9 @@ HuskySurface::free()
+ uintptr_t
+ HuskySurface::kernelAddress()
+ {
++	if (scanoutKVA != 0) {
++		return scanoutKVA;
++	}
+ 	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, memory);
+ 	if (buffer != NULL) {
+ 		return (uintptr_t)buffer->getBytesNoCopy();
+@@ -111,6 +123,12 @@ husky_surface_seed(HuskySurface *s)
+ 	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + HUSKY_SURFACE_STATE_SEED);
+ }
+ 
++uint32_t
++HuskySurface::seed()
++{
++	return *husky_surface_seed(this);
++}
++
+ /*
+  * Give the surface an id and a table slot; the table holds one retain and a
+  * user count (creators, client mappings, kernel holders). Lock held.
+@@ -371,6 +389,83 @@ husky_surface_layout(HuskySurface *s, OSDictionary *props)
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * Backing for the render server's panel-sized BGRA framebuffers: a slot of the
++ * scanout pool, so the DPU can read the pixels the GPU rendered without a copy.
++ * Returns NULL for any other surface; *why then names the refusal of a
++ * panel-sized one (NULL for the rest), and nothing is allocated.
++ */
++static IOMemoryDescriptor *
++husky_surface_scanout_backing(HuskySurface *s, const char **why)
++{
++	uint32_t w, h, stride;
++	char name[32];
++	void *kva = NULL;
++	uint64_t pa = 0;
++	int slot = -1;
++
++	*why = NULL;
++	if (!husky_scanout_geometry(&w, &h, &stride) || s->width != w || s->height != h) {
++		return NULL;
++	}
++	proc_selfname(name, sizeof(name));
++	if (strncmp(name, "backboardd", sizeof(name)) != 0) {
++		*why = "creator";
++	} else if (s->planeCount > 1) {
++		*why = "planes";
++	} else if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
++		*why = "element";
++	} else if (s->pixelFormat != HUSKY_SURFACE_FMT_BGRA) {
++		*why = "format";
++	} else if (s->bytesPerRow != stride || s->offset != 0) {
++		*why = "layout";
++	} else if (s->allocSize > HUSKY_SCANOUT_SLOT_SIZE) {
++		*why = "size";
++	} else if (!husky_scanout_slot_get(s->allocSize, &pa, &kva, &slot)) {
++		*why = "no free slot";
++	}
++	if (*why != NULL) {
++		return NULL;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut);
++	if (md == NULL) {
++		husky_scanout_slot_put(slot);
++		*why = "descriptor";
++		return NULL;
++	}
++	/*
++	 * Clean+invalidate, not just clean: dirty lines left by the zeroing would
++	 * be evicted later on top of pixels the GPU wrote to DRAM.
++	 */
++	bzero(kva, s->allocSize);
++	husky_dcache_flush((vm_offset_t)kva, s->allocSize);
++	s->scanoutSlot = slot;
++	s->scanoutPA = pa;
++	s->scanoutKVA = (uintptr_t)kva;
++	return md;
++}
++
++static void
++husky_surface_keys(OSDictionary *props, char *buf, size_t len)
++{
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
++	size_t n = 0;
++
++	buf[0] = '\0';
++	while (it != NULL) {
++		OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject());
++		if (key == NULL) {
++			break;
++		}
++		int w = snprintf(buf + n, len - n, "%s%s", n ? "," : "", key->getCStringNoCopy());
++		if (w < 0 || (size_t)w >= len - n) {
++			break;
++		}
++		n += (size_t)w;
++	}
++	OSSafeReleaseNULL(it);
++}
++
+ /* Per-client mapping of one surface. */
+ class HuskySurfaceRef : public OSObject {
+ 	OSDeclareDefaultStructors(HuskySurfaceRef);
+@@ -712,24 +807,51 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		return kIOReturnNoMemory;
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
++	const char *nopool = NULL;
+ 	ret = husky_surface_layout(s, props);
+ 	if (ret == kIOReturnSuccess) {
+-		IOBufferMemoryDescriptor *mem = NULL;
+-		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&husky_surface_wired) +
+-		    s->allocSize <= HUSKY_SURFACE_WIRED_MAX) {
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+-		}
+-		if (mem == NULL) {
+-			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&husky_surface_wired);
+-			ret = kIOReturnNoMemory;
+-		} else {
+-			bzero(mem->getBytesNoCopy(), s->allocSize);
+-			s->memory = mem;
++		IOMemoryDescriptor *scan = husky_surface_scanout_backing(s, &nopool);
++		if (scan != NULL) {
++			s->memory = scan;
+ 			s->mapCache = kIOMapDefaultCache;
+ 			if (!husky_surface_publish(s)) {
+ 				ret = kIOReturnNoResources;
+ 			}
++		} else {
++			IOBufferMemoryDescriptor *mem = NULL;
++			if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&husky_surface_wired) +
++			    s->allocSize <= HUSKY_SURFACE_WIRED_MAX) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			}
++			if (mem == NULL) {
++				OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&husky_surface_wired);
++				ret = kIOReturnNoMemory;
++			} else {
++				bzero(mem->getBytesNoCopy(), s->allocSize);
++				s->memory = mem;
++				s->mapCache = kIOMapDefaultCache;
++				if (!husky_surface_publish(s)) {
++					ret = kIOReturnNoResources;
++				}
++			}
++		}
++	}
++	if (ret == kIOReturnSuccess && (s->scanoutSlot >= 0 || nopool != NULL)) {
++		static uint32_t husky_nopool_logged;
++		char name[32];
++		char keys[192];
++		OSString *label = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
++		proc_selfname(name, sizeof(name));
++		if (s->scanoutSlot >= 0) {
++			husky_surface_keys(props, keys, sizeof(keys));
++			HUSKY_DISP_LOG("HUSKY DISP: slot %d -> sid %u %ux%u rb %u fmt %08x by %s keys=[%s] name=%s\n",
++			    s->scanoutSlot, s->id, s->width, s->height, s->bytesPerRow, s->pixelFormat, name, keys,
++			    label != NULL ? label->getCStringNoCopy() : "");
++		} else if (husky_nopool_logged < 16) {
++			husky_nopool_logged++;
++			HUSKY_DISP_LOG("HUSKY DISP: nopool sid %u %ux%u by %s (%s)\n", s->id, s->width, s->height,
++			    name, nopool);
+ 		}
+ 	}
+ 	if (ret != kIOReturnSuccess || husky_surface_creates_logged < 64) {
+diff --git a/iokit/Kernel/arm/HuskySurface.h b/iokit/Kernel/arm/HuskySurface.h
+index 7a84ef4..54a1504 100644
+--- a/iokit/Kernel/arm/HuskySurface.h
++++ b/iokit/Kernel/arm/HuskySurface.h
+@@ -40,11 +40,25 @@ public:
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	/* Scanout pool slot (HuskyDisplay.cpp): the pixels the DPU reads directly. */
++	int       scanoutSlot;                  /* -1: not a pool surface */
++	uint64_t  scanoutPA;
++	uintptr_t scanoutKVA;
++	uint32_t  scanoutSeed;                  /* write seed at the previous scanout */
++
++	bool init() APPLE_KEXT_OVERRIDE
++	{
++		scanoutSlot = -1;
++		scanoutSeed = ~0u;
++		return OSObject::init();
++	}
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+ 	uintptr_t kernelAddress();
++
++	/* Bumped by every read-write unlock (trapUnlock). */
++	uint32_t seed();
+ };
+ 
+ /* Retained surface for an id, or NULL. */
+@@ -61,5 +75,18 @@ HuskySurface *husky_surface_create_physical(uint64_t phys, uint32_t width,
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t husky_surface_port_in_task(HuskySurface *surface, task_t task);
+ 
++/*
++ * Scanout pool, implemented in HuskyDisplay.cpp (huskydisp >= 2). Slots are
++ * physically contiguous, below 4 GiB, and zeroed by the caller.
++ * husky_scanout_geometry returns false while no pool exists, else the panel
++ * geometry the DPU reads (width, height, bytes per row).
++ */
++bool husky_scanout_geometry(uint32_t *width, uint32_t *height, uint32_t *bytesPerRow);
++bool husky_scanout_slot_get(uint64_t size, uint64_t *pa, void **kva, int *slot);
++void husky_scanout_slot_put(int slot);
++
++extern "C" void husky_dcache_flush(vm_offset_t va, size_t len);
++extern "C" void husky_dcache_clean(vm_offset_t va, size_t len);
++
+ #endif /* HUSKY */
+ #endif /* _HUSKY_SURFACE_H */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 5509bfb..14c72c4 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -14,6 +14,7 @@ iokit/Kernel/arm/HuskyKeyStore.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskyWatchdog.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskySurface.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskyFramebuffer.cpp						optional iokitcpp
++iokit/Kernel/arm/HuskyDisplay.cpp							optional iokitcpp
+ iokit/Kernel/arm/HuskyBattery.cpp						optional iokitcpp
+ 
+ # HUSKY HID event services (IOHIDFamily-1915 user client + event queue + IOHIDEvent, ported from ios-sweet 0058)
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index ebd1d72..422150a 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -285,6 +285,32 @@ extern unsigned int gFastIPI;
+ /* HUSKY routes GIC SGIs to the cross-CPU signal handler in sleh_irq. */
+ void cpu_signal_handler(void);
+ #endif
++#if defined(HUSKY)
++#define HUSKY_IRQ_TABLE_FIRST   32      /* first SPI INTID */
++#define HUSKY_IRQ_TABLE_SIZE    320     /* INTIDs 32..351 */
++typedef void (*husky_irq_fn_t)(void *arg, uint32_t intid);
++static struct {
++	husky_irq_fn_t volatile fn;
++	void * volatile         arg;
++} husky_irq_table[HUSKY_IRQ_TABLE_SIZE];
++
++/* Thread context only, before the SPI is enabled at the GIC. */
++int husky_irq_register(uint32_t intid, husky_irq_fn_t fn, void *arg);
++int
++husky_irq_register(uint32_t intid, husky_irq_fn_t fn, void *arg)
++{
++	uint32_t idx = intid - HUSKY_IRQ_TABLE_FIRST;
++
++	if (intid < HUSKY_IRQ_TABLE_FIRST || idx >= HUSKY_IRQ_TABLE_SIZE || fn == NULL ||
++	    husky_irq_table[idx].fn != NULL) {
++		return -1;
++	}
++	husky_irq_table[idx].arg = arg;
++	os_atomic_thread_fence(release);
++	husky_irq_table[idx].fn = fn;
++	return 0;
++}
++#endif /* HUSKY */
+ 
+ static arm_saved_state64_t *original_faulting_state = NULL;
+ 
+@@ -3042,7 +3068,12 @@ sleh_irq(arm_saved_state_t *state)
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+-		if (cdp->interrupt_handler) {
++		uint32_t irq_idx = intid - HUSKY_IRQ_TABLE_FIRST;
++		husky_irq_fn_t irq_fn = (intid >= HUSKY_IRQ_TABLE_FIRST && irq_idx < HUSKY_IRQ_TABLE_SIZE) ?
++		    husky_irq_table[irq_idx].fn : NULL;
++		if (irq_fn != NULL) {
++			irq_fn(husky_irq_table[irq_idx].arg, intid);
++		} else if (cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,
+ 			    cdp->interrupt_nub,
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index d055336..60eb711 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -27,6 +27,14 @@ extern void husky_early_bc(const char *s);
+ #define HUSKY_GICR_ISACTIVER0   0x10300
+ #define HUSKY_GICR_IPRIORITYR   0x10400
+ #define HUSKY_GICR_IGRPMODR0    0x10D00
++/* Distributor SPI registers (GICv3 architecture, affinity routing on). */
++#define HUSKY_GICD_IGROUPR      0x0080
++#define HUSKY_GICD_ISENABLER    0x0100
++#define HUSKY_GICD_IPRIORITYR   0x0400
++#define HUSKY_GICD_ICFGR        0x0C00
++#define HUSKY_GICD_IROUTER      0x6000
++#define HUSKY_MPIDR_AFF_MASK    0xFF00FFFFFFULL
++static uint64_t husky_boot_affinity;
+ #endif
+ static vm_offset_t gicd_base;
+ static vm_offset_t gicr_base;
+@@ -133,6 +141,9 @@ pe_init_fiq()
+ 		}
+ 
+ 		gicr_size = gicr_size_prop;
++#if defined(HUSKY)
++		husky_boot_affinity = __builtin_arm_rsr64("MPIDR_EL1") & HUSKY_MPIDR_AFF_MASK;
++#endif
+ 	}
+ 
+ #if defined(HUSKY)
+@@ -273,6 +284,43 @@ husky_gic_dump(const char *tag)
+ 	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("CNTV_CVAL_EL0"),
+ 	    __builtin_arm_rsr64("CNTVCT_EL0"), __builtin_arm_rsr64("CNTFRQ_EL0"));
+ }
++
++/*
++ * Route one SPI to the boot CPU as a level-sensitive Group 1 NS interrupt and
++ * enable it. IGROUPR/IGRPMODR are left alone: Non-secure writes are ignored
++ * (see pe_init_fiq), the group is checked with husky_gic_spi_probe instead.
++ */
++void husky_gic_spi_enable(uint32_t intid, uint8_t prio);
++void
++husky_gic_spi_enable(uint32_t intid, uint8_t prio)
++{
++	uint32_t cfg_off = HUSKY_GICD_ICFGR + (intid / 16) * 4;
++	uint32_t cfg_shift = (intid % 16) * 2;
++
++	gicd_write32(cfg_off, gicd_read32(cfg_off) & ~(3U << cfg_shift));
++	*(volatile uint8_t *)(gicd_base + HUSKY_GICD_IPRIORITYR + intid) = prio;
++	*(volatile uint64_t *)(gicd_base + HUSKY_GICD_IROUTER + (vm_offset_t)intid * 8) = husky_boot_affinity;
++	__builtin_arm_dsb(DSB_SY);
++	gicd_write32(HUSKY_GICD_ISENABLER + (intid / 32) * 4, 1U << (intid % 32));
++	while (gicd_read32(GICD_CTLR) & HUSKY_GICD_CTLR_RWP) {
++		/* wait for the enable to take effect */
++	}
++}
++
++/* Read-only view of one SPI; returns 0 before the GIC is mapped. */
++int husky_gic_spi_probe(uint32_t intid, uint32_t *grp, uint32_t *cfg, uint32_t *en, uint64_t *route);
++int
++husky_gic_spi_probe(uint32_t intid, uint32_t *grp, uint32_t *cfg, uint32_t *en, uint64_t *route)
++{
++	if (!gicd_base) {
++		return 0;
++	}
++	*grp = (gicd_read32(HUSKY_GICD_IGROUPR + (intid / 32) * 4) >> (intid % 32)) & 1;
++	*cfg = (gicd_read32(HUSKY_GICD_ICFGR + (intid / 16) * 4) >> ((intid % 16) * 2)) & 3;
++	*en = (gicd_read32(HUSKY_GICD_ISENABLER + (intid / 32) * 4) >> (intid % 32)) & 1;
++	*route = _gic_read64(gicd_base + HUSKY_GICD_IROUTER + (vm_offset_t)intid * 8);
++	return 1;
++}
+ #endif /* HUSKY */
+ #else
+ void
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 8418c87..ca2022d 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -892,10 +892,32 @@ husky_early_bc(const char *s)
+  */
+ #define HUSKY_DECON0_PHYS	0x19470000ULL
+ static volatile uint32_t *husky_decon;
++
++/*
++ * HuskyDisplay.cpp sets husky_disp_direct while it owns DECON0 scanout; the
++ * console then must not request frames (it would scan a stale base). A panic
++ * is the exception: the base goes back to the splash, which holds the panic
++ * text, through the RDMA window HuskyDisplay mapped beforehand (no mapping
++ * from the panic path).
++ */
++volatile int husky_disp_direct;
++volatile uint32_t husky_disp_splash_pa;
++volatile uint32_t *husky_rdma0;
++static int husky_panic_splash_done;
++
+ void husky_fb_kick(void);
+ void
+ husky_fb_kick(void)
+ {
++	if (husky_disp_direct) {
++		if (!panic_active()) {
++			return;
++		}
++		if (!husky_panic_splash_done && husky_rdma0 != NULL) {
++			husky_panic_splash_done = 1;
++			husky_rdma0[0x40 / 4] = husky_disp_splash_pa;
++		}
++	}
+ 	if (husky_decon == NULL) {
+ 		/* ml_io_map allocates: fine during early boot, else only with IRQs on. */
+ 		if (startup_phase >= STARTUP_SUB_EARLY_BOOT && !ml_get_interrupts_enabled()) {
