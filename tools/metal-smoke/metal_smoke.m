@@ -10,8 +10,6 @@
 #define THREADS 256u
 #define GROUP 64u
 
-static int g_console = -1;
-
 static void say(const char *fmt, ...)
 {
     char buf[768];
@@ -25,8 +23,12 @@ static void say(const char *fmt, ...)
         n = sizeof(buf) - 1;
     fputs(buf, stdout);
     fflush(stdout);
-    if (g_console >= 0)
-        (void)write(g_console, buf, (size_t)n);
+    /* reopened per line: a descriptor opened before Metal's start-up stops reaching the console */
+    int fd = open("/dev/console", O_WRONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+    if (fd >= 0) {
+        (void)write(fd, buf, (size_t)n);
+        close(fd);
+    }
 }
 
 static int fail(int step, NSString *what)
@@ -156,13 +158,10 @@ static int run(void)
 
 int main(void)
 {
-    g_console = open("/dev/console", O_WRONLY | O_NOCTTY);
     say("METAL-SMOKE: start\n");
     int rc;
     @autoreleasepool {
         rc = run();
     }
-    if (g_console >= 0)
-        close(g_console);
     return rc;
 }
