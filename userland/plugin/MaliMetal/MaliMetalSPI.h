@@ -37,19 +37,19 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 /* ---- Metal.framework base classes ---- */
-@interface _MTLDevice : NSObject
+@interface _MTLDevice : NSObject <MTLDeviceSPI>
 - (void)initLimits;
 - (void)initFeatureQueries;
 - (void)initWorkarounds;
 - (unsigned long long)featureProfile;
 @end
-@interface _MTLCommandQueue : NSObject @end
-@interface _MTLCommandBuffer : NSObject @end
-@interface _MTLCommandEncoder : NSObject @end
-@interface _MTLSamplerState : NSObject
+@interface _MTLCommandQueue : NSObject <MTLCommandQueue> @end
+@interface _MTLCommandBuffer : NSObject <MTLCommandBuffer> @end
+@interface _MTLCommandEncoder : NSObject <MTLCommandEncoder> @end
+@interface _MTLSamplerState : NSObject <MTLSamplerState>
 - (instancetype)initWithDevice:(id<MTLDevice>)device samplerDescriptor:(MTLSamplerDescriptor *)desc;
 @end
-@interface _MTLDepthStencilState : NSObject
+@interface _MTLDepthStencilState : NSObject <MTLDepthStencilState>
 - (instancetype)initWithDevice:(id<MTLDevice>)device depthStencilDescriptor:(MTLDepthStencilDescriptor *)desc;
 @end
 
@@ -88,20 +88,20 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable instancetype)initWithCommandBuffer:(id<MTLCommandBuffer>)cb;
 - (void)endEncoding;
 @end
-@interface IOGPUMetalRenderCommandEncoder : IOGPUMetalCommandEncoder
+@interface IOGPUMetalRenderCommandEncoder : IOGPUMetalCommandEncoder <MTLRenderCommandEncoder>
 - (nullable instancetype)initWithCommandBuffer:(id<MTLCommandBuffer>)cb descriptor:(MTLRenderPassDescriptor *)rp;
 @end
-@interface IOGPUMetalBlitCommandEncoder : IOGPUMetalCommandEncoder @end
-@interface IOGPUMetalComputeCommandEncoder : IOGPUMetalCommandEncoder @end
-@interface IOGPUMetalResource : NSObject
+@interface IOGPUMetalBlitCommandEncoder : IOGPUMetalCommandEncoder <MTLBlitCommandEncoder> @end
+@interface IOGPUMetalComputeCommandEncoder : IOGPUMetalCommandEncoder <MTLComputeCommandEncoder> @end
+@interface IOGPUMetalResource : NSObject <MTLResource>
 - (id)device;
 - (uint32_t)resourceID;
 - (uint64_t)resourceSize;
 - (uint64_t)gpuAddress;                  /* property gpuAddress, IOGPUMetalResource.h */
 - (nullable void *)virtualAddress;       /* CPU mapping of a sysmem allocation; NULL for private storage */
 @end
-@interface IOGPUMetalBuffer : IOGPUMetalResource @end
-@interface IOGPUMetalTexture : IOGPUMetalResource @end
+@interface IOGPUMetalBuffer : IOGPUMetalResource <MTLBuffer> @end
+@interface IOGPUMetalTexture : IOGPUMetalResource <MTLTexture> @end
 
 extern void MTLAddDevice(id<MTLDevice> device);
 
@@ -139,11 +139,11 @@ typedef struct { unsigned short major; unsigned char minor, patch; } MaliArchVer
 @interface MTLFunctionVariant : NSObject
 - (instancetype)initWithCompilerOutput:(id)output;
 @end
-@interface _MTLRenderPipelineState : NSObject
+@interface _MTLRenderPipelineState : NSObject <MTLRenderPipelineState>
 - (instancetype)initWithDevice:(id)d pipelineStateDescriptor:(id)desc;
 - (id<MTLDevice>)device;
 @end
-@interface _MTLComputePipelineState : NSObject
+@interface _MTLComputePipelineState : NSObject <MTLComputePipelineState>
 - (instancetype)initWithDevice:(id)d pipelineStateDescriptor:(id)desc;
 - (id<MTLDevice>)device;
 @end
