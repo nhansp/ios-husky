@@ -104,16 +104,24 @@ if(MM_PROBE_MAJOR_SYSMACROS)
   list(APPEND MM_GLOBAL_DEFS -DMAJOR_IN_SYSMACROS)
 endif()
 
-# GNU qsort_r (comparator last) vs BSD qsort_r (thunk first): Darwin is BSD, Mesa falls back to
-# its own sort when HAVE_GNU_QSORT_R is unset (util/u_qsort.*).
+# Without -Werror a mismatched comparator is only a warning, so the GNU probe passed on Darwin.
+set(CMAKE_REQUIRED_FLAGS "-Werror")
 check_c_source_compiles("
   #define _GNU_SOURCE
   #include <stdlib.h>
   static int cmp(const void *a, const void *b, void *c) { (void)a; (void)b; (void)c; return 0; }
   int main(void) { int v[2] = {0, 1}; qsort_r(v, 2, sizeof(int), cmp, 0); return 0; }"
   MM_PROBE_GNU_QSORT_R)
+check_c_source_compiles("
+  #include <stdlib.h>
+  static int cmp(void *c, const void *a, const void *b) { (void)a; (void)b; (void)c; return 0; }
+  int main(void) { int v[2] = {0, 1}; qsort_r(v, 2, sizeof(int), 0, cmp); return 0; }"
+  MM_PROBE_BSD_QSORT_R)
+unset(CMAKE_REQUIRED_FLAGS)
 if(MM_PROBE_GNU_QSORT_R)
   list(APPEND MM_GLOBAL_DEFS -DHAVE_GNU_QSORT_R)
+elseif(MM_PROBE_BSD_QSORT_R)
+  list(APPEND MM_GLOBAL_DEFS -DHAVE_BSD_QSORT_R)
 endif()
 
 unset(CMAKE_REQUIRED_DEFINITIONS)
