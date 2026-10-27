@@ -1,0 +1,3 @@
+plugin/MaliMetal/out/
+shadercache/mali-shadercache
+shadercache/*.o

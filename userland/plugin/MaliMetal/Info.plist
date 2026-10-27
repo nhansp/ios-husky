@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  MaliMetal.bundle  (intended repo path: plugin/MaliMetal/Info.plist)
+  Installed as /System/Library/Extensions/MaliMetal.bundle (the accelerator node's "MetalPluginName" is "MaliMetal").
+  gpu_bundle_find_trusted() looks in /Library/GPUBundles and /System/Library/Extensions (spec 04 Q10, spec 05 section 2);
+  whether a bundle that is not in the trust cache loads is open question 10 of spec 04.
+  Metal reads the registry's MetalPluginClassName first ("MaliMTLDevice") and falls back to NSPrincipalClass.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>	<string>en</string>
+	<key>CFBundleExecutable</key>		<string>MaliMetal</string>
+	<key>CFBundleIdentifier</key>		<string>org.mali-ios.MaliMetal</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key>			<string>MaliMetal</string>
+	<key>CFBundlePackageType</key>		<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>	<string>0.1</string>
+	<key>CFBundleVersion</key>		<string>0.1</string>
+	<key>CFBundleSupportedPlatforms</key>	<array><string>iPhoneOS</string></array>
+	<key>MinimumOSVersion</key>		<string>26.5</string>
+	<key>NSPrincipalClass</key>		<string>MaliMTLDevice</string>
+</dict>
+</plist>

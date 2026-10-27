@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  com.apple.security.iokit-user-client-class:
+	  Specifies the permitted IOKit user-client class for IOServiceOpen.
+	  On iOS, processes running under sandbox or security policy checks must declare the
+	  user-client classes they need to open. The Mali accelerator registers
+	  IOUserClientClass = "IOGPUDeviceUserClient" (IOGPU.cpp:56), which newUserClient
+	  instantiates (IOGPU.cpp:177).
+
+	  Restricted entitlements (such as com.apple.private.gpu-restricted) are intentionally
+	  omitted: holding that entitlement causes IOGPUDeviceUserClient to activate dispatch Table B,
+	  which stubs selectors 21, 27-34, 36-54 and traps 4-7 with kIOReturnNotPermitted (0xe00002e2)
+	  per refs/gpu-spec/01-iogpu-userclient-abi.md:144-156.
+	-->
+	<key>com.apple.security.iokit-user-client-class</key>
+	<array>
+		<string>IOGPUDeviceUserClient</string>
+	</array>
+</dict>
+</plist>

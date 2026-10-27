@@ -1,0 +1,87 @@
+name: gpu-userland
+
+on:
+  workflow_dispatch:
+
+env:
+  MESA_REV: 1f9035d9c04ca391a58155159027b1d85fba8be8
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          xcrun --sdk iphoneos --show-sdk-version
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+
+      - uses: actions/cache@v4
+        with:
+          path: mesa
+          key: mesa-src-${{ env.MESA_REV }}
+
+      - name: Mesa source
+        run: |
+          if [ ! -f mesa/meson.build ]; then
+            rm -rf mesa && git init -q mesa
+            git -C mesa fetch -q --depth 1 https://github.com/mesa3d/mesa.git "$MESA_REV" ||
+              git -C mesa fetch -q --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git "$MESA_REV"
+            git -C mesa checkout -q FETCH_HEAD
+          fi
+          git -C mesa rev-parse HEAD
+
+      - uses: actions/cache@v4
+        with:
+          path: out/mesa
+          key: mesa-ios-${{ env.MESA_REV }}-${{ hashFiles('userland/mesa-build/**') }}
+
+      - name: Mesa for iOS
+        run: |
+          set -eux
+          if [ ! -f out/mesa/lib/libmali_mesa.a ]; then
+            mkdir -p out/gen
+            tar -xJf userland/mesa-build/gen-1f9035d.tar.xz -C out/gen --strip-components=1
+            MESA_SRC=$PWD/mesa MESA_GEN=$PWD/out/gen MESA_OUT_LIB=$PWD/out/mesa/lib \
+              MESA_BUILD_TREE=$PWD/out/mesa/tree ARCH=arm64e bash userland/mesa-build/ios-build.sh
+          fi
+          ls -la out/mesa/lib
+
+      - name: MaliMetal.bundle
+        run: |
+          set -eux
+          PACK=""
+          [ -f userland/shadercache/shaders.mvpack ] && PACK=$PWD/userland/shadercache/shaders.mvpack
+          MESA_SRC=$PWD/mesa MESA_TREE=$PWD/out/mesa/tree MESA_LIB=$PWD/out/mesa/lib/libmali_mesa.a \
+            OUT=$PWD/out/plugin PACK="$PACK" sh userland/plugin/MaliMetal/ios-build.sh
+          codesign -f -s - out/plugin/MaliMetal.bundle
+          otool -L out/plugin/MaliMetal.bundle/MaliMetal
+
+      - name: metal-smoke
+        run: |
+          set -eux
+          mkdir -p out/smoke
+          xcrun -sdk iphoneos metal --version || xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk iphoneos metal -c -mios-version-min=26.0 tools/metal-smoke/metal_smoke.metal -o out/smoke/metal_smoke.air
+          xcrun -sdk iphoneos metallib out/smoke/metal_smoke.air -o out/smoke/metal_smoke.metallib
+          xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 -fobjc-arc -O1 -Wall -Werror \
+            tools/metal-smoke/metal_smoke.m -framework Foundation -framework Metal -o out/smoke/metal_smoke
+          codesign -f -s - --entitlements tools/metal-smoke/ent.plist out/smoke/metal_smoke
+          cp tools/metal-smoke/com.husky.metal-smoke.plist out/smoke/
+
+      - name: Package
+        if: always()
+        run: |
+          mkdir -p artifact
+          [ -d out/plugin/MaliMetal.bundle ] && cp -R out/plugin/MaliMetal.bundle artifact/
+          [ -d out/smoke ] && cp out/smoke/metal_smoke out/smoke/metal_smoke.metallib out/smoke/*.plist artifact/ 2>/dev/null || true
+          (cd artifact && find . -type f -exec shasum -a 256 {} + > SHA256SUMS) || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpu-userland
+          path: artifact

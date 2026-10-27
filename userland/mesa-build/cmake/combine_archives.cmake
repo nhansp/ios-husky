@@ -1,0 +1,20 @@
+# cmake -DAR=<ar> -DOUT=<libmali_mesa.a> "-DINPUTS=a.a|b.a|..." -P combine_archives.cmake
+# Non-Apple hosts: merge static archives with an ar MRI script (GNU ar and llvm-ar both accept it).
+# Duplicate member names across inputs are preserved. Apple uses `libtool -static` instead.
+if(NOT AR OR NOT OUT OR NOT INPUTS)
+  message(FATAL_ERROR "usage: -DAR= -DOUT= -DINPUTS=a;b -P combine_archives.cmake")
+endif()
+string(REPLACE "|" ";" INPUTS "${INPUTS}")
+set(_mri "CREATE ${OUT}\n")
+foreach(a ${INPUTS})
+  string(APPEND _mri "ADDLIB ${a}\n")
+endforeach()
+string(APPEND _mri "SAVE\nEND\n")
+file(REMOVE "${OUT}")
+set(_script "${OUT}.mri")
+file(WRITE "${_script}" "${_mri}")
+execute_process(COMMAND "${AR}" -M INPUT_FILE "${_script}" RESULT_VARIABLE _r ERROR_VARIABLE _e)
+file(REMOVE "${_script}")
+if(NOT _r EQUAL 0)
+  message(FATAL_ERROR "ar -M failed: ${_e}")
+endif()
