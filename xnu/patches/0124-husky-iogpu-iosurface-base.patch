@@ -1,0 +1,26 @@
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.cpp b/iokit/Families/IOGPU/IOGPUMemory.cpp
+index e6b04fd..b17b4bf 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.cpp
++++ b/iokit/Families/IOGPU/IOGPUMemory.cpp
+@@ -186,15 +186,17 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 		break;
+ 	}
+ 	case kIOGPUResType_IOSurface: {    /* type 0x82: {surface id, plane} at +0x38 */
++		/* The whole surface from its base, for every plane: MaliMetal adds the plane offset itself. */
+ 		const uint32_t sid = (uint32_t)in->ptrOrSurface, plane = (uint32_t)(in->ptrOrSurface >> 32);
+ 		HuskySurface *surf = husky_surface_copy(sid);
+-		uint64_t off = 0;
++		uint64_t off = 0, len = 0;
+ 		bool ok = surf != NULL && surf->memory != NULL && plane < (surf->planeCount ? surf->planeCount : 1);
+ 		if (ok) {
+-			off = surf->planeCount ? surf->planes[plane].offset : surf->offset;
+-			ok = off + fSize <= surf->memory->getLength();
++			off = surf->offset;
++			len = surf->memory->getLength() > off ? surf->memory->getLength() - off : 0;
++			ok = len >= fSize;
+ 		}
+-		IOReturn r = ok ? importMemory(surf->memory, off, fSize, flags & ~MALI_BO_GPU_EXEC) : kIOGPUReturnBadArgument;
++		IOReturn r = ok ? importMemory(surf->memory, off, len, flags & ~MALI_BO_GPU_EXEC) : kIOGPUReturnBadArgument;
+ 		if (r != kIOGPUReturnSuccess) {
+ 			IOLog("IOGPU: IOSurface %u plane %u resource refused (size 0x%llx, 0x%x)\n", sid, plane, fSize, r);
+ 			OSSafeReleaseNULL(surf);
