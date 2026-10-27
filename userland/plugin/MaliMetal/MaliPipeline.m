@@ -129,6 +129,17 @@ BOOL MaliUploadShader(MaliMTLDevice *dev, MaliShaderProgram *p, mali_shader_t *s
 - (NSArray *)maliResources { return _res; }
 - (void)maliSetVS:(MaliShaderProgram *)v FS:(MaliShaderProgram *)f { _vs = v; _fs = f; _attrMask = v ? v->prog.vs.attribute_mask : 0; }
 - (uint32_t)maliVertexAttrMask { return _attrMask; }
+- (NSString *)maliDiagName {
+    NSMutableString *n = [NSMutableString stringWithFormat:@"%@/%@", _vs ? _vs.entry : @"-", _fs ? _fs.entry : @"-"];
+    for (uint32_t i = 0; i < _pipe.rt_count; i++) {
+        const mali_rt_state_t *rt = &_pipe.rt[i];
+        [n appendFormat:@" rt%u:fmt%u%@%@ wm%x", i, rt->mtl_format,
+            rt->blend_enable ? [NSString stringWithFormat:@" blend %u,%u,%u/%u,%u,%u", rt->src_rgb, rt->dst_rgb, rt->op_rgb,
+                                rt->src_alpha, rt->dst_alpha, rt->op_alpha] : @"",
+            _pipe.blend_shader_gpu[i] ? @" bshader" : @"", rt->write_mask];
+    }
+    return n;
+}
 - (const MaliConstSampler *)maliConstSamplers:(uint32_t *)count stage:(int)stage {
     MaliShaderProgram *p = stage == 0 ? _vs : _fs;
     *count = p ? p->csamp_count : 0;

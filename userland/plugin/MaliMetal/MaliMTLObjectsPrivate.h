@@ -48,6 +48,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (NSArray *)maliResources;                         /* buffers holding code/SPD/blend shaders */
 - (const MaliConstSampler *)maliConstSamplers:(uint32_t *)count stage:(int)stage;   /* 0 vertex, 1 fragment */
 @property (nonatomic, readonly) uint32_t maliVertexAttrMask;
+- (NSString *)maliDiagName;
 @end
 
 @interface MaliComputePipelineState : _MTLComputePipelineState <MTLComputePipelineState>

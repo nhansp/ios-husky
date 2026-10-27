@@ -16,6 +16,7 @@
  */
 #import "MaliMTLObjectsPrivate.h"
 #import "MaliBindings.h"
+#include <stdatomic.h>
 
 #define MALI_UNSUPPORTED(what) MaliLogOnce(@"render encoder: " what " is not supported")
 
@@ -59,7 +60,13 @@ static inline uint32_t level_dim(NSUInteger v, NSUInteger level) { return (uint3
     id<MTLTexture> _fragTex[MALI_MAX_TEXTURES], _vertTex[MALI_MAX_TEXTURES];
     /* buffers bound per slot, so setXBufferOffset:atIndex: can recompute the address */
     id<MTLBuffer> _vbuf[MALI_MAX_BUFFERS], _fbuf[MALI_MAX_BUFFERS];
+    /* first passes of the process, written to the diag file at endEncoding */
+    NSMutableString *_diag;
+    MaliRenderPipelineState *_diagPipe;
+    NSUInteger _diagDraws;
 }
+
+static _Atomic unsigned gPassDiagCount;
 
 - (instancetype)initWithCommandBuffer:(id<MTLCommandBuffer>)cb descriptor:(MTLRenderPassDescriptor *)rp {
     if (!(self = [super initWithCommandBuffer:cb descriptor:rp])) return nil;
@@ -155,6 +162,17 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
 
     mali_cs_t *cs = [_cb maliCS];
     if (!cs) [NSException raise:NSInternalInconsistencyException format:@"MaliMetal: command stream allocation failed"];
+    if (atomic_fetch_add(&gPassDiagCount, 1) < 48) {
+        _diag = [NSMutableString stringWithFormat:@"pass %ux%u", w, h];
+        for (uint32_t i = 0; i < pd.color_count; i++) {
+            id<MTLTexture> t = rp.colorAttachments[i].texture;
+            if (t) [_diag appendFormat:@" rt%u fmt%lu %lux%lu%@ load%u%@ store%u", i, (unsigned long)t.pixelFormat, (unsigned long)t.width,
+                    (unsigned long)t.height, t.iosurface ? @" iosurface" : @"", (unsigned)rp.colorAttachments[i].loadAction,
+                    loads[i] ? @"(draw)" : @"", pd.color[i].store];
+        }
+        if (rp.depthAttachment.texture) [_diag appendFormat:@" depth fmt%lu", (unsigned long)rp.depthAttachment.texture.pixelFormat];
+        if (rp.stencilAttachment.texture) [_diag appendFormat:@" stencil fmt%lu", (unsigned long)rp.stencilAttachment.texture.pixelFormat];
+    }
     _pass = mali_pass_begin(cs, [dev maliCtx], &pd);
     if (!_pass) [NSException raise:NSInvalidArgumentException format:@"MaliMetal: the command builder refused the render pass (%ux%u, %u colour attachments)", w, h, pd.color_count];
     _cb.maliUsedRender = YES;
@@ -209,6 +227,9 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
     _ended = YES;
     @try {
         [_cb maliEndEncoder];
+        if (_diag) MaliDiagLine([_diag stringByAppendingFormat:@" | draws %lu%@", (unsigned long)_diagDraws,
+                                                                _cb.maliEncodingFailed ? @" FAILED" : @""]);
+        _diag = nil;
         if (pass && !_cb.maliEncodingFailed) {
             if (!mali_pass_end(pass)) [_cb maliFail:@"mali_pass_end failed"];
             else mali_cs_encoder_barrier([_cb maliCS]);       /* the pass's writes are visible to whatever follows */
@@ -344,6 +365,15 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
         s.base_vertex = (int32_t)bv;
         [_cb maliUseResource:ib usage:MTLResourceUsageRead];
     } else s.vertex_start = (uint32_t)start;
+    if (_diag) {
+        _diagDraws++;
+        if (_pipeline != _diagPipe) {
+            _diagPipe = _pipeline;
+            [_diag appendFormat:@" | %@ prim%u n%u i%u%@%@ fs_tex%x", [_pipeline maliDiagName], s.prim, s.count, s.instance_count,
+                s.indexed ? @" idx" : @"", _scissorSet ? [NSString stringWithFormat:@" sc%ux%u", s.scissor.w, s.scissor.h] : @"",
+                _fs.tex_mask];
+        }
+    }
     if (!mali_pass_draw(_pass, &s)) [_cb maliFail:@"mali_pass_draw failed"];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)p vertexStart:(NSUInteger)s vertexCount:(NSUInteger)c {
