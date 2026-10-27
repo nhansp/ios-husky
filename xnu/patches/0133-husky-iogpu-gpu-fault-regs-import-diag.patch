@@ -1,0 +1,71 @@
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.cpp b/iokit/Families/IOGPU/IOGPUMemory.cpp
+index 3f9876d..dd620cd 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.cpp
++++ b/iokit/Families/IOGPU/IOGPUMemory.cpp
+@@ -190,6 +190,7 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 		}
+ 		fKernelMap = fImport->map();
+ 		if (fKernelMap == NULL) {
++			IOLog("IOGPU: client-memory resource: kernel map of 0x%llx size 0x%llx failed\n", in->ptrOrSurface, fSize);
+ 			return kIOGPUReturnNoMemory;
+ 		}
+ 		fCpuAddr = in->ptrOrSurface;
+@@ -331,12 +332,19 @@ IOGPUResource::importMemory(IOMemoryDescriptor *md, uint64_t offset, uint64_t le
+ 		IOByteCount seg = 0;
+ 		addr64_t pa = md->getPhysicalSegment(start + (uint64_t)i * IOGPU_GPU_PAGE, &seg, kIOMemoryMapperNone);
+ 		ok = pa != 0 && !(pa & (IOGPU_GPU_PAGE - 1)) && seg >= IOGPU_GPU_PAGE;
++		if (!ok) {
++			IOLog("IOGPU: import: page %u/%u has no usable physical segment (pa 0x%llx len 0x%llx)\n", i, n, pa,
++			    (uint64_t)seg);
++		}
+ 		for (; ok && seg >= IOGPU_GPU_PAGE && i < n; seg -= IOGPU_GPU_PAGE, pa += IOGPU_GPU_PAGE) {
+ 			phys[i++] = pa;
+ 		}
+ 	}
+ 	mali_vm_t *vm = fDevice->task()->vm();
+-	ok = ok && mali_backend_ops.bo_import_pages(vm, phys, n, flags & ~MALI_BO_CPU_MAP, &fBO) == 0;
++	if (ok && mali_backend_ops.bo_import_pages(vm, phys, n, flags & ~MALI_BO_CPU_MAP, &fBO) != 0) {
++		IOLog("IOGPU: import: GPU mapping of %u pages (first pa 0x%llx) failed\n", n, phys[0]);
++		ok = false;
++	}
+ 	if (phys != NULL) {
+ 		IOFreeData(phys, n * sizeof(uint64_t));
+ 	}
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 789c6d1..29297b4 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -137,6 +137,11 @@ bridge_flush_on(void)
+ #define AS_FAULTSTATUS          0x1cu               /* kbase AS_FAULTSTATUS */
+ #define AS_FAULTADDRESS         0x20u
+ #define MMU_IRQ_RAWSTAT         0x2000u             /* kbase MMU_CONTROL_BASE + MMU_IRQ_RAWSTAT */
++#define MMU_IRQ_PAGE_FAULTS     0xffffu             /* CSF: bits 16-31 are per-AS command completion, not bus errors */
++#define GPU_IRQ_RAWSTAT         0x20u               /* kbase GPU_IRQ_RAWSTAT */
++#define GPU_STATUS              0x34u
++#define GPU_FAULTSTATUS         0x3cu               /* CSF reports bus faults here, not in MMU_IRQ */
++#define GPU_FAULTADDRESS        0x40u
+ #define AS_LOCK_MIN_LOG2        15u                 /* kbase_get_lock_region_min_size_log2, arch < 12 */
+ #define AS_TRANSCFG_UNMAPPED    1u                  /* kbase AS_TRANSCFG_ADRMODE_UNMAPPED */
+ #define AS_MEMATTR_VALUE        0x4C4C4C4C8C4C8F4CULL /* [husky_gpu.c:208] */
+@@ -1376,16 +1381,17 @@ queue_dump_state(mali_queue_t *q)
+ 	const uint32_t as_reg = AS0 + (uint32_t)q->vm->as_slot * AS_STRIDE;
+ 	BR_LOG("HUSKY IOGPU bridge: CSG%u ack 0x%x state 0x%x irq req/ack 0x%x/0x%x (status %s) | CS req 0x%x ack 0x%x "
+ 	    "cmd_ptr 0x%llx wait 0x%x res 0x%x sb 0x%x blocked %u fault 0x%x/0x%llx fatal 0x%x/0x%llx | heap vt %u/%u frag %u "
+-	    "| MMU irq 0x%x AS%d fault 0x%x at 0x%llx\n", q->csg, rd32(q->csgout, CSG_OUT_ACK),
++	    "| MMU pf 0x%x AS%d fault 0x%x at 0x%llx | GPU irq 0x%x status 0x%x fault 0x%x at 0x%llx\n", q->csg, rd32(q->csgout, CSG_OUT_ACK),
+ 	    rd32(q->csgout, CSG_OUT_STATUS_STATE), rd32(q->csgout, CSG_OUT_IRQ_REQ), rd32(q->csgin, CSG_IN_IRQ_ACK),
+ 	    us < 10000 ? "fresh" : "stale", rd32(q->csin, CS_IN_REQ), rd32(q->csout, CS_OUT_ACK),
+ 	    (unsigned long long)rd64(q->csout, CS_OUT_CMD_PTR), rd32(q->csout, CS_OUT_STATUS_WAIT),
+ 	    rd32(q->csout, CS_OUT_REQ_RESOURCE), rd32(q->csout, CS_OUT_SCOREBOARDS), rd32(q->csout, CS_OUT_BLOCKED_REASON),
+ 	    rd32(q->csout, CS_OUT_FAULT), (unsigned long long)rd64(q->csout, CS_OUT_FAULT_INFO), rd32(q->csout, CS_OUT_FATAL),
+ 	    (unsigned long long)rd64(q->csout, CS_OUT_FATAL_INFO), rd32(q->csout, CS_OUT_HEAP_VT_START),
+-	    rd32(q->csout, CS_OUT_HEAP_VT_END), rd32(q->csout, CS_OUT_HEAP_FRAG_END), grd(MMU_IRQ_RAWSTAT), q->vm->as_slot,
+-	    grd(as_reg + AS_FAULTSTATUS), (unsigned long long)(grd(as_reg + AS_FAULTADDRESS) |
+-	    ((uint64_t)grd(as_reg + AS_FAULTADDRESS + 4) << 32)));
++	    rd32(q->csout, CS_OUT_HEAP_VT_END), rd32(q->csout, CS_OUT_HEAP_FRAG_END), grd(MMU_IRQ_RAWSTAT) & MMU_IRQ_PAGE_FAULTS,
++	    q->vm->as_slot, grd(as_reg + AS_FAULTSTATUS), (unsigned long long)(grd(as_reg + AS_FAULTADDRESS) |
++	    ((uint64_t)grd(as_reg + AS_FAULTADDRESS + 4) << 32)), grd(GPU_IRQ_RAWSTAT), grd(GPU_STATUS), grd(GPU_FAULTSTATUS),
++	    (unsigned long long)(grd(GPU_FAULTADDRESS) | ((uint64_t)grd(GPU_FAULTADDRESS + 4) << 32)));
+ }
+ 
+ static mali_status_t
