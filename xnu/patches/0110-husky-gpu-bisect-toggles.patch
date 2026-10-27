@@ -1,0 +1,103 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 727ab8a..85c3abe 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -91,8 +91,12 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+  */
+ extern void husky_log_final_flush(void);
+ static uint32_t husky_gpu_mode; /* boot-arg huskygpu (defined below) */
++/* 0110 bisect toggles (boot 0107-0109 froze; 0103 still boots): all default off */
++static uint32_t husky_gpu_flush;        /* huskygpuflush=1: flush the on-disk log after every line */
++static uint32_t husky_gpu_pre;          /* huskygpupre=1: TZPC/PROT preflight before the first access */
++static uint32_t husky_iogpu = 1;        /* huskyiogpu=0: huskygpu=6 maps the bridge area, skips the self-test */
+ #define HU_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); \
+-	if (husky_gpu_mode >= 6) husky_log_final_flush(); } while (0)
++	if (husky_gpu_flush) husky_log_final_flush(); } while (0)
+ 
+ #define PMU_PA                  0x15460000ULL
+ #define PMU_SIZE                0x4000ULL
+@@ -1366,6 +1370,8 @@ husky_gpu_mcu_boot(void)
+ 	bool jobs_ok = husky_gpu_first_job(shared_nc, shared_size, gin, gout);
+ 	if (husky_gpu_mode >= 6 && !jobs_ok) {
+ 		HU_LOG("HUSKY IOGPU: earlier jobs failed; self-test skipped\n");
++	} else if (husky_gpu_mode >= 6 && !husky_iogpu) {
++		HU_LOG("HUSKY IOGPU: self-test skipped (huskyiogpu=0)\n");
+ 	} else if (husky_gpu_mode >= 6) {
+ 		extern bool husky_iogpu_selftest(void);
+ 		HU_LOG("HUSKY IOGPU: starting self-test (huskygpu=6)\n");
+@@ -1420,7 +1426,11 @@ husky_gpu_probe(void)
+ 	if (!PE_parse_boot_argn("huskygpu", &mode, sizeof(mode)) || mode == 0) {
+ 		return;
+ 	}
+-	HU_LOG("HUSKY GPU: probe mode %u\n", mode);
++	(void)PE_parse_boot_argn("huskygpuflush", &husky_gpu_flush, sizeof(husky_gpu_flush));
++	(void)PE_parse_boot_argn("huskygpupre", &husky_gpu_pre, sizeof(husky_gpu_pre));
++	(void)PE_parse_boot_argn("huskyiogpu", &husky_iogpu, sizeof(husky_iogpu));
++	HU_LOG("HUSKY GPU: probe mode %u (flush %u, preflight %u, iogpu self-test %u)\n", mode, husky_gpu_flush,
++	    husky_gpu_pre, husky_iogpu);
+ 	husky_gpu_mode = mode;
+ 	vm_offset_t pmu = ml_io_map(PMU_PA, PMU_SIZE);
+ 	if (!pmu) {
+@@ -1458,7 +1468,9 @@ husky_gpu_probe(void)
+ 			return;
+ 		}
+ 	}
+-	husky_gpu_preflight();
++	if (husky_gpu_pre) {
++		husky_gpu_preflight();
++	}
+ 	husky_gpu_dump();
+ 	if (mode >= 3) {
+ 		husky_gpu_mcu_boot();
+diff --git a/iokit/Families/IOGPU/husky_iogpu_selftest.cpp b/iokit/Families/IOGPU/husky_iogpu_selftest.cpp
+index 76d90bb..7e0c3b0 100644
+--- a/iokit/Families/IOGPU/husky_iogpu_selftest.cpp
++++ b/iokit/Families/IOGPU/husky_iogpu_selftest.cpp
+@@ -34,8 +34,19 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern "C" void husky_log_final_flush(void);
+-/* Each line goes to the on-disk log immediately: a hard freeze still leaves the last step on disk. */
+-#define HU_LOG(...) do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); husky_log_final_flush(); } while (0)
++/* boot-arg huskygpuflush=1: each line goes to the on-disk log immediately (0110 bisect toggle). */
++static uint32_t
++selftest_flush_on(void)
++{
++	static int v = -1;
++	if (v < 0) {
++		uint32_t f = 0;
++		(void)PE_parse_boot_argn("huskygpuflush", &f, sizeof(f));
++		v = (int)f;
++	}
++	return (uint32_t)v;
++}
++#define HU_LOG(...) do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); if (selftest_flush_on()) husky_log_final_flush(); } while (0)
+ 
+ /* Compute job layout and constants [husky_gpu.c:625-633, 683-710; husky_gpu_compute.h:8-60] */
+ #define HUSKY_COMP_JOB_VA       0x06004000u
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 6fab3d5..f0d870c 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -79,8 +79,19 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern void husky_log_final_flush(void);
+-/* Each line goes to the on-disk log immediately (huskygpu=6 bring-up: hard freezes lose the 5 s window). */
+-#define BR_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); husky_log_final_flush(); } while (0)
++/* boot-arg huskygpuflush=1: each line goes to the on-disk log immediately (0110 bisect toggle). */
++static uint32_t
++bridge_flush_on(void)
++{
++	static int v = -1;
++	if (v < 0) {
++		uint32_t f = 0;
++		(void)PE_parse_boot_argn("huskygpuflush", &f, sizeof(f));
++		v = (int)f;
++	}
++	return (uint32_t)v;
++}
++#define BR_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); if (bridge_flush_on()) husky_log_final_flush(); } while (0)
+ 
+ /* ---- FW IFACE flags [husky_gpu.c:217-223] ---- */
+ #define FW_IFACE_RD             (1u << 0)
