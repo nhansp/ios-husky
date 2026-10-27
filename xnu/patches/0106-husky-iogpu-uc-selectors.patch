@@ -1,0 +1,31 @@
+diff --git a/iokit/Families/IOGPU/IOGPUDevice.cpp b/iokit/Families/IOGPU/IOGPUDevice.cpp
+index 53bb4f4..944f8f9 100644
+--- a/iokit/Families/IOGPU/IOGPUDevice.cpp
++++ b/iokit/Families/IOGPU/IOGPUDevice.cpp
+@@ -125,7 +125,8 @@ ns_add_internal(IOLock *lock, OSArray *arr, uint32_t *pNextId, OSObject *obj)
+ 	unsigned int idx = id - 1;
+ 	bool ok = false;
+ 	if (idx < arr->getCount()) {
+-		ok = arr->replaceObject(idx, obj);
++		arr->replaceObject(idx, obj);
++		ok = true;
+ 	} else if (idx == arr->getCount()) {
+ 		ok = arr->setObject(obj);
+ 	} else {
+diff --git a/iokit/Families/IOGPU/iogpu_uc_abi.h b/iokit/Families/IOGPU/iogpu_uc_abi.h
+index 887088d..90fa4a0 100644
+--- a/iokit/Families/IOGPU/iogpu_uc_abi.h
++++ b/iokit/Families/IOGPU/iogpu_uc_abi.h
+@@ -230,6 +230,12 @@ typedef struct iogpu_device_info {       /* 0x40 bytes */
+     uint32_t reserved2;                  /* +0x3c */
+ } iogpu_device_info_t;
+ 
++/* Selector numbers used by the in-kernel self-test and callers (spec 01 dispatch table). */
++#define IOGPU_SEL_GET_STAMP_CONFIG    2u
++#define IOGPU_SEL_NEW_COMMAND_QUEUE   6u
++#define IOGPU_SEL_NEW_RESOURCE        8u
++#define IOGPU_SEL_CREATE_DEVICE_SHMEM 12u
++
+ /* -- sel 2 GET_STAMP_CONFIG (bOut 0x218 = 536) [A7-sel2-layout / A3-sel2-layout] */
+ #define IOGPU_STAMP_CONFIG_SIZE     0x218u
+ #define IOGPU_STAMP_MAX_SLOTS       128u   /* (0x218 - 0x18) / 4 */
