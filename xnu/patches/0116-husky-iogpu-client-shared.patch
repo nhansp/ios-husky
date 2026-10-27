@@ -1,0 +1,176 @@
+diff --git a/iokit/Families/IOGPU/IOGPUDevice.cpp b/iokit/Families/IOGPU/IOGPUDevice.cpp
+index 8d8ed9e..a494715 100644
+--- a/iokit/Families/IOGPU/IOGPUDevice.cpp
++++ b/iokit/Families/IOGPU/IOGPUDevice.cpp
+@@ -101,6 +101,8 @@ IOGPUDevice::free()
+ 	OSSafeReleaseNULL(fNotifQueues);
+ 	OSSafeReleaseNULL(fResources);
+ 	OSSafeReleaseNULL(fShmems);
++	OSSafeReleaseNULL(fCSMap);
++	OSSafeReleaseNULL(fCSPool);
+ 	OSSafeReleaseNULL(fTask);
+ 
+ 	if (fLock) {
+@@ -173,6 +175,45 @@ ns_remove_internal(IOLock *lock, OSArray *arr, uint32_t id)
+ }
+ 
+ /* Resource namespace */
++uint64_t
++IOGPUDevice::allocClientShared(uint32_t *slot)
++{
++	uint64_t va = 0;
++	IOLockLock(fLock);
++	if (fCSPool == NULL) {
++		fCSPool = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIOMemoryKernelUserShared | kIODirectionInOut, IOGPU_CS_SLOTS * IOGPU_CS_SLOT_SIZE, page_size);
++		fCSMap = fCSPool ? fCSPool->createMappingInTask(fOwner, 0, kIOMapAnywhere) : NULL;
++		if (fCSMap == NULL) {
++			OSSafeReleaseNULL(fCSPool);
++		} else {
++			bzero(fCSPool->getBytesNoCopy(), IOGPU_CS_SLOTS * IOGPU_CS_SLOT_SIZE);
++		}
++	}
++	for (uint32_t i = 0; fCSMap != NULL && i < IOGPU_CS_SLOTS; i++) {
++		if (!(fCSUsed[i / 32] & (1u << (i % 32)))) {
++			fCSUsed[i / 32] |= 1u << (i % 32);
++			bzero((uint8_t *)fCSPool->getBytesNoCopy() + i * IOGPU_CS_SLOT_SIZE, IOGPU_CS_SLOT_SIZE);
++			*slot = i;
++			va = fCSMap->getAddress() + i * IOGPU_CS_SLOT_SIZE;
++			break;
++		}
++	}
++	IOLockUnlock(fLock);
++	return va;
++}
++
++void
++IOGPUDevice::freeClientShared(uint32_t slot)
++{
++	if (slot >= IOGPU_CS_SLOTS) {
++		return;
++	}
++	IOLockLock(fLock);
++	fCSUsed[slot / 32] &= ~(1u << (slot % 32));
++	IOLockUnlock(fLock);
++}
++
+ uint32_t
+ IOGPUDevice::addResource(IOGPUResource *r)
+ {
+diff --git a/iokit/Families/IOGPU/IOGPUDevice.h b/iokit/Families/IOGPU/IOGPUDevice.h
+index 4c56ac6..66cc3a2 100644
+--- a/iokit/Families/IOGPU/IOGPUDevice.h
++++ b/iokit/Families/IOGPU/IOGPUDevice.h
+@@ -32,6 +32,9 @@ class IOGPUNotificationQueue;
+  * Four pool types: 0=segment-list, 1=kernel-command, 2=debug, 3=sideband
+  * [spec 01 lines 261-266, 353].
+  */
++#define IOGPU_CS_SLOT_SIZE      0x80u
++#define IOGPU_CS_SLOTS          2048u
++
+ class IOGPUDeviceShmem : public OSObject {
+ 	OSDeclareDefaultStructors(IOGPUDeviceShmem);
+ 
+@@ -74,6 +77,11 @@ class IOGPUDevice : public OSObject {
+ 	uint32_t    fNextNqId;
+ 	uint32_t    fNextQueueId;
+ 
++	/* Per-resource client-shared blocks (reply +0x10): zeroed slots of one kernel/user shared pool. */
++	IOBufferMemoryDescriptor *fCSPool;
++	IOMemoryMap *fCSMap;
++	uint32_t    fCSUsed[IOGPU_CS_SLOTS / 32];
++
+ public:
+ 	uint64_t    fClientId;
+ 
+@@ -85,6 +93,8 @@ public:
+ 	IOGPUTask *task()  const { return fTask; }
+ 
+ 	/* Namespace operations: return non-zero handle on success, 0 on error */
++	uint64_t      allocClientShared(uint32_t *slot);
++	void          freeClientShared(uint32_t slot);
+ 	uint32_t      addResource(IOGPUResource *r);
+ 	IOGPUResource *lookupResource(uint32_t id);
+ 	void          removeResource(uint32_t id);
+diff --git a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+index 5e51170..f472bfa 100644
+--- a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
++++ b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+@@ -364,6 +364,12 @@ h_new_resource(OSObject *target, void *, IOExternalMethodArguments *a)
+ 		r->release();
+ 		return rc;
+ 	}
++	if (!r->attachClientShared()) {
++		new_resource_refused("client-shared pool full", a, in, kIOGPUReturnNoMemory);
++		OSSafeReleaseNULL(inMap);
++		r->release();
++		return kIOGPUReturnNoMemory;
++	}
+ 	uint32_t inFlags = in->flags, inType = in->resType;
+ 	OSSafeReleaseNULL(inMap);
+ 
+@@ -378,6 +384,7 @@ h_new_resource(OSObject *target, void *, IOExternalMethodArguments *a)
+ 	bzero(o, 0x58);
+ 	o->gpuAddress   = r->gpuAddress();
+ 	o->cpuAddress   = r->cpuAddress();   /* CLIENT TASK VA [fixes REVIEWS.md:70, 99] */
++	o->clientShared = r->clientShared();
+ 	o->resourceId   = id;
+ 	o->residentSize = r->residentSize();
+ 	o->gpuVALength  = r->gpuLength();
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.cpp b/iokit/Families/IOGPU/IOGPUMemory.cpp
+index 3d186e0..fc148e4 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.cpp
++++ b/iokit/Families/IOGPU/IOGPUMemory.cpp
+@@ -226,6 +226,10 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ void
+ IOGPUResource::free()
+ {
++	if (fCSSlot && fDevice) {
++		fDevice->freeClientShared(fCSSlot - 1);
++		fCSSlot = 0;
++	}
+ 	OSSafeReleaseNULL(fClientMap);
+ 	OSSafeReleaseNULL(fMemDesc);
+ 	OSSafeReleaseNULL(fGroupMembers);
+@@ -236,6 +240,19 @@ IOGPUResource::free()
+ 	OSObject::free();
+ }
+ 
++/* IOGPUMetalResource init releases a resource whose client-shared block is 0 (DSC:IOGPU:0x1cc846770-0x1cc846778). */
++bool
++IOGPUResource::attachClientShared()
++{
++	uint32_t slot;
++	fClientShared = fDevice->allocClientShared(&slot);
++	if (fClientShared == 0) {
++		return false;
++	}
++	fCSSlot = slot + 1;
++	return true;
++}
++
+ mali_gpu_va_t
+ IOGPUResource::gpuAddress()
+ {
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.h b/iokit/Families/IOGPU/IOGPUMemory.h
+index f6900fc..42d1968 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.h
++++ b/iokit/Families/IOGPU/IOGPUMemory.h
+@@ -55,6 +55,8 @@ class IOGPUResource : public OSObject {
+ 	IOMemoryDescriptor *fMemDesc;
+ 	IOMemoryMap        *fClientMap;   /* Client mapping in dev->owner() task */
+ 	OSArray            *fGroupMembers;/* Resource group (type 3) counted set */
++	uint64_t            fClientShared;
++	uint32_t            fCSSlot;      /* + 1; 0 = none */
+ 
+ public:
+ 	IOReturn createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t *in,
+@@ -63,6 +65,8 @@ public:
+ 
+ 	mali_gpu_va_t gpuAddress();
+ 	uint64_t      cpuAddress() const { return fCpuAddr; }
++	uint64_t      clientShared() const { return fClientShared; }
++	bool          attachClientShared();
+ 	uint64_t      residentSize() const { return fSize; }
+ 	uint64_t      gpuLength() const { return fSize; }
+ 	mali_bo_t    *bo() const { return fBO; }
