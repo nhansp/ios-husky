@@ -1,0 +1,90 @@
+diff --git a/iokit/Families/IOGPU/IOGPU.cpp b/iokit/Families/IOGPU/IOGPU.cpp
+index 07b985c..389ea66 100644
+--- a/iokit/Families/IOGPU/IOGPU.cpp
++++ b/iokit/Families/IOGPU/IOGPU.cpp
+@@ -18,6 +18,36 @@
+ #include "IOGPUEventMachine.h"
+ #include "IOGPUMemory.h"     /* needed for IOGPUTask definition; fixes REVIEWS.md:68 */
+ #include <pexpert/pexpert.h>
++#include <sys/proc.h>
++
++/* boot-arg huskygpuclients=a,b: only these processes get a device (bring-up isolation). */
++static bool
++iogpu_client_allowed(void)
++{
++	static char allow[128];
++	static int parsed;
++	if (!parsed) {
++		if (!PE_parse_boot_argn("huskygpuclients", allow, sizeof(allow))) {
++			allow[0] = 0;
++		}
++		parsed = 1;
++	}
++	if (!allow[0]) {
++		return true;
++	}
++	char name[64];
++	proc_selfname(name, sizeof(name));
++	size_t n = strlen(name);
++	for (const char *p = allow; *p;) {
++		const char *end = strchr(p, ',');
++		size_t len = end ? (size_t)(end - p) : strlen(p);
++		if (len == n && !strncmp(p, name, n)) {
++			return true;
++		}
++		p += len + (end ? 1 : 0);
++	}
++	return false;
++}
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ OSDefineMetaClassAndAbstractStructors(IOGPU, IOAcceleratorES);
+@@ -173,6 +203,9 @@ IOGPU::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+ 	    kind != IOGPU_UC_CONNECT_TYPE_MEMINFO) {
+ 		return kIOReturnUnsupported;
+ 	}
++	if (!iogpu_client_allowed()) {
++		return kIOReturnNotPermitted;
++	}
+ 
+ 	IOGPUDeviceUserClient *uc = OSTypeAlloc(IOGPUDeviceUserClient);
+ 	if (uc == NULL) {
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 3c85eb0..5894aed 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -406,13 +406,27 @@ op_configure_device(const void *provider, mali_backend_t **out)
+ 	(void)provider;
+ 	bzero(&g_mali_backend, sizeof(g_mali_backend));
+ 
+-	/* Fill device properties matching Mali-G715 r1p2 [husky_gpu.c lines 136-161] */
+-	g_mali_backend.props.gpu_id                 = 0xb8a21020ULL;  /* Mali-G715 r1p2 */
+-	g_mali_backend.props.gpu_variant            = 0;
+-	g_mali_backend.props.gpu_features           = 0;
+-	g_mali_backend.props.shader_present         = GPU_SHADER_PRESENT; /* 7 cores [husky_gpu.c:213] */
+-	g_mali_backend.props.core_count             = 7;
+-	g_mali_backend.props.core_id_range          = 25;
++	mali_dev_props_t *p = &g_mali_backend.props;
++	p->gpu_id                 = grd(0x00);
++	p->l2_features            = grd(0x04);
++	p->gpu_variant            = grd(0x08) & 0xff;
++	p->tiler_features         = grd(0x0c);
++	p->mem_features           = grd(0x10);
++	p->mmu_features           = grd(0x14);
++	p->as_present             = grd(0x18);
++	p->csf_id                 = grd(0x1c);
++	p->gpu_features           = (uint64_t)grd(0x60) | ((uint64_t)grd(0x64) << 32);
++	p->max_threads_per_core   = grd(0xa0);
++	p->max_threads_per_wg     = grd(0xa4);
++	uint32_t thread_features  = grd(0xac);
++	p->max_tasks_per_core     = thread_features >> 24;
++	p->num_registers_per_core = thread_features & 0x3fffff;
++	for (unsigned n = 0; n < 4; n++) {
++		p->texture_features[n] = grd(0xb0 + 4 * n);
++	}
++	p->shader_present         = (uint64_t)grd(0x100) | ((uint64_t)grd(0x104) << 32);
++	p->core_count             = (uint32_t)__builtin_popcountll(p->shader_present);
++	p->core_id_range          = p->shader_present ? 64u - (uint32_t)__builtin_clzll(p->shader_present) : 0;
+ 	g_mali_backend.props.num_csg                = 8;
+ 	g_mali_backend.props.num_cs_per_csg         = 8;
+ 	g_mali_backend.props.cs_reg_count           = 96;
