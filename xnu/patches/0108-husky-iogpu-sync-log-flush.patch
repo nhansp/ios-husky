@@ -1,0 +1,108 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 4bcd672..d62282d 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -85,7 +85,14 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+-#define HU_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
++/*
++ * huskygpu>=6: every line is also flushed to the on-disk log right away, so a hard freeze in the
++ * GPU/IOGPU path still leaves its last line on disk (the periodic flush runs only every 5 s).
++ */
++extern void husky_log_final_flush(void);
++static uint32_t husky_gpu_mode; /* boot-arg huskygpu (defined below) */
++#define HU_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); \
++	if (husky_gpu_mode >= 6) husky_log_final_flush(); } while (0)
+ 
+ #define PMU_PA                  0x15460000ULL
+ #define PMU_SIZE                0x4000ULL
+@@ -523,7 +530,6 @@ vm_offset_t husky_gpu_shared_nc;
+ uint32_t    husky_gpu_shared_size;
+ vm_offset_t husky_gpu_gin;
+ vm_offset_t husky_gpu_gout;
+-static uint32_t husky_gpu_mode; /* boot-arg huskygpu */
+ static uint64_t render_pa;      /* render area (huskygpu=5) */
+ 
+ static uint64_t *
+diff --git a/iokit/Families/IOGPU/husky_iogpu_selftest.cpp b/iokit/Families/IOGPU/husky_iogpu_selftest.cpp
+index a04b70a..76d90bb 100644
+--- a/iokit/Families/IOGPU/husky_iogpu_selftest.cpp
++++ b/iokit/Families/IOGPU/husky_iogpu_selftest.cpp
+@@ -33,7 +33,9 @@
+ #include <sys/systm.h>
+ #include <pexpert/pexpert.h>
+ 
+-#define HU_LOG(...) do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
++extern "C" void husky_log_final_flush(void);
++/* Each line goes to the on-disk log immediately: a hard freeze still leaves the last step on disk. */
++#define HU_LOG(...) do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); husky_log_final_flush(); } while (0)
+ 
+ /* Compute job layout and constants [husky_gpu.c:625-633, 683-710; husky_gpu_compute.h:8-60] */
+ #define HUSKY_COMP_JOB_VA       0x06004000u
+@@ -149,11 +151,13 @@ husky_iogpu_selftest(void)
+ 		OSSafeReleaseNULL(accel);
+ 		return false;
+ 	}
++	HU_LOG("HUSKY IOGPU: [1/7] attach MaliAccelerator to IOResources\n");
+ 	if (!accel->attach(res)) {
+ 		HU_LOG("HUSKY IOGPU: [1/7] attach MaliAccelerator to IOResources: FAIL\n");
+ 		OSSafeReleaseNULL(accel);
+ 		return false;
+ 	}
++	HU_LOG("HUSKY IOGPU: [1/7] MaliAccelerator setupDevice\n");
+ 	if (!accel->setupDevice(res)) {
+ 		HU_LOG("HUSKY IOGPU: [1/7] MaliAccelerator device setup: FAIL\n");
+ 		accel->detach(res);
+@@ -161,6 +165,7 @@ husky_iogpu_selftest(void)
+ 		return false;
+ 	}
+ 
++	HU_LOG("HUSKY IOGPU: [1/7] IOGPUDeviceUserClient init/attach/start\n");
+ 	IOGPUDeviceUserClient *uc = OSTypeAlloc(IOGPUDeviceUserClient);
+ 	if (uc == NULL || !uc->initWithTask(kernel_task, NULL, 0, NULL)) {
+ 		HU_LOG("HUSKY IOGPU: [1/7] init IOGPUDeviceUserClient: FAIL\n");
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index b4fd6d0..6fab3d5 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -78,7 +78,9 @@
+ #include <vm/pmap.h>
+ #include <pexpert/pexpert.h>
+ 
+-#define BR_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
++extern void husky_log_final_flush(void);
++/* Each line goes to the on-disk log immediately (huskygpu=6 bring-up: hard freezes lose the 5 s window). */
++#define BR_LOG(...)     do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); husky_log_final_flush(); } while (0)
+ 
+ /* ---- FW IFACE flags [husky_gpu.c:217-223] ---- */
+ #define FW_IFACE_RD             (1u << 0)
+@@ -487,6 +489,7 @@ static mali_status_t
+ vm_as_update(mali_vm_t *vm)
+ {
+ 	uint32_t as_reg = AS0 + (uint32_t)vm->as_slot * AS_STRIDE;
++	BR_LOG("HUSKY IOGPU bridge: AS%d update, root 0x%llx\n", vm->as_slot, (unsigned long long)vm->root_pa);
+ 	if (!gpoll(as_reg + AS_STATUS, 3, 0, 100000, NULL)) {
+ 		BR_LOG("HUSKY IOGPU bridge: AS%d busy before update\n", vm->as_slot);
+ 		return EBUSY;
+@@ -1065,6 +1068,8 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 
+ 	/* Ring the queue's CS doorbell [husky_gpu.c:676, 997] (doorbell 2: CSG1/CS0) */
++	BR_LOG("HUSKY IOGPU bridge: submit: %u words at ring +0x%x, insert 0x%x, doorbell %u, want sync %llu\n",
++	    n, 8 * q->ring_used, new_in, BRIDGE_DOORBELL_ID, (unsigned long long)expected_sync);
+ 	gwr(DOORBELL(BRIDGE_DOORBELL_ID), 1);
+ 
+ 	/* Poll sync object for hardware completion [husky_gpu.c:672-678] */
+@@ -1076,6 +1081,10 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 		delay(10);
+ 	}
+ 
++	BR_LOG("HUSKY IOGPU bridge: submit %s after %u us: sync %llu, ring extract 0x%llx\n",
++	    us < 500000 ? "completed" : "TIMED OUT", us,
++	    (unsigned long long)(so != NULL && so->cpu != NULL ? *so->cpu : 0),
++	    (unsigned long long)(q->ring_out_cpu != NULL ? q->ring_out_cpu[0] : 0));
+ 	q->ring_used += total;
+ 	return (us < 500000) ? 0 : ETIMEDOUT;
+ }
