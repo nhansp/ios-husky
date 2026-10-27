@@ -1,0 +1,320 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 391e23b..37774e3 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -180,7 +180,7 @@ husky_gpu_dump(void)
+ 
+ /* ---- CSF firmware boot (huskygpu=3) ---- */
+ 
+-#define GPU_MAP_SIZE            0xA1000ULL      /* up to doorbell 2 (doorbell 2 = IOGPU bridge queue) */
++#define GPU_MAP_SIZE            0x101000ULL     /* up to doorbell 8 (IOGPU bridge: CSG n rings doorbell n+1) */
+ #define GPU_IRQ_RAWSTAT         0x020u
+ #define GPU_IRQ_CLEAR           0x024u
+ #define GPU_IRQ_MASK            0x028u
+@@ -358,14 +358,18 @@ static const uint32_t gpu_l2_hash[3] = {0x0036DB6D, 0x005B6DB6, 0x0};
+  */
+ #include "husky_gpu_render.h"
+ /*
+- * IOGPU bridge queue area (huskygpu=6): ring input page, ring output page, then the group suspend
+- * buffer. The firmware reads these through the MCU's address space (kbase maps a queue's user I/O
+- * pages and its group's suspend buffer into the MCU shared region, mali_kbase_csf_mcu_shared_reg.c),
+- * so they are mapped here before the MCU boots, like the job area. Only the ring itself lives in the
+- * bridge VM's own address space.
++ * IOGPU bridge queue area (huskygpu>=6): one slot per bridge group CSG1..CSG7, each a ring input
++ * page, a ring output page, then the group suspend buffer (firmware GROUP_SUSPEND_SIZE is 0x6700).
++ * The firmware reads these through the MCU's address space (kbase maps a queue's user I/O pages and
++ * its group's suspend buffer into the MCU shared region, mali_kbase_csf_mcu_shared_reg.c), so they
++ * are mapped here before the MCU boots, like the job area. Only the ring itself lives in the bridge
++ * VM's own address space.
+  */
+ #define BRIO_VA                 0x07800000u
+-#define BRIO_SIZE               (2 * GPU_PAGE + TEST_SUSPEND_MAX)
++#define BRIO_SUSPEND            0x10000u
++#define BRIO_SLOT               (2 * GPU_PAGE + BRIO_SUSPEND)
++#define BRIO_SLOTS              7u
++#define BRIO_SIZE               (BRIO_SLOTS * BRIO_SLOT)
+ uint64_t husky_gpu_brio_pa;     /* 0 unless the area is mapped */
+ #define R_EXEC                  0x000000u       /* HUSKY_GPU_EXEC_VA, 4 KiB, executable */
+ #define R_DESC                  0x001000u       /* HUSKY_GPU_DESC_VA .. GEOM end, 128 KiB */
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 5d1c750..3c85eb0 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -77,6 +77,7 @@
+ #include <vm/vm_kern_xnu.h>
+ #include <vm/pmap.h>
+ #include <pexpert/pexpert.h>
++#include <kern/locks.h>
+ 
+ extern void husky_log_final_flush(void);
+ /* boot-arg huskygpuflush=1: each line goes to the on-disk log immediately (0110 bisect toggle). */
+@@ -115,7 +116,7 @@ bridge_flush_on(void)
+ 
+ #define GPU_PA                  0x1F000000ULL       /* [husky_gpu.c:103] */
+ #define GPU_SIZE                0x1000ULL           /* [husky_gpu.c:104] */
+-#define GPU_MAP_SIZE            0xA1000ULL          /* up to doorbell 2 [husky_gpu.c:166] */
++#define GPU_MAP_SIZE            0x101000ULL         /* up to doorbell 8 [husky_gpu.c GPU_MAP_SIZE] */
+ 
+ #define AS0                     0x2400u             /* [husky_gpu.c:188] */
+ #define AS_TRANSTAB             0x00u               /* [husky_gpu.c:189] */
+@@ -203,15 +204,18 @@ bridge_flush_on(void)
+ #define CS_DOORBELL_ID          1u                  /* [husky_gpu.c:309] proven path; not used here */
+ 
+ /* Bridge slots: never the proven path's CSG0 / doorbell 1 / AS1, never the MCU's AS0. */
+-#define BRIDGE_CSG              1u                  /* group 1, stream 0 */
++#define BRIDGE_CSG_FIRST        1u                  /* groups 1..7 (CSG0 = proven path), stream 0 */
++#define BRIDGE_CSG_LAST         7u
+ #define BRIDGE_CS               0u
+-#define BRIDGE_DOORBELL_ID      2u                  /* DOORBELL(2) = 0xA0000, inside GPU_MAP_SIZE */
++#define BRIDGE_DOORBELL(csg)    ((csg) + 1u)        /* CSG1 -> doorbell 2 ... CSG7 -> 8 (doorbell 1: proven path) */
+ #define BRIDGE_AS_FIRST         2
+ #define BRIDGE_AS_LAST          7                   /* AS_PRESENT 0xff */
+ 
+ #define TEST_SUSPEND_MAX        0x80000u            /* 512 KiB suspend limit [husky_gpu.c:325] */
+ #define BRIO_VA                 0x07800000u         /* MCU-mapped queue area [husky_gpu.c BRIO_VA] */
+-#define BRIO_SIZE               (2 * GPU_PAGE + TEST_SUSPEND_MAX)
++#define BRIO_SUSPEND            0x10000u            /* per-group suspend buffer [husky_gpu.c BRIO_SUSPEND] */
++#define BRIO_SLOT               (2 * GPU_PAGE + BRIO_SUSPEND)
++#define BRIO_SIZE               ((BRIDGE_CSG_LAST - BRIDGE_CSG_FIRST + 1u) * BRIO_SLOT)
+ 
+ /* CS instructions (Mesa genxml v10/v11; opcode in 63:56) [husky_gpu.c:354-366] */
+ #define CS_MOVE48(r, imm)       ((1ULL << 56) | ((uint64_t)(r) << 48) | ((uint64_t)(imm) & 0xffffffffffffULL))
+@@ -384,6 +388,7 @@ struct mali_queue {
+ 	unsigned            ra;
+ 	unsigned            rv;
+ 	uint32_t            waitall;
++	uint32_t            csg;           /* CSG_FIRST..CSG_LAST, owned until queue_destroy */
+ };
+ 
+ struct mali_syncobj {
+@@ -786,10 +791,35 @@ op_dcache_flush(const void *cpu_addr, uint64_t len)
+ 
+ /* --- CSF Queue Create, Submit, and Sync Objects --- */
+ 
+-/* CSG1 has one owner at a time (the bridge has a single group slot). */
++/* Bit n set: group n belongs to a live (or wedged) bridge queue. */
+ static uint32_t g_csg_busy;
++/*
++ * The global doorbell request (GLB_IN_DB_REQ) is a read-modify-write of a register shared by all
++ * groups, and group programming must not interleave with it: serialize both across clients.
++ */
++static LCK_GRP_DECLARE(g_bridge_grp, "husky_iogpu_bridge");
++static LCK_MTX_DECLARE(g_glb_lock, &g_bridge_grp);
++
++static int
++csg_slot_alloc(uint32_t ngroups)
++{
++	for (uint32_t csg = BRIDGE_CSG_FIRST; csg <= BRIDGE_CSG_LAST && csg < ngroups; csg++) {
++		uint32_t bit = 1u << csg;
++		if (!(__atomic_fetch_or(&g_csg_busy, bit, __ATOMIC_ACQ_REL) & bit)) {
++			return (int)csg;
++		}
++	}
++	return -1;
++}
+ 
+-/* Ring a group's doorbell through the global interface [husky_gpu.c:978-980]; bit n = group n. */
++static void
++csg_slot_free(uint32_t csg)
++{
++	__atomic_fetch_and(&g_csg_busy, ~(1u << csg), __ATOMIC_ACQ_REL);
++}
++
++/* Ring a group's doorbell through the global interface [husky_gpu.c:978-980]; bit n = group n.
++ * Caller holds g_glb_lock. */
+ static void
+ glb_group_doorbell(uint32_t csg)
+ {
+@@ -809,9 +839,11 @@ queue_csg_terminate(mali_queue_t *q)
+ 	if (q->csgin == 0 || q->csgout == 0) {
+ 		return true;    /* group was never programmed */
+ 	}
++	lck_mtx_lock(&g_glb_lock);
+ 	uint32_t req = (rd32(q->csgin, CSG_IN_REQ) & ~CSG_STATE_MASK) | CSG_STATE_TERMINATE;
+ 	wr32(q->csgin, CSG_IN_REQ, req);
+-	glb_group_doorbell(BRIDGE_CSG);
++	glb_group_doorbell(q->csg);
++	lck_mtx_unlock(&g_glb_lock);
+ 	unsigned us;
+ 	for (us = 0; us < 100000; us += 10) {
+ 		if ((rd32(q->csgout, CSG_OUT_ACK) & CSG_STATE_MASK) == CSG_STATE_TERMINATE) {
+@@ -820,7 +852,7 @@ queue_csg_terminate(mali_queue_t *q)
+ 		delay(10);
+ 	}
+ 	BR_LOG("HUSKY IOGPU bridge: CSG%u terminate NOT acked after %u us (ack 0x%x state 0x%x)\n",
+-	    BRIDGE_CSG, us, rd32(q->csgout, CSG_OUT_ACK), rd32(q->csgout, CSG_OUT_STATUS_STATE));
++	    q->csg, us, rd32(q->csgout, CSG_OUT_ACK), rd32(q->csgout, CSG_OUT_STATUS_STATE));
+ 	return false;
+ }
+ 
+@@ -852,19 +884,22 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 		BR_LOG("HUSKY IOGPU bridge: queue_create: CSF interface not up\n");
+ 		return ENXIO;
+ 	}
+-	if (rd32(shared, GLB_GROUP_NUM) <= BRIDGE_CSG) {
+-		BR_LOG("HUSKY IOGPU bridge: queue_create: firmware has %u groups\n", rd32(shared, GLB_GROUP_NUM));
+-		return ENXIO;
++	if (__atomic_load_n(&g_csg_wedged, __ATOMIC_ACQUIRE)) {
++		BR_LOG("HUSKY IOGPU bridge: queue_create: a GPU group is wedged; refusing new queues\n");
++		return EBUSY;
+ 	}
+-	if (__atomic_exchange_n(&g_csg_busy, 1u, __ATOMIC_ACQ_REL) != 0) {
+-		BR_LOG("HUSKY IOGPU bridge: queue_create: CSG%u already in use\n", BRIDGE_CSG);
++	int slot = csg_slot_alloc(rd32(shared, GLB_GROUP_NUM));
++	if (slot < 0) {
++		BR_LOG("HUSKY IOGPU bridge: queue_create: no free group (CSG%u-%u busy, firmware has %u)\n",
++		    BRIDGE_CSG_FIRST, BRIDGE_CSG_LAST, rd32(shared, GLB_GROUP_NUM));
+ 		return EBUSY;
+ 	}
+ 	mali_queue_t *q = (mali_queue_t *)kalloc_data(sizeof(mali_queue_t), Z_WAITOK | Z_ZERO);
+ 	if (q == NULL) {
+-		__atomic_store_n(&g_csg_busy, 0u, __ATOMIC_RELEASE);
++		csg_slot_free((uint32_t)slot);
+ 		return ENOMEM;
+ 	}
++	q->csg = (uint32_t)slot;
+ 
+ 	q->vm        = vm;
+ 	q->cs_mask   = cs_mask;
+@@ -885,7 +920,7 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 	/*
+ 	 * RING_INPUT / RING_OUTPUT pages and the suspend buffer are read by the firmware in the MCU's
+ 	 * address space, not the group's: they come from husky_gpu.c's BRIO area, mapped in the MCU
+-	 * tables before the MCU booted (one bridge queue at a time, guarded by g_csg_busy).
++	 * tables before the MCU booted; slot csg-1 of BRIO belongs to group csg.
+ 	 */
+ 	if (husky_gpu_brio_pa == 0) {
+ 		BR_LOG("HUSKY IOGPU bridge: queue_create: no MCU-mapped queue area (huskygpu<6?)\n");
+@@ -898,23 +933,25 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 			goto fail;
+ 		}
+ 	}
++	vm_offset_t slot_kva = g_brio_kva + (q->csg - BRIDGE_CSG_FIRST) * BRIO_SLOT;
++	uint64_t slot_va = BRIO_VA + (uint64_t)(q->csg - BRIDGE_CSG_FIRST) * BRIO_SLOT;
+ 	for (uint32_t off = 0; off < 2 * GPU_PAGE; off += 8) {
+-		*(volatile uint64_t *)(g_brio_kva + off) = 0;   /* fresh insert/extract pointers */
++		*(volatile uint64_t *)(slot_kva + off) = 0;     /* fresh insert/extract pointers */
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	q->ring_in_cpu    = (volatile uint64_t *)g_brio_kva;
+-	q->ring_out_cpu   = (volatile uint64_t *)(g_brio_kva + GPU_PAGE);
+-	q->ring_in_gpu    = BRIO_VA;
+-	q->ring_out_gpu   = BRIO_VA + GPU_PAGE;
+-	q->suspend_gpu_va = BRIO_VA + 2 * GPU_PAGE;
++	q->ring_in_cpu    = (volatile uint64_t *)slot_kva;
++	q->ring_out_cpu   = (volatile uint64_t *)(slot_kva + GPU_PAGE);
++	q->ring_in_gpu    = slot_va;
++	q->ring_out_gpu   = slot_va + GPU_PAGE;
++	q->suspend_gpu_va = slot_va + 2 * GPU_PAGE;
+ 
+ 	/*
+-	 * Group BRIDGE_CSG (1), stream 0, mirroring husky_gpu.c:873-988. Control blocks: group i at
++	 * Group q->csg, stream 0, mirroring husky_gpu.c:873-988. Control blocks: group i at
+ 	 * shared + 0x1000 + i * GLB_GROUP_STRIDE, stream j at group + 0x40 + j * GROUP_STREAM_STRIDE
+ 	 * [husky_gpu.c:257-261, 882].
+ 	 */
+ 	uint32_t group_stride  = rd32(shared, GLB_GROUP_STRIDE);
+-	vm_offset_t csg_ctl    = shared + CSF_GROUP_CONTROL + BRIDGE_CSG * group_stride;
++	vm_offset_t csg_ctl    = shared + CSF_GROUP_CONTROL + q->csg * group_stride;
+ 	vm_offset_t cs_ctl     = csg_ctl + CSF_STREAM_CONTROL + BRIDGE_CS * rd32(csg_ctl, GROUP_STREAM_STRIDE);
+ 	uint32_t csg_in_va  = rd32(csg_ctl, GROUP_INPUT_VA);
+ 	uint32_t csg_out_va = rd32(csg_ctl, GROUP_OUTPUT_VA);
+@@ -923,7 +960,7 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 	uint32_t cs_in_va   = rd32(cs_ctl, STREAM_INPUT_VA);
+ 	uint32_t cs_out_va  = rd32(cs_ctl, STREAM_OUTPUT_VA);
+ 	BR_LOG("HUSKY IOGPU bridge: group stride 0x%x; CSG%u in 0x%x out 0x%x suspend 0x%x; CS%u features 0x%x "
+-	    "in 0x%x out 0x%x; AS%d\n", group_stride, BRIDGE_CSG, csg_in_va, csg_out_va, suspend, BRIDGE_CS,
++	    "in 0x%x out 0x%x; AS%d\n", group_stride, q->csg, csg_in_va, csg_out_va, suspend, BRIDGE_CS,
+ 	    cs_feat, cs_in_va, cs_out_va, vm->as_slot);
+ 
+ 	/* Same sanity checks as husky_gpu.c:885-899 */
+@@ -937,7 +974,7 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 	}
+ 	unsigned regs = (cs_feat & 0xff) + 1;
+ 	unsigned sbs  = (cs_feat >> 8) & 0xff;
+-	if (regs < 8 || sbs == 0 || sbs > 16 || suspend > TEST_SUSPEND_MAX) {
++	if (regs < 8 || sbs == 0 || sbs > 16 || suspend > BRIO_SUSPEND) {
+ 		BR_LOG("HUSKY IOGPU bridge: unexpected CS features 0x%x / suspend size 0x%x\n", cs_feat, suspend);
+ 		st = ENXIO;
+ 		goto fail;
+@@ -961,12 +998,13 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 	wr32(csin, CS_IN_RING_SIZE, q->ring_size);
+ 	wr64(csin, CS_IN_RING_INPUT, q->ring_in_gpu);
+ 	wr64(csin, CS_IN_RING_OUTPUT, q->ring_out_gpu);
+-	wr32(csin, CS_IN_CONFIG, 1u | (BRIDGE_DOORBELL_ID << 8)); /* priority 1, doorbell 2 */
++	wr32(csin, CS_IN_CONFIG, 1u | (BRIDGE_DOORBELL(q->csg) << 8)); /* priority 1, the group's doorbell */
+ 	wr32(csin, CS_IN_ACK_IRQ_MASK, ~0u);
+ 	uint32_t mask = CS_IDLE_SYNC_WAIT | CS_IDLE_EMPTY | CS_STATE_MASK;
+ 	wr32(csin, CS_IN_REQ, (rd32(csin, CS_IN_REQ) & ~mask) | CS_IDLE_SYNC_WAIT | CS_IDLE_EMPTY | CS_STATE_START);
+ 
+-	/* Program CSG 1 [husky_gpu.c:962-977] */
++	/* Program the group [husky_gpu.c:962-977], serialized with other clients' doorbell requests */
++	lck_mtx_lock(&g_glb_lock);
+ 	unsigned cores = (unsigned)__builtin_popcountll(GPU_SHADER_PRESENT);
+ 	wr64(csgin, CSG_IN_ALLOW_COMPUTE, GPU_SHADER_PRESENT);
+ 	wr64(csgin, CSG_IN_ALLOW_FRAGMENT, GPU_SHADER_PRESENT);
+@@ -982,8 +1020,9 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 	    ((rd32(csgout, CSG_OUT_ACK) ^ CSG_ENDPOINT_CONFIG) & CSG_ENDPOINT_CONFIG);
+ 	wr32(csgin, CSG_IN_REQ, csg_req);
+ 
+-	/* Ring group 1's doorbell via the global interface [husky_gpu.c:978-980] */
+-	glb_group_doorbell(BRIDGE_CSG);
++	/* Ring the group's doorbell via the global interface [husky_gpu.c:978-980] */
++	glb_group_doorbell(q->csg);
++	lck_mtx_unlock(&g_glb_lock);
+ 
+ 	/* Poll CSG ack [husky_gpu.c:982-995]; a timeout fails the queue */
+ 	unsigned us;
+@@ -993,12 +1032,12 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 		}
+ 		delay(10);
+ 	}
+-	BR_LOG("HUSKY IOGPU bridge: CSG%u start %s after %u us (req 0x%x ack 0x%x)\n", BRIDGE_CSG,
++	BR_LOG("HUSKY IOGPU bridge: CSG%u start %s after %u us (req 0x%x ack 0x%x)\n", q->csg,
+ 	    us < 100000 ? "acked" : "NOT acked", us, csg_req, rd32(csgout, CSG_OUT_ACK));
+ 	if (us >= 100000) {
+ 		st = ETIMEDOUT;
+ 		if (!queue_csg_terminate(q)) {
+-			/* group state unknown: keep CSG1 marked busy and leave its buffers to the GPU */
++			/* group state unknown: keep its slot marked busy and leave its buffers to the GPU */
+ 			kfree_data(q, sizeof(mali_queue_t));
+ 			return st;
+ 		}
+@@ -1010,8 +1049,8 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 
+ fail:
+ 	queue_free_buffers(q);
++	csg_slot_free(q->csg);
+ 	kfree_data(q, sizeof(mali_queue_t));
+-	__atomic_store_n(&g_csg_busy, 0u, __ATOMIC_RELEASE);
+ 	return st;
+ }
+ 
+@@ -1024,14 +1063,14 @@ op_queue_destroy(mali_queue_t *q)
+ 	/* Stop the group before its ring/control/suspend buffers go away. */
+ 	if (!queue_csg_terminate(q)) {
+ 		/* The firmware may still use them: leak rather than free memory under a live group. */
+-		BR_LOG("HUSKY IOGPU bridge: queue_destroy: leaking queue buffers, CSG%u stays reserved\n", BRIDGE_CSG);
++		BR_LOG("HUSKY IOGPU bridge: queue_destroy: leaking queue buffers, CSG%u stays reserved\n", q->csg);
+ 		__atomic_store_n(&g_csg_wedged, 1u, __ATOMIC_RELEASE);
+ 		kfree_data(q, sizeof(mali_queue_t));
+ 		return;
+ 	}
+ 	queue_free_buffers(q);
++	csg_slot_free(q->csg);
+ 	kfree_data(q, sizeof(mali_queue_t));
+-	__atomic_store_n(&g_csg_busy, 0u, __ATOMIC_RELEASE);
+ }
+ 
+ /*
+@@ -1106,8 +1145,8 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 
+ 	/* Ring the queue's CS doorbell [husky_gpu.c:676, 997] (doorbell 2: CSG1/CS0) */
+ 	BR_LOG("HUSKY IOGPU bridge: submit: %u words at ring +0x%x, insert 0x%x, doorbell %u, want sync %llu\n",
+-	    n, 8 * q->ring_used, new_in, BRIDGE_DOORBELL_ID, (unsigned long long)expected_sync);
+-	gwr(DOORBELL(BRIDGE_DOORBELL_ID), 1);
++	    n, 8 * q->ring_used, new_in, BRIDGE_DOORBELL(q->csg), (unsigned long long)expected_sync);
++	gwr(DOORBELL(BRIDGE_DOORBELL(q->csg)), 1);
+ 
+ 	/* Poll sync object for hardware completion [husky_gpu.c:672-678] */
+ 	unsigned us;
