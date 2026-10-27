@@ -1,0 +1,18 @@
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.cpp b/iokit/Families/IOGPU/IOGPUMemory.cpp
+index 310bf63..3f9876d 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.cpp
++++ b/iokit/Families/IOGPU/IOGPUMemory.cpp
+@@ -178,6 +178,13 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 		    dev->owner());
+ 		IOReturn r = md != NULL ? importMemory(md, 0, fSize, flags & ~MALI_BO_GPU_EXEC) : kIOGPUReturnNoMemory;
+ 		OSSafeReleaseNULL(md);
++		if (r != kIOGPUReturnSuccess) {
++			/* read-only client memory (constant vertex data) cannot be wired for writing: GPU reads only */
++			md = IOMemoryDescriptor::withAddressRange(in->ptrOrSurface, fSize, kIODirectionOut, dev->owner());
++			r = md != NULL ? importMemory(md, 0, fSize, flags & ~(MALI_BO_GPU_EXEC | MALI_BO_GPU_WRITE)) :
++			    kIOGPUReturnNoMemory;
++			OSSafeReleaseNULL(md);
++		}
+ 		if (r != kIOGPUReturnSuccess) {
+ 			return r;
+ 		}
