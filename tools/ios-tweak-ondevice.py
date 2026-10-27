@@ -157,8 +157,13 @@ def merge_plist(path, name, values, dry):
     tmp = path + '.husky-tmp'
     adb('exec-in', f"su -c 'cat > {tmp}'", data=buf.getvalue())
     su(f'chown {uid}:{gid} {tmp} && chmod {mode} {tmp} && mv -f {tmp} {path}')
-    if plistlib.loads(su_bytes(f'cat {path}')) != new:
-        sys.exit(f'{name}: read-back mismatch')
+    for attempt in range(3):            # a read right after the write occasionally comes back short
+        try:
+            if plistlib.loads(su_bytes(f'cat {path}')) == new:
+                return
+        except plistlib.InvalidFileException:
+            pass
+    sys.exit(f'{name}: read-back mismatch')
 
 
 def set_timezone(tz, dry):
@@ -257,6 +262,37 @@ def rerun_migration(dry):
         sys.exit('migration preferences still present')
 
 
+# IOPlatformUUID our kernel derives for this phone (ADT unique-chip-id, xnu 0048); stable across boots.
+PLATFORM_UUID = '7DB69C72-B7CC-5CBD-843D-53F8F9396228'
+
+
+def skip_migration(dry):
+    """The reverse of rerun_migration: record the first-boot data migration as done for this build
+    (husky-root-tweaks.py migration()), so iOS stops starting the ~26-minute migration (Apple logo +
+    progress bar) on every boot. Only once the staged system apps are parked or installed."""
+    vals = {'LastSystemVersion': tweaks.BUILD}
+    disp = {'SyntheticDidUpgrade': False, 'buildVersion': tweaks.BUILD}
+    pd = f'{MNT}/private/var/mobile/Library/Preferences'
+    byhost = f'{pd}/ByHost'
+    files = [f'{pd}/com.apple.migration.plist']
+    files += su(f'ls {byhost}/com.apple.migration.*.plist 2>/dev/null; true').split()
+    for u in (PLATFORM_UUID.upper(), PLATFORM_UUID.lower()):
+        f = f'{byhost}/com.apple.migration.{u}.plist'
+        if f not in files:
+            files.append(f)
+    if not dry:
+        su(f'mkdir -p {byhost} && chown {tweaks.MOBILE}:{tweaks.MOBILE} {byhost}')
+    for f in files:
+        cur = {}
+        if su(f'test -f {f} && echo yes; true').strip() == 'yes':
+            cur = plistlib.loads(su_bytes(f'cat {f}'))
+        v = dict(vals)
+        # keep a fuller DMUserDataDisposition datamigrator wrote itself, unless it names another build
+        if (cur.get('DMUserDataDisposition') or {}).get('buildVersion') != tweaks.BUILD:
+            v['DMUserDataDisposition'] = disp
+        merge_plist(f, os.path.relpath(f, MNT), v, dry)
+
+
 def install_system_apps(tar, dry):
     """Restore the staged system-app bundles and set up the migrator to install them.
 
@@ -328,6 +364,43 @@ def install_file(spec, dry):
     print(f'installed {dest} ({got} bytes, mode {mode})')
 
 
+LAUNCHD_CACHE = 'System/Library/xpc/launchd.plist'
+
+
+def edit_launchd_cache(key, job, dry):
+    """Add (job) or remove (job None) one entry of the compiled launchd job cache. iOS launchd runs
+    jobs from this cache, keyed by plist path, not by scanning /Library/LaunchDaemons; an edited cache
+    needs the boot-arg launchd_unsecure_cache=1 (husky-root-tweaks.py launchd())."""
+    path = f'{MNT}/{LAUNCHD_CACHE}'
+    raw = su_bytes(f'cat {path}')
+    fmt = plistlib.FMT_BINARY if raw[:6] == b'bplist' else plistlib.FMT_XML
+    plist = plistlib.loads(raw)
+    jobs = plist['LaunchDaemons']
+    if jobs.get(key) == job:
+        print(f'unchanged launchd cache entry {key} ({len(jobs)} jobs)')
+        return
+    if job is None:
+        del jobs[key]
+    else:
+        jobs[key] = job
+    print(f'{"remove" if job is None else "set"} launchd cache entry {key} ({len(jobs)} jobs)')
+    if dry:
+        return
+    uid, gid, mode = su(f'stat -c "%u %g %a" {path}').split()
+    buf = io.BytesIO()
+    plistlib.dump(plist, buf, fmt=fmt)
+    tmp = path + '.husky-tmp'
+    adb('exec-in', f"su -c 'cat > {tmp}'", data=buf.getvalue())
+    su(f'chown {uid}:{gid} {tmp} && chmod {mode} {tmp} && mv -f {tmp} {path}')
+    for attempt in range(3):            # large reads over adb occasionally come back short
+        try:
+            if plistlib.loads(su_bytes(f'cat {path}'))['LaunchDaemons'].get(key) == job:
+                return
+        except plistlib.InvalidFileException:
+            pass
+    sys.exit(f'{LAUNCHD_CACHE}: read-back mismatch for {key}')
+
+
 def remove_file(dest, dry):
     if not dest.startswith('/') or '..' in dest:
         sys.exit(f'--remove-file wants an absolute path, got {dest}')
@@ -347,13 +420,22 @@ def main():
     ap.add_argument('--install-system-apps', metavar='TAR',
                     help='restore staged_system_apps from TAR, set the trust-cache sentinel, reset installd '
                     'state; implies --rerun-migration so the migrator installs them next boot')
+    ap.add_argument('--skip-migration', action='store_true',
+                    help='record the first-boot data migration as done for this build (stops the per-boot '
+                    'migration progress bar; the reverse of --rerun-migration)')
     ap.add_argument('--drop-mg-cache', action='store_true',
                     help='delete the MobileGestalt cache (after an identity change)')
     ap.add_argument('--install-file', action='append', default=[], metavar='SRC:/DEST[:MODE]',
                     help='copy a host file onto the iOS root, root:wheel (repeatable)')
     ap.add_argument('--remove-file', action='append', default=[], metavar='/DEST',
                     help='delete a file from the iOS root (repeatable)')
+    ap.add_argument('--add-launchd-job', action='append', default=[], metavar='JOB.plist:/KEY',
+                    help='add a job to the launchd cache, keyed by its plist path on the device (repeatable)')
+    ap.add_argument('--remove-launchd-job', action='append', default=[], metavar='/KEY',
+                    help='remove a job from the launchd cache (repeatable)')
     args = ap.parse_args()
+    if args.skip_migration and (args.rerun_migration or args.install_system_apps):
+        sys.exit('--skip-migration contradicts --rerun-migration / --install-system-apps')
     if args.install_system_apps:
         args.rerun_migration = True
         if not os.path.isfile(args.install_system_apps):
@@ -384,10 +466,20 @@ def main():
                 drop_mg_cache(args.dry_run)
             if args.rerun_migration:
                 rerun_migration(args.dry_run)
+            if args.skip_migration:
+                skip_migration(args.dry_run)
             for spec in args.install_file:
                 install_file(spec, args.dry_run)
             for dest in args.remove_file:
                 remove_file(dest, args.dry_run)
+            for spec in args.add_launchd_job:
+                src, _, key = spec.partition(':')
+                if not key.startswith('/'):
+                    sys.exit(f'--add-launchd-job wants JOB.plist:/KEY, got {spec}')
+                with open(src, 'rb') as fh:
+                    edit_launchd_cache(key, plistlib.load(fh), args.dry_run)
+            for key in args.remove_launchd_job:
+                edit_launchd_cache(key, None, args.dry_run)
         finally:
             unmount()
     finally:
