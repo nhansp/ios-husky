@@ -78,7 +78,7 @@ jobs:
           mkdir -p artifact
           [ -d out/plugin/MaliMetal.bundle ] && cp -R out/plugin/MaliMetal.bundle artifact/
           [ -d out/smoke ] && cp out/smoke/metal_smoke out/smoke/metal_smoke.metallib out/smoke/*.plist artifact/ 2>/dev/null || true
-          (cd artifact && find . -type f -exec shasum -a 256 {} + > SHA256SUMS) || true
+          (cd artifact && find . -type f ! -name SHA256SUMS -exec shasum -a 256 {} + > ../SHA256SUMS && mv ../SHA256SUMS .) || true
 
       - uses: actions/upload-artifact@v4
         if: always()
