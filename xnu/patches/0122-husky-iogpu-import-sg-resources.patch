@@ -1,0 +1,398 @@
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+index cf11b4e..671ff64 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+@@ -101,7 +101,7 @@ IOGPUCommandQueue::heapOp(const struct mali_kcmd_heap_op *cmd)
+ 	if (r == NULL) {
+ 		return kIOGPUStatus_ParseError;
+ 	}
+-	uint8_t *qs = r->bo() ? (uint8_t *)mali_backend_ops.bo_cpu_map(r->bo()) : NULL;
++	uint8_t *qs = (uint8_t *)r->kernelAddress();
+ 	const bool usable = qs != NULL && r->gpuAddress() == cmd->qstate_gpu_va &&
+ 	    r->gpuLength() >= MALI_QSTATE_RESULT_OFF + sizeof(struct mali_heap_result);
+ 	if (!usable) {
+@@ -321,11 +321,11 @@ IOGPUCommandQueue::processOneCommandBuffer(const iogpu_cmdbuf_args_t *cb)
+ 						 * Non-coherent GPU cache maintenance: clean CPU-written
+ 						 * resources to DRAM before the GPU reads them
+ 						 * [claim C16; spec 03 lines 260-264; fixes REVIEWS.md:71, 98].
+-						 * Flush using kernel mapping bo_cpu_map(res->bo()) rather than
+-						 * client task userland VA to ensure valid EL1 translation and
+-						 * flush resources without CPU mapping [fixes REVIEW defect 4].
++						 * Cleaned through the resource's kernel alias (valid at EL1, also
++						 * for resources without a client mapping); write-combined
++						 * resources have no cached lines to clean.
+ 						 */
+-						void *kernel_va = (res->bo() != NULL) ? mali_backend_ops.bo_cpu_map(res->bo()) : NULL;
++						void *kernel_va = res->cpuCached() ? res->kernelAddress() : NULL;
+ 						if (kernel_va != NULL && res->residentSize() > 0) {
+ 							mali_backend_ops.dcache_flush(kernel_va, res->residentSize());
+ 						}
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.cpp b/iokit/Families/IOGPU/IOGPUMemory.cpp
+index fc148e4..e6b04fd 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.cpp
++++ b/iokit/Families/IOGPU/IOGPUMemory.cpp
+@@ -19,8 +19,11 @@
+ #include "IOGPUMemory.h"
+ #include "IOGPU.h"
+ #include "IOGPUDevice.h"
++#include "../../Kernel/arm/HuskySurface.h"
+ #include <vm/pmap.h>
+ 
++#define IOGPU_GPU_PAGE          4096u
++
+ extern "C" ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ OSDefineMetaClassAndStructors(IOGPUTask, OSObject);
+@@ -133,23 +136,74 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 	/* Handle per-type allocation */
+ 	switch (in->resType) {
+ 	case kIOGPUResType_KernelMem: {    /* type 0x00 */
+-		if (mali_backend_ops.bo_alloc(vm, fSize, flags, in->gpuAddress, &fBO) != 0) {
++		if (flags & MALI_BO_FIXED_VA) {
++			if (mali_backend_ops.bo_alloc(vm, fSize, flags, in->gpuAddress, &fBO) != 0) {
++				return kIOGPUReturnNoMemory;
++			}
++			break;
++		}
++		/* Wired pages, not physically contiguous; write-combined for the CPU because the GPU is not coherent. */
++		IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache, round_page_64(fSize), page_size);
++		if (buf == NULL) {
+ 			return kIOGPUReturnNoMemory;
+ 		}
++		bzero(buf->getBytesNoCopy(), buf->getLength());
++		IOReturn r = importMemory(buf, 0, fSize, flags);
++		if (r != kIOGPUReturnSuccess) {
++			buf->release();
++			return r;
++		}
++		fImportOwner = buf;
++		fWriteCombined = true;
++		if (flags & MALI_BO_CPU_MAP) {
++			fClientMap = buf->createMappingInTask(dev->owner(), 0, kIOMapAnywhere | kIOMapWriteCombineCache);
++			if (fClientMap == NULL) {
++				return kIOGPUReturnNoMemory;
++			}
++			fCpuAddr = fClientMap->getAddress();
++		}
+ 		break;
+ 	}
+-	case kIOGPUResType_ClientMem: {    /* type 0x80 */
+-		/* Client memory: wrap client pages or allocate matching backing */
+-		flags |= MALI_BO_CPU_MAP;
+-		if (mali_backend_ops.bo_alloc(vm, fSize, flags, in->gpuAddress, &fBO) != 0) {
++	case kIOGPUResType_ClientMem: {    /* type 0x80: the client's own pages, wired for the resource's life */
++		if (in->ptrOrField != 0 || (in->ptrOrSurface & PAGE_MASK) || (fSize & PAGE_MASK)) {
++			IOLog("IOGPU: client-memory resource refused: ptr 0x%llx size 0x%llx ranges %llu (one page-aligned range only)\n",
++			    in->ptrOrSurface, fSize, in->ptrOrField);
++			return kIOGPUReturnBadArgument;
++		}
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(in->ptrOrSurface, fSize, kIODirectionInOut,
++		    dev->owner());
++		IOReturn r = md != NULL ? importMemory(md, 0, fSize, flags & ~MALI_BO_GPU_EXEC) : kIOGPUReturnNoMemory;
++		OSSafeReleaseNULL(md);
++		if (r != kIOGPUReturnSuccess) {
++			return r;
++		}
++		fKernelMap = fImport->map();
++		if (fKernelMap == NULL) {
+ 			return kIOGPUReturnNoMemory;
+ 		}
++		fCpuAddr = in->ptrOrSurface;
+ 		break;
+ 	}
+-	case kIOGPUResType_IOSurface: {    /* type 0x82 */
+-		/* IOSurface plane import: map backing into VM */
+-		if (mali_backend_ops.bo_alloc(vm, fSize, flags, in->gpuAddress, &fBO) != 0) {
+-			return kIOGPUReturnNoMemory;
++	case kIOGPUResType_IOSurface: {    /* type 0x82: {surface id, plane} at +0x38 */
++		const uint32_t sid = (uint32_t)in->ptrOrSurface, plane = (uint32_t)(in->ptrOrSurface >> 32);
++		HuskySurface *surf = husky_surface_copy(sid);
++		uint64_t off = 0;
++		bool ok = surf != NULL && surf->memory != NULL && plane < (surf->planeCount ? surf->planeCount : 1);
++		if (ok) {
++			off = surf->planeCount ? surf->planes[plane].offset : surf->offset;
++			ok = off + fSize <= surf->memory->getLength();
++		}
++		IOReturn r = ok ? importMemory(surf->memory, off, fSize, flags & ~MALI_BO_GPU_EXEC) : kIOGPUReturnBadArgument;
++		if (r != kIOGPUReturnSuccess) {
++			IOLog("IOGPU: IOSurface %u plane %u resource refused (size 0x%llx, 0x%x)\n", sid, plane, fSize, r);
++			OSSafeReleaseNULL(surf);
++			return r;
++		}
++		fImportOwner = surf;
++		if (flags & MALI_BO_CPU_MAP) {
++			fClientMap = surf->memory->createMappingInTask(dev->owner(), 0, kIOMapAnywhere | surf->mapCache);
++			fCpuAddr = fClientMap != NULL ? fClientMap->getAddress() + off : 0;
+ 		}
+ 		break;
+ 	}
+@@ -178,7 +232,7 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 	 * using createMappingInTask. Store the CLIENT VA in fCpuAddr so selector 8 reply +0x08
+ 	 * carries the valid userland pointer [spec 01 line 493; fixes REVIEWS.md:70, 99].
+ 	 */
+-	if (flags & MALI_BO_CPU_MAP) {
++	if ((flags & MALI_BO_CPU_MAP) && fImport == NULL) {
+ 		void *kva = mali_backend_ops.bo_cpu_map(fBO);
+ 		if (kva != NULL && dev->owner() == kernel_task) {
+ 			/*
+@@ -237,9 +291,67 @@ IOGPUResource::free()
+ 		mali_backend_ops.bo_free(fBO);
+ 		fBO = NULL;
+ 	}
++	OSSafeReleaseNULL(fKernelMap);
++	if (fImport != NULL) {
++		fImport->complete();
++		OSSafeReleaseNULL(fImport);
++	}
++	OSSafeReleaseNULL(fImportOwner);
+ 	OSObject::free();
+ }
+ 
++/* Map the GPU pages of md covering [offset, offset + length) into the client VM; md stays prepared until free(). */
++IOReturn
++IOGPUResource::importMemory(IOMemoryDescriptor *md, uint64_t offset, uint64_t length, uint32_t flags)
++{
++	const uint64_t start = offset & ~(uint64_t)(IOGPU_GPU_PAGE - 1);
++	const uint64_t end = (offset + length + IOGPU_GPU_PAGE - 1) & ~(uint64_t)(IOGPU_GPU_PAGE - 1);
++	if (end > round_page_64(md->getLength()) || md->prepare() != kIOReturnSuccess) {
++		return kIOGPUReturnBadArgument;
++	}
++	const uint32_t n = (uint32_t)((end - start) / IOGPU_GPU_PAGE);
++	uint64_t *phys = (uint64_t *)IOMallocData(n * sizeof(uint64_t));
++	bool ok = phys != NULL;
++	for (uint32_t i = 0; ok && i < n;) {
++		IOByteCount seg = 0;
++		addr64_t pa = md->getPhysicalSegment(start + (uint64_t)i * IOGPU_GPU_PAGE, &seg, kIOMemoryMapperNone);
++		ok = pa != 0 && !(pa & (IOGPU_GPU_PAGE - 1)) && seg >= IOGPU_GPU_PAGE;
++		for (; ok && seg >= IOGPU_GPU_PAGE && i < n; seg -= IOGPU_GPU_PAGE, pa += IOGPU_GPU_PAGE) {
++			phys[i++] = pa;
++		}
++	}
++	mali_vm_t *vm = fDevice->task()->vm();
++	ok = ok && mali_backend_ops.bo_import_pages(vm, phys, n, flags & ~MALI_BO_CPU_MAP, &fBO) == 0;
++	if (phys != NULL) {
++		IOFreeData(phys, n * sizeof(uint64_t));
++	}
++	if (!ok) {
++		md->complete();
++		return kIOGPUReturnNoMemory;
++	}
++	md->retain();
++	fImport = md;
++	fImportOffset = offset;
++	fGpuOffset = offset - start;
++	return kIOGPUReturnSuccess;
++}
++
++void *
++IOGPUResource::kernelAddress()
++{
++	if (fImport == NULL) {
++		return fBO != NULL ? mali_backend_ops.bo_cpu_map(fBO) : NULL;
++	}
++	if (IOBufferMemoryDescriptor *buf = OSDynamicCast(IOBufferMemoryDescriptor, fImportOwner)) {
++		return (uint8_t *)buf->getBytesNoCopy() + fImportOffset;
++	}
++	if (HuskySurface *surf = OSDynamicCast(HuskySurface, fImportOwner)) {
++		const uintptr_t base = surf->kernelAddress();
++		return base != 0 ? (void *)(base + fImportOffset) : NULL;
++	}
++	return fKernelMap != NULL ? (void *)(fKernelMap->getVirtualAddress() + fImportOffset) : NULL;
++}
++
+ /* IOGPUMetalResource init releases a resource whose client-shared block is 0 (DSC:IOGPU:0x1cc846770-0x1cc846778). */
+ bool
+ IOGPUResource::attachClientShared()
+@@ -256,7 +368,7 @@ IOGPUResource::attachClientShared()
+ mali_gpu_va_t
+ IOGPUResource::gpuAddress()
+ {
+-	return fBO ? mali_backend_ops.bo_gpu_va(fBO) : 0;
++	return fBO ? mali_backend_ops.bo_gpu_va(fBO) + fGpuOffset : 0;
+ }
+ 
+ IOReturn
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.h b/iokit/Families/IOGPU/IOGPUMemory.h
+index 42d1968..0ce6e90 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.h
++++ b/iokit/Families/IOGPU/IOGPUMemory.h
+@@ -57,6 +57,14 @@ class IOGPUResource : public OSObject {
+ 	OSArray            *fGroupMembers;/* Resource group (type 3) counted set */
+ 	uint64_t            fClientShared;
+ 	uint32_t            fCSSlot;      /* + 1; 0 = none */
++	IOMemoryDescriptor *fImport;      /* prepared backing of an imported resource */
++	OSObject           *fImportOwner; /* keeps that backing alive (IOSurface or buffer) */
++	IOMemoryMap        *fKernelMap;   /* client memory seen by the kernel */
++	uint64_t            fImportOffset;/* resource start within fImport */
++	uint64_t            fGpuOffset;   /* resource start within its first GPU page */
++	bool                fWriteCombined; /* no cached CPU alias: nothing to clean before GPU reads */
++
++	IOReturn importMemory(IOMemoryDescriptor *md, uint64_t offset, uint64_t length, uint32_t flags);
+ 
+ public:
+ 	IOReturn createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t *in,
+@@ -70,6 +78,8 @@ public:
+ 	uint64_t      residentSize() const { return fSize; }
+ 	uint64_t      gpuLength() const { return fSize; }
+ 	mali_bo_t    *bo() const { return fBO; }
++	void         *kernelAddress();
++	bool          cpuCached() const { return !fWriteCombined; }
+ 	uint32_t      type() const { return fType; }
+ 
+ 	IOReturn groupAdd(const uint32_t *ids, uint32_t n);
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 8fdfe88..3cb1652 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -384,6 +384,7 @@ struct mali_bo {
+ 	mali_vm_t    *vm;
+ 	uint64_t      size;
+ 	uint32_t      flags;
++	bool          imported;   /* pages belong to the importer: unmapped on free, never freed */
+ 	uint64_t      pa;
+ 	vm_offset_t   kva;
+ 	vm_offset_t   cpu_wcomb;
+@@ -790,6 +791,28 @@ op_vm_flush_as(mali_vm_t *vm)
+ }
+ 
+ /* --- Buffer Object (BO) Allocation & Mapping --- */
++/*
++ * BO flags to leaf PTE attributes:
++ *   - MALI_BO_GPU_EXEC -> FW_IFACE_EX (leaves XN clear: leaf_attrs_for lines 559-561)
++ *   - MALI_BO_NONCACHEABLE -> FW_IFACE_CACHE=0 (AttrIndx 0, outer shareable: lines 564-566)
++ *   - MALI_BO_GPU_WRITE -> FW_IFACE_WR (leaves read-only clear: lines 556-558)
++ */
++static uint64_t
++bo_leaf_attrs(uint32_t flags)
++{
++	uint32_t fw_flags = FW_IFACE_RD;
++	if (flags & MALI_BO_GPU_WRITE) {
++		fw_flags |= FW_IFACE_WR;
++	}
++	if (flags & MALI_BO_GPU_EXEC) {
++		fw_flags |= FW_IFACE_EX;
++	}
++	if (!(flags & MALI_BO_NONCACHEABLE)) {
++		fw_flags |= (1u << 3);   /* Cacheable inner-shareable */
++	}
++	return leaf_attrs_for(fw_flags);
++}
++
+ static mali_status_t
+ op_bo_alloc(mali_vm_t *vm, uint64_t size, uint32_t flags,
+     mali_gpu_va_t fixed_va, mali_bo_t **out)
+@@ -826,23 +849,7 @@ op_bo_alloc(mali_vm_t *vm, uint64_t size, uint32_t flags,
+ 		bo->cpu_wcomb = ml_io_map_unmappable((vm_offset_t)bo->pa, rsize, VM_WIMG_WCOMB);
+ 	}
+ 
+-	/*
+-	 * Translate BO flags to FW IFACE flags for leaf PTE attribute generation:
+-	 *   - MALI_BO_GPU_EXEC -> FW_IFACE_EX (leaves XN clear: leaf_attrs_for lines 559-561)
+-	 *   - MALI_BO_NONCACHEABLE -> FW_IFACE_CACHE=0 (AttrIndx 0, outer shareable: lines 564-566)
+-	 *   - MALI_BO_GPU_WRITE -> FW_IFACE_WR (leaves read-only clear: lines 556-558)
+-	 */
+-	uint32_t fw_flags = FW_IFACE_RD;
+-	if (flags & MALI_BO_GPU_WRITE) {
+-		fw_flags |= FW_IFACE_WR;
+-	}
+-	if (flags & MALI_BO_GPU_EXEC) {
+-		fw_flags |= FW_IFACE_EX;
+-	}
+-	if (!(flags & MALI_BO_NONCACHEABLE)) {
+-		fw_flags |= (1u << 3);   /* Cacheable inner-shareable */
+-	}
+-	uint64_t leaf_attrs = leaf_attrs_for(fw_flags);
++	uint64_t leaf_attrs = bo_leaf_attrs(flags);
+ 
+ 	/* Clean and invalidate newly allocated memory to DRAM [husky_gpu.c:481-492] */
+ 	husky_dcache_flush(bo->kva, rsize);
+@@ -910,12 +917,61 @@ op_bo_alloc(mali_vm_t *vm, uint64_t size, uint32_t flags,
+ 	return st;
+ }
+ 
++/* Map caller-owned 4 KiB pages (client memory, IOSurface planes) into the VM. */
+ static mali_status_t
+ op_bo_import_pages(mali_vm_t *vm, const uint64_t *phys, uint32_t n_pages,
+     uint32_t flags, mali_bo_t **out)
+ {
+-	(void)phys;
+-	return op_bo_alloc(vm, (uint64_t)n_pages * GPU_PAGE, flags, 0, out);
++	if (vm == NULL || phys == NULL || n_pages == 0 || out == NULL) {
++		return EINVAL;
++	}
++	mali_bo_t *bo = (mali_bo_t *)kalloc_data(sizeof(mali_bo_t), Z_WAITOK | Z_ZERO);
++	if (bo == NULL) {
++		return ENOMEM;
++	}
++	bo->vm = vm;
++	bo->size = (uint64_t)n_pages * GPU_PAGE;
++	bo->flags = flags & ~MALI_BO_FIXED_VA;
++	bo->imported = true;
++	bo->pa = phys[0];
++	const vm_size_t rsize = round_page(bo->size);
++	const uint64_t leaf_attrs = bo_leaf_attrs(bo->flags);
++
++	lck_mtx_lock(&g_vm_lock);
++	bo->gpu_va = va_alloc(vm, rsize);
++	mali_status_t st = bo->gpu_va != 0 ? 0 : ENOMEM;
++	uint64_t mapped = 0;
++	for (uint32_t i = 0; st == 0 && i < n_pages; i++) {
++		if ((phys[i] & (GPU_PAGE - 1)) || !pt_map_page(vm->root_pa, bo->gpu_va + mapped, phys[i], leaf_attrs)) {
++			BR_LOG("HUSKY IOGPU bridge: bo_import: page %u (pa 0x%llx) not mapped, %u tables in use\n", i,
++			    (unsigned long long)phys[i], pt_pages_in_use());
++			st = ENOMEM;
++			break;
++		}
++		mapped += GPU_PAGE;
++	}
++	husky_gpu_pt_flush();
++	if (st == 0) {
++		st = vm_as_update(vm);
++	}
++	if (st == 0) {
++		vm->n_bos++;
++		lck_mtx_unlock(&g_vm_lock);
++		*out = bo;
++		return 0;
++	}
++	bool va_reusable = true;
++	if (mapped != 0) {
++		pt_unmap_range(vm->root_pa, bo->gpu_va, mapped);
++		husky_gpu_pt_flush();
++		va_reusable = vm_flush_range(vm, bo->gpu_va, mapped) == 0;
++	}
++	if (bo->gpu_va != 0 && va_reusable) {
++		va_free(vm, bo->gpu_va, rsize);
++	}
++	lck_mtx_unlock(&g_vm_lock);
++	kfree_data(bo, sizeof(mali_bo_t));
++	return st;
+ }
+ 
+ static void
+@@ -947,14 +1003,17 @@ op_bo_free(mali_bo_t *bo)
+ 	}
+ 	lck_mtx_unlock(&g_vm_lock);
+ 
+-	if (bo->cpu_wcomb != 0) {
+-		ml_io_unmap(bo->cpu_wcomb, rsize);
++	if (!released) {
++		BR_LOG("HUSKY IOGPU bridge: bo_free: GPU TLB flush of 0x%llx failed%s\n", (unsigned long long)bo->gpu_va,
++		    bo->imported ? "" : ", backing leaked");
+ 	}
+-	if (released) {
+-		kmem_free(kernel_map, bo->kva, rsize);
+-	} else {
+-		BR_LOG("HUSKY IOGPU bridge: bo_free: GPU TLB flush of 0x%llx failed, leaking %llu bytes\n",
+-		    (unsigned long long)bo->gpu_va, (unsigned long long)bo->size);
++	if (!bo->imported) {
++		if (bo->cpu_wcomb != 0) {
++			ml_io_unmap(bo->cpu_wcomb, rsize);
++		}
++		if (released) {
++			kmem_free(kernel_map, bo->kva, rsize);
++		}
+ 	}
+ 	kfree_data(bo, sizeof(mali_bo_t));
+ }
