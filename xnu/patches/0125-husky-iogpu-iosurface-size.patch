@@ -1,0 +1,26 @@
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.cpp b/iokit/Families/IOGPU/IOGPUMemory.cpp
+index b17b4bf..44718e6 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.cpp
++++ b/iokit/Families/IOGPU/IOGPUMemory.cpp
+@@ -93,7 +93,8 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 	 */
+ 	uint64_t maxRes = dev->accel()->config()->maxResourceSize;
+ 	if (in->resType != kIOGPUResType_Group) {
+-		if (in->size == 0 || (maxRes != 0 && in->size > maxRes)) {
++		/* IOSurface resources arrive with size 0: the surface defines it */
++		if ((in->size == 0 && in->resType != kIOGPUResType_IOSurface) || (maxRes != 0 && in->size > maxRes)) {
+ 			return kIOGPUReturnBadArgument;
+ 		}
+ 		fSize = in->size;
+@@ -194,7 +195,10 @@ IOGPUResource::createFromArgs(IOGPUDevice *dev, const iogpu_new_resource_args_t
+ 		if (ok) {
+ 			off = surf->offset;
+ 			len = surf->memory->getLength() > off ? surf->memory->getLength() - off : 0;
+-			ok = len >= fSize;
++			ok = len != 0 && len >= fSize;
++			if (fSize == 0) {
++				fSize = len;
++			}
+ 		}
+ 		IOReturn r = ok ? importMemory(surf->memory, off, len, flags & ~MALI_BO_GPU_EXEC) : kIOGPUReturnBadArgument;
+ 		if (r != kIOGPUReturnSuccess) {
