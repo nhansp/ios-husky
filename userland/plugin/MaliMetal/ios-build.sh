@@ -19,10 +19,13 @@ ARCH="-arch arm64e -isysroot $SDK -miphoneos-version-min=26.0"
 DEFS="$(cat "$MESA_TREE/mesa_defs.txt") -D_DARWIN_C_SOURCE"
 T=$MESA_TREE
 S=$MESA_SRC
-MESA_INC="-I$T/src/panfrost -I$T/src/panfrost/genxml -I$T/src/panfrost/lib -I$T/src -I$T/include \
- -I$T/src/compiler/nir -I$T/src/util -I$T/src/compiler \
- -I$S/src/panfrost/lib -I$S/src/panfrost/genxml -I$S/src/panfrost/shared -I$S/src/panfrost/compiler \
- -I$S/src/panfrost/model -I$S/src/panfrost -I$S/src -I$S/include -I$S/src/util -I$S/src/compiler -I$S/src/compiler/nir"
+MESA_INC=""
+for d in $T/src/panfrost $T/src/panfrost/genxml $T/src/panfrost/lib $T/src $T/include $T/src/compiler/nir \
+	$T/src/util $T/src/compiler $S/src/panfrost/lib $S/src/panfrost/genxml $S/src/panfrost/shared \
+	$S/src/panfrost/compiler $S/src/panfrost/model $S/src/panfrost $S/src $S/include $S/src/util $S/src/compiler \
+	$S/src/compiler/nir; do
+	MESA_INC="$MESA_INC -isystem $d"
+done
 
 for f in mali_formats mali_texture mali_desc mali_state mali_cs; do
 	clang $ARCH -std=gnu11 -O2 -g -Wall -Werror -DPAN_ARCH=11 $DEFS \
