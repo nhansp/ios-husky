@@ -5,7 +5,7 @@
  *
  * Each dispatch becomes one RUN_COMPUTE in the command buffer's stream (mali_cs_dispatch). Metal's serial dispatch
  * type orders every dispatch after the previous one, so each dispatch is followed by an encoder barrier (drain the
- * scoreboard slots + FLUSH_CACHE2, S06 3.5); MTLDispatchTypeConcurrent gets the same, which is merely stricter.
+ * scoreboard slots + read-only cache invalidate); MTLDispatchTypeConcurrent gets the same, which is merely stricter.
  *
  * dispatchThreads: with a grid that is not a multiple of the threadgroup uses the program variant compiled with
  * AIR2VH_F_NONUNIFORM_DISPATCH (body guarded by all(gid < threads_per_grid)), built lazily by the pipeline state.

@@ -200,13 +200,14 @@ mali_cs_encoder_barrier(mali_cs_t *cs)
 {
     struct cs_builder *b = &cs->b;
     ensure_prologue(cs);
-    /* drain everything this encoder issued, then clean the GPU caches so the next
-     * encoder (or the CPU after completion) sees the data [S06 3.5; HG:336-337 flush word] */
+    /* L2 is the device domain and LSC is coherent with it, so a device-to-device barrier only
+     * invalidates the read-only L1s [MV:panvk_vX_cmd_buffer.c:355-388]. The kernel ring wrapper
+     * cleans L2/LSC before and after the whole stream for the host domain. */
     cs_wait_slots(b, MALI_SB_MASK(MALI_SB_EP) | MALI_SB_MASK(MALI_SB_VT) | MALI_SB_MASK(MALI_SB_FRAG) |
                          MALI_SB_MASK(MALI_SB_LS));
     struct cs_index flush_id = cs_reg32(b, R_SCRATCH);
     cs_move32_to(b, flush_id, 0);               /* latest_flush 0: unconditional [panthor_drm.h:992-1002] */
-    cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN_AND_INVALIDATE, MALI_CS_FLUSH_MODE_CLEAN_AND_INVALIDATE,
+    cs_flush_caches(b, MALI_CS_FLUSH_MODE_NONE, MALI_CS_FLUSH_MODE_NONE,
                     MALI_CS_OTHER_FLUSH_MODE_INVALIDATE, flush_id, cs_defer(0, MALI_SB_VT));
     cs_wait_slot(b, MALI_SB_VT);
     shadow_reset(cs);
