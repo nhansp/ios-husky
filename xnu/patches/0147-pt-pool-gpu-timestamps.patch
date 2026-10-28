@@ -1,0 +1,287 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 4cffb85..6189ee3 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -241,7 +241,7 @@ static const uint32_t gpu_l2_hash[3] = {0x0036DB6D, 0x005B6DB6, 0x0};
+ #define FW_SHARED_VA            0x04000000u
+ #define FW_MAX_SECTIONS         16
+ #define FW_MEM_MAX              (2u << 20)
+-#define PT_PAGES                256u
++#define PT_PAGES                2048u
+ /* GPU MMU granule (4 KiB); xnu's own PAGE_SIZE is 16 KiB here. */
+ #define GPU_PAGE                0x1000u
+ #define GPU_PAGE_MASK           (GPU_PAGE - 1)
+@@ -564,12 +564,28 @@ vm_offset_t husky_gpu_gin;
+ vm_offset_t husky_gpu_gout;
+ static uint64_t render_pa;      /* render area (huskygpu=5) */
+ 
++/* Table pages written since the last husky_gpu_pt_flush(), as a pool index range. */
++static unsigned pt_dirty_lo = PT_PAGES, pt_dirty_hi;
++
+ static uint64_t *
+ pt_entry_table(uint64_t table_pa)
+ {
+ 	return (uint64_t *)(pt_kva + (table_pa - pt_pa));
+ }
+ 
++static uint64_t *
++pt_dirty_table(uint64_t table_pa)
++{
++	const unsigned i = (unsigned)((table_pa - pt_pa) / GPU_PAGE);
++	if (i < pt_dirty_lo) {
++		pt_dirty_lo = i;
++	}
++	if (i > pt_dirty_hi) {
++		pt_dirty_hi = i;
++	}
++	return pt_entry_table(table_pa);
++}
++
+ /* Freed table pages (pool indices); a table is zeroed when it goes back. */
+ static uint16_t pt_free_stack[PT_PAGES];
+ static unsigned pt_free_count;
+@@ -591,7 +607,7 @@ pt_alloc(void)
+ static void
+ pt_release(uint64_t table)
+ {
+-	bzero(pt_entry_table(table), GPU_PAGE);
++	bzero(pt_dirty_table(table), GPU_PAGE);
+ 	pt_free_stack[pt_free_count++] = (uint16_t)((table - pt_pa) / GPU_PAGE);
+ }
+ 
+@@ -625,12 +641,12 @@ pt_unmap_range(uint64_t root, uint64_t va, uint64_t size)
+ 		if (level < 3) {
+ 			continue;
+ 		}
+-		pt_entry_table(table[3])[(a >> 12) & 0x1ff] = 0;
++		pt_dirty_table(table[3])[(a >> 12) & 0x1ff] = 0;
+ 		if (((a + GPU_PAGE) & 0x1fffffULL) != 0 && off + GPU_PAGE < size) {
+ 			continue;               /* emptiness is checked once per L3 table */
+ 		}
+ 		for (int l = 3; l > 0 && pt_table_empty(pt_entry_table(table[l])); l--) {
+-			pt_entry_table(table[l - 1])[idx[l - 1]] = 0;
++			pt_dirty_table(table[l - 1])[idx[l - 1]] = 0;
+ 			pt_release(table[l]);
+ 		}
+ 	}
+@@ -675,22 +691,25 @@ pt_map_page(uint64_t root, uint64_t va, uint64_t pa, uint64_t leaf_attrs)
+ 				return false;
+ 			}
+ 			/* table descriptor; kbase also sets AF on table entries */
+-			t[idx] = (next & PT_ADDR_MASK) | (1ULL << 10) | 3;
++			pt_dirty_table(table)[idx] = (next & PT_ADDR_MASK) | (1ULL << 10) | 3;
+ 		}
+ 		table = t[idx] & PT_ADDR_MASK;
+ 	}
+-	uint64_t *l3 = pt_entry_table(table);
++	uint64_t *l3 = pt_dirty_table(table);
+ 	l3[(va >> 12) & 0x1ff] = (pa & PT_ADDR_MASK) | leaf_attrs | 3;
+ 	return true;
+ }
+ 
+-/* Clean the whole page-table pool to DRAM (the GPU walks non-coherently); for the IOGPU bridge. */
++/* Clean the tables written since the last call to DRAM (the GPU walks non-coherently); for the IOGPU bridge. */
+ void
+ husky_gpu_pt_flush(void)
+ {
+-	if (pt_kva) {
+-		husky_dcache_flush(pt_kva, PT_PAGES * GPU_PAGE);
++	if (pt_kva && pt_dirty_lo <= pt_dirty_hi) {
++		husky_dcache_flush(pt_kva + (vm_offset_t)pt_dirty_lo * GPU_PAGE,
++		    (vm_size_t)(pt_dirty_hi - pt_dirty_lo + 1) * GPU_PAGE);
+ 	}
++	pt_dirty_lo = PT_PAGES;
++	pt_dirty_hi = 0;
+ }
+ 
+ uint64_t
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+index 3376457..6a87acd 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+@@ -50,9 +50,24 @@ static const uint64_t     kHangUS = 500000;
+ /* Submit-to-retire latency, logged every 10 s while the GPU is busy (gPollLock). */
+ static struct {
+ 	uint64_t t0, cycles0, n, sum_us, max_us, exec_us;
++	uint64_t gpu_n, stream_ticks, flush_ticks;      /* GPU timestamps around each submit's stream */
+ 	uint32_t hist[5];                       /* < 4, 8, 16, 33 ms, more */
+ } gLat;
+ 
++static void
++gpu_note(const mali_syncobj_t *so, uint64_t from, uint64_t to)
++{
++	for (uint64_t seq = from + 1; seq <= to; seq++) {
++		uint64_t t[3];
++		mali_backend_ops.syncobj_gpu_times(so, seq, t);
++		if (t[0] != 0 && t[1] >= t[0] && t[2] >= t[1]) {
++			gLat.gpu_n++;
++			gLat.stream_ticks += t[1] - t[0];
++			gLat.flush_ticks += t[2] - t[1];
++		}
++	}
++}
++
+ /* tStart: when the GPU could start it (submitted, and the queue's previous one retired) */
+ static void
+ lat_note(uint64_t now, uint64_t tSubmit, uint64_t tStart)
+@@ -73,10 +88,14 @@ lat_note(uint64_t now, uint64_t tSubmit, uint64_t tStart)
+ 		gLat.cycles0 = husky_gpu_cycles();
+ 	} else if (ns >= 10 * NSEC_PER_SEC) {
+ 		uint64_t cycles = husky_gpu_cycles();
++		uint64_t freq;
++		__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
++		const uint64_t gn = gLat.gpu_n ? gLat.gpu_n : 1;
+ 		IOLog("HUSKY IOGPU: 10 s: %llu command buffers, latency avg %llu max %llu us, exec avg %llu us, "
+-		    "<4/8/16/33/more ms %u/%u/%u/%u/%u, GPU %llu MHz avg\n", gLat.n, gLat.sum_us / gLat.n, gLat.max_us,
+-		    gLat.exec_us / gLat.n, gLat.hist[0], gLat.hist[1], gLat.hist[2], gLat.hist[3], gLat.hist[4],
+-		    (cycles - gLat.cycles0) / (ns / NSEC_PER_USEC));
++		    "<4/8/16/33/more ms %u/%u/%u/%u/%u, GPU %llu MHz avg; %llu streams avg %llu us + flush %llu us\n", gLat.n,
++		    gLat.sum_us / gLat.n, gLat.max_us, gLat.exec_us / gLat.n, gLat.hist[0], gLat.hist[1], gLat.hist[2],
++		    gLat.hist[3], gLat.hist[4], (cycles - gLat.cycles0) / (ns / NSEC_PER_USEC), gLat.gpu_n,
++		    gLat.stream_ticks * 1000000 / freq / gn, gLat.flush_ticks * 1000000 / freq / gn);
+ 		bzero(&gLat, sizeof(gLat));
+ 		gLat.t0 = now;
+ 		gLat.cycles0 = cycles;
+@@ -213,7 +232,11 @@ IOGPUCommandQueue::service(uint64_t now)
+ 			st = kIOGPUStatus_ParseError;       /* GPU timeout / hang treated as error */
+ 		}
+ 		if (p->target > 0) {
++			if (v >= p->target && p->target > fRetired) {
++				gpu_note(fSync, fRetired, p->target);
++			}
+ 			lat_note(now, p->tSubmit, p->tSubmit > fLastRetire ? p->tSubmit : fLastRetire);
++			fRetired = p->target;
+ 		}
+ 		fLastRetire = now;
+ 		if (p->ref != 0 && fNotifQueue != NULL) {
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.h b/iokit/Families/IOGPU/IOGPUCommandQueue.h
+index f0b3b2f..51993ba 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.h
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.h
+@@ -48,6 +48,7 @@ class IOGPUCommandQueue : public OSObject {
+ 	bool                    fPolled;
+ 	bool                    fDumped;
+ 	uint64_t                fLastRetire;
++	uint64_t                fRetired;          /* sync value of the last retired command buffer */
+ 
+ public:
+ 	bool initQueue(IOGPUDevice *dev, const iogpu_new_command_queue_args_t *args);
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 3e4fb48..708df6d 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -461,8 +461,13 @@ struct mali_syncobj {
+ 	mali_bo_t          *bo;
+ 	mali_gpu_va_t       gpu_va;
+ 	volatile uint64_t  *cpu;
++	uint64_t            signals;       /* SYNC_ADDs submitted; under the queue lock */
+ };
+ 
++/* GPU timestamps {start, stream done, flush done} of signal n at page offset SYNC_TS_OFF + (n % SYNC_TS_SLOTS) * 32 */
++#define SYNC_TS_OFF             0x100u
++#define SYNC_TS_SLOTS           64u
++
+ static struct mali_backend g_mali_backend;
+ 
+ /* --- Accelerator lifecycle --- */
+@@ -832,7 +837,9 @@ static void
+ op_vm_flush_as(mali_vm_t *vm)
+ {
+ 	if (vm != NULL) {
++		lck_mtx_lock(&g_vm_lock);
+ 		husky_gpu_pt_flush();
++		lck_mtx_unlock(&g_vm_lock);
+ 		if (vm->as_slot >= 0) {
+ 			(void)vm_as_update(vm);
+ 		}
+@@ -1627,21 +1634,35 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 	prog[n++] = CS_FLUSH_CACHE2(rv);
+ 	prog[n++] = CS_WAIT(waitall);
+ 
++	mali_syncobj_t *so = desc->n_signals > 0 && desc->signals != NULL ? (mali_syncobj_t *)desc->signals[0] : NULL;
++	const uint64_t ts = so != NULL ? so->gpu_va + SYNC_TS_OFF + (so->signals % SYNC_TS_SLOTS) * 32 : 0;
++
+ 	/* 2. User CS CALL [mali_backend_ops.h:162-163] */
+ 	if (desc->stream_addr != 0 && desc->stream_size > 0) {
++		if (ts != 0) {
++			prog[n++] = CS_MOVE48(ra, ts);
++			prog[n++] = CS_STORE_STATE_TS(ra, 0);
++		}
+ 		prog[n++] = CS_MOVE48(ra, desc->stream_addr);
+ 		prog[n++] = CS_MOVE32(rv, desc->stream_size);
+ 		prog[n++] = MALI_CS_CALL(ra, rv);
+ 		prog[n++] = CS_WAIT(waitall);
++		if (ts != 0) {
++			prog[n++] = CS_MOVE48(ra, ts);
++			prog[n++] = CS_STORE_STATE_TS(ra, 8);
++		}
+ 		/* GPU-cached resources: their lines reach DRAM before the sync object says done */
+ 		prog[n++] = CS_MOVE32(rv, 0);
+ 		prog[n++] = CS_FLUSH_CACHE2(rv);
+ 		prog[n++] = CS_WAIT(waitall);
++		if (ts != 0) {
++			prog[n++] = CS_STORE_STATE_TS(ra, 16);
++			prog[n++] = CS_WAIT(waitall);
++		}
+ 	}
+ 
+ 	/* 3. Sync object update tail [husky_gpu.c:648-656, 932-936] */
+-	if (desc->n_signals > 0 && desc->signals != NULL && desc->signals[0] != NULL) {
+-		const mali_syncobj_t *so = desc->signals[0];
++	if (so != NULL) {
+ 		prog[n++] = CS_MOVE48(ra, so->gpu_va);
+ 		prog[n++] = CS_MOVE48(rv, 1);
+ 		prog[n++] = CS_SYNC_ADD64(ra, rv);
+@@ -1690,6 +1711,9 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 	    n, (unsigned long long)(q->ring_insert % q->ring_size), (unsigned long long)new_in, BRIDGE_DOORBELL(q->csg));
+ 	gwr(DOORBELL(BRIDGE_DOORBELL(q->csg)), 1);
+ 	q->ring_insert = new_in;
++	if (so != NULL) {
++		so->signals++;
++	}
+ 	lck_mtx_unlock(q->lock);
+ 	return 0;
+ }
+@@ -1771,6 +1795,21 @@ op_syncobj_read(const mali_syncobj_t *so)
+ 	return *so->cpu;
+ }
+ 
++/* Timestamps of the submit that took the sync object to value seq (all zero for one without a stream). */
++static void
++op_syncobj_gpu_times(const mali_syncobj_t *so, uint64_t seq, uint64_t t[3])
++{
++	t[0] = t[1] = t[2] = 0;
++	if (so == NULL || so->cpu == NULL || seq == 0) {
++		return;
++	}
++	const volatile uint64_t *slot = (const volatile uint64_t *)((uintptr_t)so->cpu + SYNC_TS_OFF +
++	    ((seq - 1) % SYNC_TS_SLOTS) * 32);
++	for (unsigned i = 0; i < 3; i++) {
++		t[i] = slot[i];
++	}
++}
++
+ /*
+  * Tiler heap as kbase_csf_tiler_heap_init builds it: a zeroed heap context and initial_chunks
+  * zeroed chunks, each chunk's first header word linking the next as (va | chunk_size >> 12)
+@@ -1963,6 +2002,7 @@ const mali_backend_ops_t mali_backend_ops = {
+ 	.syncobj_destroy    = op_syncobj_destroy,
+ 	.syncobj_gpu_va     = op_syncobj_gpu_va,
+ 	.syncobj_read       = op_syncobj_read,
++	.syncobj_gpu_times  = op_syncobj_gpu_times,
+ 	.tiler_heap_create  = op_tiler_heap_create,
+ 	.tiler_heap_destroy = op_tiler_heap_destroy,
+ };
+diff --git a/iokit/Families/IOGPU/mali_backend_ops.h b/iokit/Families/IOGPU/mali_backend_ops.h
+index 47d1e08..a21fb78 100644
+--- a/iokit/Families/IOGPU/mali_backend_ops.h
++++ b/iokit/Families/IOGPU/mali_backend_ops.h
+@@ -285,6 +285,8 @@ typedef struct mali_backend_ops {
+     void          (*syncobj_destroy)(mali_syncobj_t *);
+     mali_gpu_va_t (*syncobj_gpu_va)(const mali_syncobj_t *);
+     uint64_t      (*syncobj_read)(const mali_syncobj_t *);
++    /* GPU timestamps {start, stream end, trailing flush end} of the submit that reached seq */
++    void          (*syncobj_gpu_times)(const mali_syncobj_t *, uint64_t seq, uint64_t t[3]);
+ 
+     /* --- tiler heap: FW-owned, for render passes (spec 06 5.4.5) --- */
+     /* chunk size page-aligned in [128 KiB, 8 MiB]; returns the triple the CS
