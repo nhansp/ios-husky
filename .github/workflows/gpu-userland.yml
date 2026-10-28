@@ -50,6 +50,34 @@ jobs:
           fi
           ls -la out/mesa/lib
 
+      - uses: actions/cache/restore@v4
+        id: llvm
+        with:
+          path: out/llvm-ios
+          key: llvm-ios-18.1.8-arm64e-${{ hashFiles('userland/air2valhall/llvm-ios-build.sh') }}
+
+      - name: LLVM for iOS
+        if: steps.llvm.outputs.cache-hit != 'true'
+        run: |
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          OUT=$PWD/out/llvm-ios WORK=$RUNNER_TEMP/llvm sh userland/air2valhall/llvm-ios-build.sh
+
+      - uses: actions/cache/save@v4
+        if: steps.llvm.outputs.cache-hit != 'true'
+        with:
+          path: out/llvm-ios
+          key: llvm-ios-18.1.8-arm64e-${{ hashFiles('userland/air2valhall/llvm-ios-build.sh') }}
+
+      - name: libMaliCompiler.dylib
+        run: |
+          set -eux
+          MESA_SRC=$PWD/mesa MESA_TREE=$PWD/out/mesa/tree MESA_LIB=$PWD/out/mesa/lib/libmali_mesa.a \
+            LLVM_DIR=$PWD/out/llvm-ios OUT=$PWD/out/compiler sh userland/air2valhall/ios-build.sh
+          codesign -f -s - out/compiler/libMaliCompiler.dylib
+          ls -la out/compiler/libMaliCompiler.dylib
+          otool -L out/compiler/libMaliCompiler.dylib
+          nm -gU out/compiler/libMaliCompiler.dylib | head -40
+
       - name: MaliMetal.bundle
         run: |
           set -eux
@@ -62,6 +90,8 @@ jobs:
           [ -f userland/shadercache/shaders.mvpack ] && PACK=$PWD/userland/shadercache/shaders.mvpack
           MESA_SRC=$PWD/mesa MESA_TREE=$PWD/out/mesa/tree MESA_LIB=$PWD/out/mesa/lib/libmali_mesa.a \
             OUT=$PWD/out/plugin PACK="$PACK" sh userland/plugin/MaliMetal/ios-build.sh
+          mkdir -p out/plugin/MaliMetal.bundle/Frameworks
+          cp out/compiler/libMaliCompiler.dylib out/plugin/MaliMetal.bundle/Frameworks/
           codesign -f -s - out/plugin/MaliMetal.bundle
           otool -L out/plugin/MaliMetal.bundle/MaliMetal
 
