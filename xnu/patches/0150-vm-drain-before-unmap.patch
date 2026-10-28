@@ -1,0 +1,166 @@
+diff --git a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+index 66c0966..051e220 100644
+--- a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
++++ b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+@@ -138,6 +138,10 @@ IOReturn
+ IOGPUDeviceUserClient::clientClose(void)
+ {
+ 	fStarted = false;
++	/* the client's queues (separate user clients) may still be running work over these resources */
++	if (fDevice != NULL && fDevice->task() != NULL) {
++		(void)mali_backend_ops.vm_wait_idle(fDevice->task()->vm(), 1000000);
++	}
+ 	OSSafeReleaseNULL(fDevice); /* Release via refcounting [fixes REVIEW defect 5] */
+ 	OSSafeReleaseNULL(fStampMap);
+ 	terminate();
+diff --git a/iokit/Families/IOGPU/IOGPUMemory.cpp b/iokit/Families/IOGPU/IOGPUMemory.cpp
+index 830f55d..e6685ab 100644
+--- a/iokit/Families/IOGPU/IOGPUMemory.cpp
++++ b/iokit/Families/IOGPU/IOGPUMemory.cpp
+@@ -305,11 +305,18 @@ IOGPUResource::free()
+ 	OSSafeReleaseNULL(fClientMap);
+ 	OSSafeReleaseNULL(fMemDesc);
+ 	OSSafeReleaseNULL(fGroupMembers);
++	/* a wedged VM's group may still DMA: its pages stay wired and owned, like the bridge's own */
++	const bool keep = fBO != NULL && fDevice != NULL && fDevice->task() != NULL &&
++	    mali_backend_ops.vm_is_wedged(fDevice->task()->vm());
+ 	if (fBO) {
+ 		mali_backend_ops.bo_free(fBO);
+ 		fBO = NULL;
+ 	}
+ 	OSSafeReleaseNULL(fKernelMap);
++	if (keep) {
++		fImport = NULL;
++		fImportOwner = NULL;
++	}
+ 	if (fImport != NULL) {
+ 		fImport->complete();
+ 		OSSafeReleaseNULL(fImport);
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 708df6d..af396d1 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -454,6 +454,9 @@ struct mali_queue {
+ 	mali_group_t       *grp;
+ 	lck_mtx_t          *lock;          /* submit vs the completion poller's queue_service */
+ 	uint32_t            refs;          /* IOGPU queues on this stream; g_grp_lock */
++	mali_bo_t          *done_bo;       /* every submit adds 1 here: the stream is idle at done == submitted */
++	volatile uint64_t  *done_cpu;
++	uint64_t            submitted;     /* under lock */
+ 	bool                oom_failed;    /* stop answering OOM until the next submit */
+ };
+ 
+@@ -1358,6 +1361,10 @@ queue_free_buffers(mali_queue_t *q)
+ 		op_bo_free(q->suspend_bo);
+ 		q->suspend_bo = NULL;
+ 	}
++	if (q->done_bo != NULL) {
++		op_bo_free(q->done_bo);
++		q->done_bo = NULL;
++	}
+ }
+ 
+ /* Give the stream back; the group goes with its last stream. g_grp_lock held. */
+@@ -1446,6 +1453,11 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 	}
+ 	q->ring_cpu    = (vm_offset_t)op_bo_cpu_map(q->ring_bo);
+ 	q->ring_gpu_va = q->ring_bo->gpu_va;
++	if (op_bo_alloc(vm, GPU_PAGE, MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_CPU_MAP | MALI_BO_NONCACHEABLE | MALI_BO_ZERO,
++	    0, &q->done_bo) != 0) {
++		goto fail;
++	}
++	q->done_cpu = (volatile uint64_t *)op_bo_cpu_map(q->done_bo);
+ 
+ 	/*
+ 	 * RING_INPUT / RING_OUTPUT pages are read by the firmware in the MCU's address space, not the
+@@ -1668,6 +1680,10 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 		prog[n++] = CS_SYNC_ADD64(ra, rv);
+ 	}
+ 
++	prog[n++] = CS_MOVE48(ra, q->done_bo->gpu_va);
++	prog[n++] = CS_MOVE48(rv, 1);
++	prog[n++] = CS_SYNC_ADD64(ra, rv);
++
+ 	/* 4. Error barrier [husky_gpu.c:655, 935] */
+ 	prog[n++] = CS_ERROR_BARRIER;
+ 
+@@ -1711,6 +1727,7 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 	    n, (unsigned long long)(q->ring_insert % q->ring_size), (unsigned long long)new_in, BRIDGE_DOORBELL(q->csg));
+ 	gwr(DOORBELL(BRIDGE_DOORBELL(q->csg)), 1);
+ 	q->ring_insert = new_in;
++	q->submitted++;
+ 	if (so != NULL) {
+ 		so->signals++;
+ 	}
+@@ -1739,6 +1756,48 @@ op_queue_wait_idle(mali_queue_t *q, uint64_t timeout_us)
+ 	return 0;
+ }
+ 
++/*
++ * A client that dies drops its resources in no fixed order against its queues (each queue is its own user
++ * client): wait for the VM's stream to retire everything before they are unmapped, or the GPU takes a
++ * translation fault that nothing services and the stream can no longer stop (bootE shutdown, bootI). A VM
++ * whose stream does not drain is wedged: its pages stay.
++ */
++static bool
++op_vm_wait_idle(mali_vm_t *vm, uint64_t timeout_us)
++{
++	if (vm == NULL) {
++		return true;
++	}
++	lck_mtx_lock(&g_grp_lock);
++	mali_queue_t *q = vm->group != NULL ? vm->group->queue : NULL;
++	bool idle = true;
++	if (q != NULL && q->done_cpu != NULL) {
++		lck_mtx_lock(q->lock);
++		const uint64_t want = q->submitted;
++		lck_mtx_unlock(q->lock);
++		uint64_t us = 0;
++		while (*q->done_cpu < want && us < timeout_us) {
++			delay(100);
++			us += 100;
++		}
++		idle = *q->done_cpu >= want;
++		if (!idle) {
++			BR_LOG("HUSKY IOGPU bridge: CSG%u CS%u did not drain in %llu us (%llu of %llu): AS%d wedged\n", q->csg, q->cs,
++			    (unsigned long long)timeout_us, (unsigned long long)*q->done_cpu, (unsigned long long)want, vm->as_slot);
++			queue_dump_state(q);
++			__atomic_store_n(&vm->wedged, true, __ATOMIC_RELEASE);
++		}
++	}
++	lck_mtx_unlock(&g_grp_lock);
++	return idle;
++}
++
++static bool
++op_vm_is_wedged(const mali_vm_t *vm)
++{
++	return vm != NULL && __atomic_load_n(&vm->wedged, __ATOMIC_ACQUIRE);
++}
++
+ /* --- Sync Objects [spec 06 lines 160-184, husky_gpu.c:649] --- */
+ static mali_status_t
+ op_syncobj_create(mali_vm_t *vm, mali_syncobj_t **out)
+@@ -2003,6 +2062,8 @@ const mali_backend_ops_t mali_backend_ops = {
+ 	.syncobj_gpu_va     = op_syncobj_gpu_va,
+ 	.syncobj_read       = op_syncobj_read,
+ 	.syncobj_gpu_times  = op_syncobj_gpu_times,
++	.vm_wait_idle       = op_vm_wait_idle,
++	.vm_is_wedged       = op_vm_is_wedged,
+ 	.tiler_heap_create  = op_tiler_heap_create,
+ 	.tiler_heap_destroy = op_tiler_heap_destroy,
+ };
+diff --git a/iokit/Families/IOGPU/mali_backend_ops.h b/iokit/Families/IOGPU/mali_backend_ops.h
+index f9c9fa0..1fc4602 100644
+--- a/iokit/Families/IOGPU/mali_backend_ops.h
++++ b/iokit/Families/IOGPU/mali_backend_ops.h
+@@ -288,6 +288,9 @@ typedef struct mali_backend_ops {
+     uint64_t      (*syncobj_read)(const mali_syncobj_t *);
+     /* GPU timestamps {start, stream end, trailing flush end} of the submit that reached seq */
+     void          (*syncobj_gpu_times)(const mali_syncobj_t *, uint64_t seq, uint64_t t[3]);
++    /* wait until the VM's stream retired every submit; false (and the VM wedged) on timeout */
++    bool          (*vm_wait_idle)(mali_vm_t *, uint64_t timeout_us);
++    bool          (*vm_is_wedged)(const mali_vm_t *);
+ 
+     /* --- tiler heap: FW-owned, for render passes (spec 06 5.4.5) --- */
+     /* chunk size page-aligned in [128 KiB, 8 MiB]; returns the triple the CS
