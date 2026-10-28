@@ -185,6 +185,8 @@ mali_texture_t *mali_texture_view(const mali_texture_t *parent, uint32_t mtl_pix
                                   uint32_t mtl_texture_type, uint32_t first_level,
                                   uint32_t level_count, uint32_t first_slice, uint32_t slice_count);
 void            mali_texture_free(mali_texture_t *t);
+/* MTLTextureSwizzleChannels (Zero, One, Red, Green, Blue, Alpha = 0..5) relative to the view's format. */
+void            mali_texture_set_swizzle(mali_texture_t *t, const uint8_t mtl_swizzle[4]);
 
 typedef struct mali_subresource {
     uint64_t offset_B;           /* from byte 0 of the resource                 */

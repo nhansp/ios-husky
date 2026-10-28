@@ -177,6 +177,7 @@ void MaliShadowWriteBack(id shadow) {
 - (void)maliAttachLinearBacking:(MaliBuffer *)buffer descriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)o bytesPerRow:(NSUInteger)bpr
                             ctx:(const mali_ctx_t *)ctx;
 - (void)maliAttachShadow:(MaliSurfaceShadow *)sh;
+- (void)maliApplySwizzle:(MTLTextureSwizzleChannels)sw;
 - (void)maliAttachShadowedBacking:(MaliBuffer *)buffer shadow:(MaliSurfaceShadow *)sh descriptor:(MTLTextureDescriptor *)d
                            offset:(NSUInteger)o ctx:(const mali_ctx_t *)ctx;
 - (void)maliSetCPU:(void *)base bytes:(NSUInteger)n;
@@ -278,6 +279,13 @@ static BOOL params_from_descriptor(MTLTextureDescriptor *d, mali_texture_params_
 - (void)maliPrepareForGPUUse { [_shadow syncIfNeeded]; }
 - (MTLTextureUsage)usage { return _usageKnown ? _usage : [super usage]; }
 - (void)maliSetUsage:(MTLTextureUsage)u { _usage = u; _usageKnown = YES; }
+- (void)maliApplySwizzle:(MTLTextureSwizzleChannels)sw {
+    if (!_mt || (sw.red == MTLTextureSwizzleRed && sw.green == MTLTextureSwizzleGreen && sw.blue == MTLTextureSwizzleBlue &&
+                 sw.alpha == MTLTextureSwizzleAlpha))
+        return;
+    const uint8_t m[4] = {(uint8_t)sw.red, (uint8_t)sw.green, (uint8_t)sw.blue, (uint8_t)sw.alpha};
+    mali_texture_set_swizzle(_mt, m);
+}
 - (void)maliRefuse:(NSString *)why { _why = why; MaliLogOnce([NSString stringWithFormat:@"texture unusable by the GPU: %@", why]); }
 
 /* Attach the Mesa layout of a fresh texture; `data_size` is checked against the resource. */
@@ -303,6 +311,7 @@ static BOOL params_from_descriptor(MTLTextureDescriptor *d, mali_texture_params_
     p.explicit_row_pitch = (uint32_t)bpr;
     p.plane_offset_B = o;
     if (![self maliAttachLayout:&p ctx:ctx baseGPU:buffer.gpuAddress available:buffer.length]) return;
+    [self maliApplySwizzle:d.swizzle];
     _keepAlive = buffer;
     if (buffer.contents) { _cpu = buffer.contents; _cpuBytes = buffer.length; }
 }
@@ -315,6 +324,7 @@ static BOOL params_from_descriptor(MTLTextureDescriptor *d, mali_texture_params_
     if (!params_from_descriptor(d, &p)) { [self maliRefuse:@"unsupported buffer texture descriptor"]; return; }
     p.explicit_row_pitch = (uint32_t)sh->_rowBytes;
     if (![self maliAttachLayout:&p ctx:ctx baseGPU:[(IOGPUMetalResource *)sh->_buffer gpuAddress] available:sh->_buffer.length]) return;
+    [self maliApplySwizzle:d.swizzle];
     _shadow = sh;
     _keepAlive = buffer;
     if (buffer.contents) { _cpu = (char *)buffer.contents + o; _cpuBytes = buffer.length - o; }
@@ -397,6 +407,12 @@ static BOOL params_from_descriptor(MTLTextureDescriptor *d, mali_texture_params_
     return [self newTextureViewWithPixelFormat:f textureType:self.textureType levels:NSMakeRange(0, self.mipmapLevelCount)
                                         slices:NSMakeRange(0, slice_count_of(self.textureType, self.arrayLength))];
 }
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)f textureType:(MTLTextureType)t levels:(NSRange)l slices:(NSRange)s
+                                       swizzle:(MTLTextureSwizzleChannels)sw {
+    MaliTexture *v = (MaliTexture *)[self newTextureViewWithPixelFormat:f textureType:t levels:l slices:s];
+    [v maliApplySwizzle:sw];
+    return v;
+}
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)f textureType:(MTLTextureType)t levels:(NSRange)l slices:(NSRange)s {
     MaliTexture *v = [[MaliTexture alloc] initWithTexture:self pixelFormat:f textureType:t levels:l slices:s];
     if (!v) return nil;
@@ -452,11 +468,13 @@ id<MTLTexture> MaliNewTexture(id<MTLDevice> dev, MTLTextureDescriptor *d, IOSurf
             [t maliAttachShadow:sh2];
             p.explicit_row_pitch = (uint32_t)sh2->_rowBytes;
             [t maliAttachLayout:&p ctx:ctx baseGPU:[(IOGPUMetalResource *)sh2->_buffer gpuAddress] available:sh2->_buffer.length];
+            [t maliApplySwizzle:d.swizzle];
             return t;
         }
         p.explicit_row_pitch = (uint32_t)row;
         p.plane_offset_B = plane_off;
         [t maliAttachLayout:&p ctx:ctx baseGPU:t.gpuAddress available:alloc];
+        [t maliApplySwizzle:d.swizzle];
         return t;
     }
 
@@ -476,6 +494,7 @@ id<MTLTexture> MaliNewTexture(id<MTLDevice> dev, MTLTextureDescriptor *d, IOSurf
     if (!t) return nil;
     [t maliSetUsage:d.usage];
     [t maliAttachLayout:&p ctx:ctx baseGPU:t.gpuAddress available:[t resourceSize]];
+    [t maliApplySwizzle:d.swizzle];
     void *va = [t virtualAddress];
     if (va) [t maliSetCPU:va bytes:(NSUInteger)MIN((uint64_t)[t resourceSize], (uint64_t)sz)];
     return t;
@@ -500,6 +519,7 @@ id<MTLTexture> MaliNewTextureNoCopy(id<MTLDevice> dev, MTLTextureDescriptor *d, 
     [t maliSetUsage:d.usage];
     [t maliSetCPU:bytes bytes:len];
     [t maliAttachLayout:&p ctx:[mdev maliCtx] baseGPU:t.gpuAddress available:len];
+    [t maliApplySwizzle:d.swizzle];
     return t;
 }
 

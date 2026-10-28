@@ -209,6 +209,15 @@ mali_texture_view(const mali_texture_t *parent, uint32_t mtl_pixel_format, uint3
 }
 
 void
+mali_texture_set_swizzle(mali_texture_t *t, const uint8_t mtl_swizzle[4])
+{
+    static const unsigned char map[6] = {PIPE_SWIZZLE_0, PIPE_SWIZZLE_1, PIPE_SWIZZLE_X,
+                                         PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W};
+    for (unsigned i = 0; i < 4; i++)
+        t->view.swizzle[i] = mtl_swizzle[i] < 6 ? map[mtl_swizzle[i]] : (unsigned char)(PIPE_SWIZZLE_X + i);
+}
+
+void
 mali_texture_free(mali_texture_t *t)
 {
     if (!t)
