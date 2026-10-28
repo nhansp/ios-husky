@@ -1,0 +1,56 @@
+diff --git a/bsd/dev/husky_gpu.c b/bsd/dev/husky_gpu.c
+index 4e2556e..4cffb85 100644
+--- a/bsd/dev/husky_gpu.c
++++ b/bsd/dev/husky_gpu.c
+@@ -1437,7 +1437,10 @@ husky_gpu_mcu_boot(void)
+ 	/* Global init (panthor_fw_init_global_iface). */
+ 	wr32(gin, GLB_IN_CORE_EN_MASK, (uint32_t)GPU_SHADER_PRESENT);
+ 	wr32(gin, GLB_IN_CORE_EN_MASK + 4, (uint32_t)(GPU_SHADER_PRESENT >> 32));
+-	wr32(gin, GLB_IN_POWEROFF_TIMER, glb_timeout(10000));
++	/* huskygpupwroff=<us>: shader-core power-off hysteresis (panthor's 10 ms default) */
++	uint32_t pwroff_us = 10000;
++	(void)PE_parse_boot_argn("huskygpupwroff", &pwroff_us, sizeof(pwroff_us));
++	wr32(gin, GLB_IN_POWEROFF_TIMER, glb_timeout(pwroff_us));
+ 	wr32(gin, GLB_IN_PROGRESS_TIMER, (5u * 500u * 1024u * 1024u) >> 10);
+ 	wr32(gin, GLB_IN_IDLE_TIMER, glb_timeout(800));
+ 	wr32(gin, GLB_IN_ACK_IRQ_MASK, GLB_REQ_ALLOC_EN | GLB_REQ_PING | GLB_REQ_PROGRESS_TIMER |
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 9f8780e..25c4ee3 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -1415,7 +1415,7 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 	/* Allocate 64 KiB ring buffer backing [husky_gpu.c:948] */
+ 	st = ENOMEM;
+ 	if (op_bo_alloc(vm, q->ring_size,
+-	    MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_CPU_MAP | MALI_BO_NONCACHEABLE,
++	    MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_CPU_MAP | MALI_BO_NONCACHEABLE | MALI_BO_ZERO,
+ 	    0, &q->ring_bo) != 0) {
+ 		goto fail;
+ 	}
+@@ -1429,12 +1429,22 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 	 */
+ 	vm_offset_t io_kva = g->slot_kva + BRIO_SUSPEND + q->cs * 2 * GPU_PAGE;
+ 	uint64_t io_va = g->slot_va + BRIO_SUSPEND + (uint64_t)q->cs * 2 * GPU_PAGE;
+-	for (uint32_t off = 0; off < 2 * GPU_PAGE; off += 8) {
+-		*(volatile uint64_t *)(io_kva + off) = 0;       /* fresh insert/extract pointers */
+-	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
+ 	q->ring_in_cpu  = (volatile uint64_t *)io_kva;
+ 	q->ring_out_cpu = (volatile uint64_t *)(io_kva + GPU_PAGE);
++	/*
++	 * Boot bootC: zeroing the pointers of a reused stream made the firmware run the new ring from 0
++	 * up to the old insert (CS_INVALID_INSTRUCTION at the ring base). The positions are monotonic
++	 * and taken modulo the ring size, so a new queue continues from the stream's last one
++	 * (the BRIO area starts zeroed).
++	 */
++	q->ring_insert = q->ring_in_cpu[0];
++	if (q->ring_out_cpu[0] != q->ring_insert) {
++		BR_LOG("HUSKY IOGPU bridge: CSG%u CS%u reused with insert 0x%llx extract 0x%llx\n", q->csg, q->cs,
++		    (unsigned long long)q->ring_insert, (unsigned long long)q->ring_out_cpu[0]);
++		q->ring_insert = q->ring_out_cpu[0];
++		q->ring_in_cpu[0] = q->ring_insert;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
+ 	q->ring_in_gpu  = io_va;
+ 	q->ring_out_gpu = io_va + GPU_PAGE;
+ 
