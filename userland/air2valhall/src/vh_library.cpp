@@ -480,7 +480,7 @@ void air2vh_free(void *p) { free(p); }
 const char *
 air2vh_compiler_id(void)
 {
-    return "air2valhall-vh1-mesa-1f9035d-llvm18";
+    return "air2valhall-vh1-r2-mesa-1f9035d-llvm18";
 }
 
 air2vh_compiler *
@@ -719,6 +719,11 @@ air2vh_compile(air2vh_compiler *c, const air2vh_compile_info *info,
             }
             lower_nir_io_pan(nir);
         }
+
+        /* pan_shader_update_info reads nir->info (quad helpers for implicit-LOD tex and
+         * derivatives, discard, barriers); panvk gathers at the same point
+         * [M:vulkan/panvk_vX_shader.c:972]. Without it FS never request helper threads. */
+        nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
         /* Step 5: Postprocess NIR for Valhall v11. */
         struct pan_shader_info sinfo = {};
