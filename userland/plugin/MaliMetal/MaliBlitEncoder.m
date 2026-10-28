@@ -271,4 +271,11 @@ typedef struct tex_span {
 - (void)waitForFence:(id<MTLFence>)f {}
 - (void)resetCommandsInBuffer:(id<MTLIndirectCommandBuffer>)b withRange:(NSRange)r { MALI_UNSUPPORTED("indirect command buffers"); }
 - (void)copyIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)s sourceRange:(NSRange)r destination:(id<MTLIndirectCommandBuffer>)d destinationIndex:(NSUInteger)i { MALI_UNSUPPORTED("indirect command buffers"); }
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel {
+    return [super methodSignatureForSelector:sel] ?: MaliDroppedSelectorSignature([self class], sel);
+}
+- (void)forwardInvocation:(NSInvocation *)inv {
+    if (![super methodSignatureForSelector:inv.selector]) return;
+    [super forwardInvocation:inv];
+}
 @end

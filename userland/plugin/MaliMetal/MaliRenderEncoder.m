@@ -36,6 +36,20 @@ static int load_kind(MTLPixelFormat f) {
 }
 static inline uint32_t level_dim(NSUInteger v, NSUInteger level) { return (uint32_t)MAX((NSUInteger)1, level < 32 ? v >> level : 0); }
 
+/* An encoder SPI selector the plug-in lacks: setters and other void-by-convention calls are dropped and named once
+ * in the diag log instead of killing the render server; anything else still raises. */
+NSMethodSignature *MaliDroppedSelectorSignature(Class cls, SEL sel) {
+    static NSString *const prefixes[] = {@"set", @"use", @"draw", @"memoryBarrier", @"wait", @"update", @"encode"};
+    NSString *name = NSStringFromSelector(sel);
+    for (size_t i = 0; i < sizeof prefixes / sizeof prefixes[0]; i++) {
+        if ([name hasPrefix:prefixes[i]]) {
+            MaliLogOnce([NSString stringWithFormat:@"%@: SPI %@ is not implemented (dropped)", NSStringFromClass(cls), name]);
+            return [NSMethodSignature signatureWithObjCTypes:"v@:"];
+        }
+    }
+    return nil;
+}
+
 @implementation MaliRenderCommandEncoder {
     MaliCommandBuffer *_cb;
     BOOL _ended;
@@ -333,6 +347,15 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
 }
 - (void)setVertexTextures:(const id<MTLTexture> [])ts withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setVertexTexture:ts[k] atIndex:r.location + k]; }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (![self maliCheckOpen]) return; MaliBindSampler(&_fs, i, s); _constDirty = YES; }
+/* QuartzCore SPI (bootI: backboardd died on the unrecognized selector) */
+- (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
+    [self setFragmentTexture:t atIndex:ti];
+    [self setFragmentSamplerState:s atIndex:si];
+}
+- (void)setVertexTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
+    [self setVertexTexture:t atIndex:ti];
+    [self setVertexSamplerState:s atIndex:si];
+}
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)a lodMaxClamp:(float)b atIndex:(NSUInteger)i { [self setFragmentSamplerState:s atIndex:i]; }
 - (void)setFragmentSamplerStates:(const id<MTLSamplerState> [])ss withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setFragmentSamplerState:ss[k] atIndex:r.location + k]; }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (![self maliCheckOpen]) return; MaliBindSampler(&_vs, i, s); _constDirty = YES; }
@@ -431,4 +454,11 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
 - (void)setThreadgroupMemoryLength:(NSUInteger)l offset:(NSUInteger)o atIndex:(NSUInteger)i { MALI_UNSUPPORTED("tile threadgroup memory"); }
 - (void)setTileBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { MALI_UNSUPPORTED("tile buffers"); }
 - (void)dispatchThreadsPerTile:(MTLSize)s { MALI_UNSUPPORTED("tile dispatch"); }
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel {
+    return [super methodSignatureForSelector:sel] ?: MaliDroppedSelectorSignature([self class], sel);
+}
+- (void)forwardInvocation:(NSInvocation *)inv {
+    if (![super methodSignatureForSelector:inv.selector]) return;
+    [super forwardInvocation:inv];
+}
 @end

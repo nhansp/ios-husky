@@ -134,4 +134,11 @@
     [self maliDispatchGrid:grid threadgroup:tg threads:threads nonUniform:ragged];
 }
 - (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o threadsPerThreadgroup:(MTLSize)tg { MALI_UNSUPPORTED("indirect dispatch"); }
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel {
+    return [super methodSignatureForSelector:sel] ?: MaliDroppedSelectorSignature([self class], sel);
+}
+- (void)forwardInvocation:(NSInvocation *)inv {
+    if (![super methodSignatureForSelector:inv.selector]) return;
+    [super forwardInvocation:inv];
+}
 @end

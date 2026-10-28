@@ -95,5 +95,6 @@ id<MTLBuffer> _Nullable MaliNewGPUBuffer(id<MTLDevice> dev, NSUInteger len, uint
 
 /* log a dropped/refused operation once per distinct reason */
 void MaliLogOnce(NSString *_Nullable reason);
+NSMethodSignature *_Nullable MaliDroppedSelectorSignature(Class cls, SEL sel);
 
 NS_ASSUME_NONNULL_END
