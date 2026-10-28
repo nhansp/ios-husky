@@ -1,0 +1,413 @@
+diff --git a/iokit/Kernel/arm/HuskyScaler.cpp b/iokit/Kernel/arm/HuskyScaler.cpp
+new file mode 100644
+index 0000000..90d2a34
+--- /dev/null
++++ b/iokit/Kernel/arm/HuskyScaler.cpp
+@@ -0,0 +1,349 @@
++/*
++ * Built-in AppleM2ScalerCSCDriver for HUSKY: Apple's scaler/colour-converter block, done on the CPU.
++ *
++ * QuartzCore copies app snapshots into 420f surfaces through IOSurfaceAccelerator.framework, which on
++ * bare metal (kern.hv_vmm_present == 0) opens IOServiceMatching("AppleM2ScalerCSCDriver") with type 0
++ * and sends one selector-1 TransformSurfaceData struct per transfer. Without the service every snapshot
++ * stayed zero (solid green in the app switcher). ABI: docs/research/scaler-shim-spec.md (ios-husky).
++ *
++ * Supported: BGRA (and the '&BGA' linear variant) source to BGRA, 420f or 420v destination, bilinear
++ * scaling, BT.709. Anything else (rotation/flip, other formats) is refused and logged.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(HUSKY)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <sys/proc.h>
++#include "HuskySurface.h"
++
++#define FOURCC(a, b, c, d) (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
++#define PF_BGRA   FOURCC('B', 'G', 'R', 'A')
++#define PF_BGRA_L FOURCC('&', 'B', 'G', 'A')
++#define PF_420F   FOURCC('4', '2', '0', 'f')
++#define PF_420V   FOURCC('4', '2', '0', 'v')
++
++enum {
++	kScalerTransform      = 1,
++	kScalerAbortTransfers = 2,
++	kScalerAbortCaptures  = 3,
++	kScalerDriverScalar   = 5,
++	kScalerEstimation     = 9,
++	kScalerClientProperty = 0xa,
++};
++
++#define TSD_SIZE                0x1b0
++#define TSD_FLAG_SKIP_CALLBACK  (1ULL << 10)
++#define TSD_FLAG_TRANSFORM_MASK 0x7ULL
++
++struct husky_tsd {
++	uint32_t srcID, dstID;
++	uint64_t callback, refcon, arg0;
++	uint64_t flags;
++	uint64_t srcX, srcY, srcW, srcH;        /* 16.16 */
++	uint32_t srcSurfW, srcSurfH;
++	uint64_t zero50, zero58;
++	uint32_t dstX, dstY, dstW, dstH;
++	uint32_t dstSurfW, dstSurfH;
++};
++static_assert(offsetof(husky_tsd, flags) == 0x20, "TransformSurfaceData layout");
++static_assert(offsetof(husky_tsd, srcSurfW) == 0x48, "TransformSurfaceData layout");
++static_assert(offsetof(husky_tsd, dstX) == 0x60, "TransformSurfaceData layout");
++static_assert(offsetof(husky_tsd, dstSurfW) == 0x70, "TransformSurfaceData layout");
++
++class AppleM2ScalerCSCDriver : public IOService {
++	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriver, IOService);
++
++bool
++AppleM2ScalerCSCDriver::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "IOSurfaceAcceleratorClient");
++	registerService();
++	IOLog("HUSKY SCALER: AppleM2ScalerCSCDriver registered (CPU transfers)\n");
++	return true;
++}
++
++class IOSurfaceAcceleratorClient : public IOUserClient {
++	OSDeclareDefaultStructors(IOSurfaceAcceleratorClient);
++
++	mach_port_t wakePort;
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn registerNotificationPort(mach_port_t port, UInt32 type, UInt32 refCon) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOSurfaceAcceleratorClient, IOUserClient);
++
++IOReturn
++IOSurfaceAcceleratorClient::clientClose(void)
++{
++	if (wakePort != MACH_PORT_NULL) {
++		releaseNotificationPort(wakePort);
++		wakePort = MACH_PORT_NULL;
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOSurfaceAcceleratorClient::registerNotificationPort(mach_port_t port, UInt32 type, __unused UInt32 refCon)
++{
++	if (type != 0) {
++		return kIOReturnUnsupported;
++	}
++	if (wakePort != MACH_PORT_NULL) {
++		releaseNotificationPort(wakePort);
++	}
++	wakePort = port;
++	return kIOReturnSuccess;
++}
++
++static const char *
++husky_fourcc(uint32_t f, char buf[5])
++{
++	buf[0] = (char)(f >> 24); buf[1] = (char)(f >> 16); buf[2] = (char)(f >> 8); buf[3] = (char)f; buf[4] = 0;
++	return buf;
++}
++
++/* Bilinear sample of a BGRA source at 16.16 coordinates (clamped), into b, g, r, a (0..255). */
++static inline void
++husky_scaler_sample(const uint8_t *src, uint32_t row, uint32_t w, uint32_t h, int64_t fx, int64_t fy, uint32_t out[4])
++{
++	if (fx < 0) {
++		fx = 0;
++	}
++	if (fy < 0) {
++		fy = 0;
++	}
++	uint32_t x0 = (uint32_t)(fx >> 16), y0 = (uint32_t)(fy >> 16);
++	if (x0 >= w - 1) {
++		x0 = w - 1;
++		fx = (int64_t)x0 << 16;
++	}
++	if (y0 >= h - 1) {
++		y0 = h - 1;
++		fy = (int64_t)y0 << 16;
++	}
++	const uint32_t x1 = x0 + 1 < w ? x0 + 1 : x0, y1 = y0 + 1 < h ? y0 + 1 : y0;
++	const uint32_t ax = (uint32_t)(fx & 0xffff) >> 8, ay = (uint32_t)(fy & 0xffff) >> 8;   /* 0..255 */
++	const uint8_t *p00 = src + y0 * row + x0 * 4, *p01 = src + y0 * row + x1 * 4;
++	const uint8_t *p10 = src + y1 * row + x0 * 4, *p11 = src + y1 * row + x1 * 4;
++	for (uint32_t c = 0; c < 4; c++) {
++		const uint32_t top = p00[c] * (256 - ax) + p01[c] * ax;
++		const uint32_t bot = p10[c] * (256 - ax) + p11[c] * ax;
++		out[c] = (top * (256 - ay) + bot * ay + (1u << 15)) >> 16;
++	}
++}
++
++/* BT.709 RGB (0..255) to Y/Cb/Cr scaled by 2^16 before range mapping. */
++static inline void
++husky_scaler_ycc(uint32_t r, uint32_t g, uint32_t b, bool video, uint32_t *y, int32_t *cb, int32_t *cr)
++{
++	const int32_t Y = (int32_t)(13933 * r + 46871 * g + 4732 * b);         /* 0.2126 0.7152 0.0722 */
++	const int32_t Cb = (int32_t)(-7509 * (int32_t)r - 25259 * (int32_t)g + 32768 * (int32_t)b);
++	const int32_t Cr = (int32_t)(32768 * (int32_t)r - 29763 * (int32_t)g - 3005 * (int32_t)b);
++	if (video) {
++		*y = (uint32_t)((Y * 219 / 255 + (16 << 16) + (1 << 15)) >> 16);
++		*cb = (Cb * 224 / 255 + (128 << 16) + (1 << 15)) >> 16;
++		*cr = (Cr * 224 / 255 + (128 << 16) + (1 << 15)) >> 16;
++	} else {
++		*y = (uint32_t)((Y + (1 << 15)) >> 16);
++		*cb = (Cb + (128 << 16) + (1 << 15)) >> 16;
++		*cr = (Cr + (128 << 16) + (1 << 15)) >> 16;
++	}
++}
++
++static inline uint8_t
++husky_clamp8(int32_t v)
++{
++	return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
++}
++
++static IOReturn
++husky_scaler_transfer(const struct husky_tsd *t)
++{
++	if (t->flags & TSD_FLAG_TRANSFORM_MASK) {
++		IOLog("HUSKY SCALER: transform 0x%llx (flip/rotate) not supported\n", t->flags & TSD_FLAG_TRANSFORM_MASK);
++		return kIOReturnUnsupported;
++	}
++	HuskySurface *src = husky_surface_copy(t->srcID);
++	HuskySurface *dst = husky_surface_copy(t->dstID);
++	IOReturn ret = kIOReturnBadArgument;
++	if (src == NULL || dst == NULL) {
++		IOLog("HUSKY SCALER: no surface %u -> %u\n", t->srcID, t->dstID);
++		goto out;
++	}
++	{
++		const uint32_t sf = src->pixelFormat, df = dst->pixelFormat;
++		if ((sf != PF_BGRA && sf != PF_BGRA_L) || src->planeCount > 1 ||
++		    (df != PF_BGRA && df != PF_BGRA_L && df != PF_420F && df != PF_420V)) {
++			char a[5], b[5];
++			IOLog("HUSKY SCALER: %u '%s' -> %u '%s' not supported\n", t->srcID, husky_fourcc(sf, a), t->dstID,
++			    husky_fourcc(df, b));
++			ret = kIOReturnUnsupported;
++			goto out;
++		}
++		uint8_t *sbase = (uint8_t *)src->kernelAddress(), *dbase = (uint8_t *)dst->kernelAddress();
++		if (sbase == NULL || dbase == NULL) {
++			ret = kIOReturnNoMemory;
++			goto out;
++		}
++		const uint8_t *s = sbase + src->offset;
++		const uint32_t srow = src->bytesPerRow;
++
++		/* 16.16 source rect; w/h 0 = the whole surface */
++		int64_t sx = (int64_t)t->srcX, sy = (int64_t)t->srcY;
++		int64_t sw = t->srcW ? (int64_t)t->srcW : ((int64_t)src->width << 16);
++		int64_t sh = t->srcH ? (int64_t)t->srcH : ((int64_t)src->height << 16);
++		uint32_t dx0 = t->dstX, dy0 = t->dstY;
++		uint32_t dw = t->dstW ? t->dstW : dst->width, dh = t->dstH ? t->dstH : dst->height;
++		if (dx0 + dw > dst->width || dy0 + dh > dst->height || src->width == 0 || src->height == 0 || dw == 0 || dh == 0 ||
++		    ((sx + sw) >> 16) > src->width || ((sy + sh) >> 16) > src->height) {
++			IOLog("HUSKY SCALER: rect out of bounds (src %ux%u, dst %u,%u %ux%u of %ux%u)\n", src->width, src->height,
++			    dx0, dy0, dw, dh, dst->width, dst->height);
++			goto out;
++		}
++		husky_dcache_flush((vm_offset_t)s, (size_t)srow * src->height);
++
++		/* source position of destination pixel centre i: sx + (i + 0.5) * step - 0.5 */
++		const int64_t stepx = sw / (int64_t)dw, stepy = sh / (int64_t)dh;     /* 16.16 */
++#define SRC_X(i) (sx + (int64_t)(i) * stepx + (stepx >> 1) - (1 << 15))
++#define SRC_Y(j) (sy + (int64_t)(j) * stepy + (stepy >> 1) - (1 << 15))
++		uint32_t px[4];
++		if (df == PF_BGRA || df == PF_BGRA_L) {
++			uint8_t *d = dbase + dst->offset;
++			for (uint32_t j = 0; j < dh; j++) {
++				uint8_t *row = d + (size_t)(dy0 + j) * dst->bytesPerRow + dx0 * 4;
++				for (uint32_t i = 0; i < dw; i++) {
++					husky_scaler_sample(s, srow, src->width, src->height, SRC_X(i), SRC_Y(j), px);
++					row[i * 4 + 0] = (uint8_t)px[0];
++					row[i * 4 + 1] = (uint8_t)px[1];
++					row[i * 4 + 2] = (uint8_t)px[2];
++					row[i * 4 + 3] = (uint8_t)px[3];
++				}
++			}
++			husky_dcache_clean((vm_offset_t)d, (size_t)dst->bytesPerRow * dst->height);
++		} else {
++			if (dst->planeCount < 2 || (dx0 | dy0 | dw | dh) & 1) {
++				IOLog("HUSKY SCALER: 420 destination %u needs 2 planes and even rect\n", t->dstID);
++				goto out;
++			}
++			const bool video = df == PF_420V;
++			const struct husky_surface_plane *py = &dst->planes[0], *pc = &dst->planes[1];
++			uint8_t *yb = dbase + py->offset, *cb = dbase + pc->offset;
++			for (uint32_t j = 0; j < dh; j += 2) {
++				uint8_t *y0 = yb + (size_t)(dy0 + j) * py->bytesPerRow + dx0;
++				uint8_t *y1 = y0 + py->bytesPerRow;
++				uint8_t *c = cb + (size_t)((dy0 + j) / 2) * pc->bytesPerRow + dx0;
++				for (uint32_t i = 0; i < dw; i += 2) {
++					uint32_t rs = 0, gs = 0, bs = 0;
++					for (uint32_t k = 0; k < 4; k++) {
++						const uint32_t ii = i + (k & 1), jj = j + (k >> 1);
++						husky_scaler_sample(s, srow, src->width, src->height, SRC_X(ii), SRC_Y(jj), px);
++						uint32_t yv;
++						int32_t cbv, crv;
++						husky_scaler_ycc(px[2], px[1], px[0], video, &yv, &cbv, &crv);
++						((k >> 1) ? y1 : y0)[ii] = husky_clamp8((int32_t)yv);
++						rs += px[2];
++						gs += px[1];
++						bs += px[0];
++					}
++					uint32_t yv;
++					int32_t cbv, crv;
++					husky_scaler_ycc((rs + 2) / 4, (gs + 2) / 4, (bs + 2) / 4, video, &yv, &cbv, &crv);
++					c[i] = husky_clamp8(cbv);
++					c[i + 1] = husky_clamp8(crv);
++				}
++			}
++			husky_dcache_clean((vm_offset_t)yb, (size_t)py->bytesPerRow * py->height);
++			husky_dcache_clean((vm_offset_t)cb, (size_t)pc->bytesPerRow * pc->height);
++		}
++#undef SRC_X
++#undef SRC_Y
++		dst->bumpSeed();
++		ret = kIOReturnSuccess;
++	}
++out:
++	OSSafeReleaseNULL(src);
++	OSSafeReleaseNULL(dst);
++	return ret;
++}
++
++IOReturn
++IOSurfaceAcceleratorClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	switch (selector) {
++	case kScalerTransform: {
++		struct husky_tsd t;
++		if (args->structureInputDescriptor != NULL) {
++			if (args->structureInputDescriptor->getLength() != TSD_SIZE) {
++				return kIOReturnBadArgument;
++			}
++			args->structureInputDescriptor->readBytes(0, &t, sizeof(t));
++		} else {
++			if (args->structureInput == NULL || args->structureInputSize != TSD_SIZE) {
++				return kIOReturnBadArgument;
++			}
++			memcpy(&t, args->structureInput, sizeof(t));
++		}
++		IOReturn ret = husky_scaler_transfer(&t);
++		if (t.callback == 0) {
++			return ret;
++		}
++		/* asynchronous: the submit succeeds and the result arrives as callback(refcon, result, arg0) */
++		if (!(t.flags & TSD_FLAG_SKIP_CALLBACK)) {
++			if (wakePort == MACH_PORT_NULL) {
++				return kIOReturnNotReady;
++			}
++			OSAsyncReference64 ref;
++			setAsyncReference64(ref, wakePort, (mach_vm_address_t)t.callback, (io_user_reference_t)t.refcon);
++			io_user_reference_t arg0 = (io_user_reference_t)t.arg0;
++			IOReturn sent = sendAsyncResult64(ref, ret, &arg0, 1);
++			if (sent != kIOReturnSuccess) {
++				IOLog("HUSKY SCALER: sendAsyncResult64 failed 0x%x\n", sent);
++			}
++		}
++		return kIOReturnSuccess;
++	}
++	case kScalerAbortTransfers:
++	case kScalerAbortCaptures:
++		return kIOReturnSuccess;    /* transfers complete synchronously: nothing is ever pending */
++	case kScalerDriverScalar:
++		if (args->scalarOutputCount >= 1) {
++			args->scalarOutput[0] = 0;
++		}
++		return kIOReturnSuccess;
++	case kScalerEstimation:
++		return kIOReturnSuccess;
++	case kScalerClientProperty: {
++		if (args->structureInput == NULL || args->structureInputSize != 0x18) {
++			return kIOReturnBadArgument;
++		}
++		const uint32_t band = *(const uint32_t *)args->structureInput;
++		return band < 4 ? kIOReturnSuccess : kIOReturnBadArgument;
++	}
++	default: {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("HUSKY SCALER: %s selector %u not supported\n", name, selector);
++		return kIOReturnUnsupported;
++	}
++	}
++}
++
++#endif /* HUSKY */
+diff --git a/iokit/Kernel/arm/HuskySurface.cpp b/iokit/Kernel/arm/HuskySurface.cpp
+index c443f6e..7920f6f 100644
+--- a/iokit/Kernel/arm/HuskySurface.cpp
++++ b/iokit/Kernel/arm/HuskySurface.cpp
+@@ -129,6 +129,12 @@ HuskySurface::seed()
+ 	return *husky_surface_seed(this);
+ }
+ 
++uint32_t
++HuskySurface::bumpSeed()
++{
++	return OSIncrementAtomic((volatile SInt32 *)husky_surface_seed(this)) + 1;
++}
++
+ /*
+  * Give the surface an id and a table slot; the table holds one retain and a
+  * user count (creators, client mappings, kernel holders). Lock held.
+diff --git a/iokit/Kernel/arm/HuskySurface.h b/iokit/Kernel/arm/HuskySurface.h
+index 54a1504..1b38dab 100644
+--- a/iokit/Kernel/arm/HuskySurface.h
++++ b/iokit/Kernel/arm/HuskySurface.h
+@@ -59,6 +59,8 @@ public:
+ 
+ 	/* Bumped by every read-write unlock (trapUnlock). */
+ 	uint32_t seed();
++	/* A kernel writer changed the pixels (the scaler shim): what a read-write unlock does. */
++	uint32_t bumpSeed();
+ };
+ 
+ /* Retained surface for an id, or NULL. */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 0efdf89..32fc9a2 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -53,6 +53,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = AppleKeyStore;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleM2ScalerCSCDriver;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleM2ScalerCSCDriver;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOWatchdog;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOWatchdog;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 14c72c4..07c96f2 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -13,6 +13,7 @@ iokit/Kernel/arm/HuskyEntitlements.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskyKeyStore.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskyWatchdog.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskySurface.cpp						optional iokitcpp
++iokit/Kernel/arm/HuskyScaler.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskyFramebuffer.cpp						optional iokitcpp
+ iokit/Kernel/arm/HuskyDisplay.cpp							optional iokitcpp
+ iokit/Kernel/arm/HuskyBattery.cpp						optional iokitcpp
