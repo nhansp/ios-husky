@@ -173,14 +173,14 @@ index f08236b..47d1e08 100644
  
  /* ===================================================================== *
 diff --git a/iokit/Kernel/arm/HuskyDisplay.cpp b/iokit/Kernel/arm/HuskyDisplay.cpp
-index 082e0ed..deecd9b 100644
+index 082e0ed..02c645c 100644
 --- a/iokit/Kernel/arm/HuskyDisplay.cpp
 +++ b/iokit/Kernel/arm/HuskyDisplay.cpp
 @@ -41,12 +41,16 @@
  #include <machine/atomic.h>
  #include <libkern/OSAtomic.h>
  #include <pexpert/pexpert.h>
-+#include <arm/memory_types.h>             /* VM_WIMG_COPYBACK */
++#include <vm/memory_types.h>              /* VM_WIMG_COPYBACK */
  
  extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  extern "C" int husky_irq_register(uint32_t intid, void (*fn)(void *arg, uint32_t intid), void *arg);
