@@ -1,0 +1,154 @@
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 25c4ee3..3e4fb48 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -402,11 +402,16 @@ struct mali_vm {
+ 	struct mali_group *group;     /* while the VM has queues; as_slot is bound only then (-1 otherwise) */
+ };
+ 
+-/* One CSG per VM; the VM's queues are its streams and share its doorbell. */
++/*
++ * One CSG per VM. Its EP_REQ grants one tiler endpoint, and every plug-in stream requests the tiler, so a
++ * second stream's REQ_RESOURCE is CS_INVALID_INSTRUCTION (bootC/bootD: fatal 0x2249 at a CS1 stream's first
++ * word): all of the VM's queues share one stream, in submission order.
++ */
+ typedef struct mali_group {
+ 	uint32_t            csg;
+ 	uint32_t            nstreams;
+ 	uint32_t            busy;          /* streams in use */
++	struct mali_queue  *queue;         /* the shared stream */
+ 	vm_offset_t         csg_ctl, csgin, csgout;
+ 	vm_offset_t         slot_kva;      /* BRIO slot csg-1 */
+ 	uint64_t            slot_va;
+@@ -448,6 +453,7 @@ struct mali_queue {
+ 	uint32_t            cs;            /* stream within it */
+ 	mali_group_t       *grp;
+ 	lck_mtx_t          *lock;          /* submit vs the completion poller's queue_service */
++	uint32_t            refs;          /* IOGPU queues on this stream; g_grp_lock */
+ 	bool                oom_failed;    /* stop answering OOM until the next submit */
+ };
+ 
+@@ -1347,16 +1353,17 @@ queue_free_buffers(mali_queue_t *q)
+ 	}
+ }
+ 
+-/* Give the stream back; the group goes with its last stream. */
++/* Give the stream back; the group goes with its last stream. g_grp_lock held. */
+ static void
+ queue_put_stream(mali_queue_t *q)
+ {
+-	lck_mtx_lock(&g_grp_lock);
++	if (q->grp->queue == q) {
++		q->grp->queue = NULL;
++	}
+ 	q->grp->busy &= ~(1u << q->cs);
+ 	if (q->grp->busy == 0) {
+ 		group_destroy(q->vm, q->grp);
+ 	}
+-	lck_mtx_unlock(&g_grp_lock);
+ }
+ 
+ static mali_status_t
+@@ -1385,12 +1392,23 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 	q->vm = vm;
+ 	q->cs_mask = cs_mask;
+ 	q->ring_size = 64 * 1024;   /* 64 KiB ring buffer */
++	q->refs = 1;
+ 
+ 	mali_status_t st = 0;
+ 	lck_mtx_lock(&g_grp_lock);
+ 	if (vm->group == NULL) {
+ 		st = group_create(vm, &vm->group);
+ 	}
++	if (st == 0 && vm->group->queue != NULL) {
++		mali_queue_t *sq = vm->group->queue;
++		sq->refs++;
++		lck_mtx_unlock(&g_grp_lock);
++		lck_mtx_free(lock, &g_bridge_grp);
++		kfree_data(q, sizeof(mali_queue_t));
++		BR_LOG("HUSKY IOGPU bridge: queue shares CSG%u CS%u (%u queues)\n", sq->csg, sq->cs, sq->refs);
++		*out = sq;
++		return 0;
++	}
+ 	if (st == 0) {
+ 		mali_group_t *g = vm->group;
+ 		uint32_t freecs = ~g->busy & ((1u << g->nstreams) - 1);
+@@ -1404,8 +1422,8 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 			q->csg = g->csg;
+ 		}
+ 	}
+-	lck_mtx_unlock(&g_grp_lock);
+ 	if (st != 0) {
++		lck_mtx_unlock(&g_grp_lock);
+ 		lck_mtx_free(lock, &g_bridge_grp);
+ 		kfree_data(q, sizeof(mali_queue_t));
+ 		return st;
+@@ -1432,10 +1450,8 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 	q->ring_in_cpu  = (volatile uint64_t *)io_kva;
+ 	q->ring_out_cpu = (volatile uint64_t *)(io_kva + GPU_PAGE);
+ 	/*
+-	 * Boot bootC: zeroing the pointers of a reused stream made the firmware run the new ring from 0
+-	 * up to the old insert (CS_INVALID_INSTRUCTION at the ring base). The positions are monotonic
+-	 * and taken modulo the ring size, so a new queue continues from the stream's last one
+-	 * (the BRIO area starts zeroed).
++	 * A later group on the same CSG slot finds the last stream's pointers here. They are monotonic and
++	 * taken modulo the ring size, so a new queue continues from them (the BRIO area starts zeroed).
+ 	 */
+ 	q->ring_insert = q->ring_in_cpu[0];
+ 	if (q->ring_out_cpu[0] != q->ring_insert) {
+@@ -1483,20 +1499,24 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 		if (!stream_set_state(q, CS_STATE_STOP)) {
+ 			/* stream state unknown: its ring stays allocated and its stream bit stays set */
+ 			__atomic_store_n(&vm->wedged, true, __ATOMIC_RELEASE);
++			lck_mtx_unlock(&g_grp_lock);
+ 			lck_mtx_free(lock, &g_bridge_grp);
+ 			kfree_data(q, sizeof(mali_queue_t));
+ 			return st;
+ 		}
+ 		goto fail;
+ 	}
++	g->queue = q;
+ 	BR_LOG("HUSKY IOGPU bridge: queue on CSG%u CS%u (AS%d), streams busy 0x%x\n", q->csg, q->cs, vm->as_slot,
+ 	    g->busy);
++	lck_mtx_unlock(&g_grp_lock);
+ 	*out = q;
+ 	return 0;
+ 
+ fail:
+ 	queue_free_buffers(q);
+ 	queue_put_stream(q);
++	lck_mtx_unlock(&g_grp_lock);
+ 	lck_mtx_free(lock, &g_bridge_grp);
+ 	kfree_data(q, sizeof(mali_queue_t));
+ 	return st;
+@@ -1508,18 +1528,30 @@ op_queue_destroy(mali_queue_t *q)
+ 	if (q == NULL) {
+ 		return;
+ 	}
++	lck_mtx_lock(&g_grp_lock);
++	if (q->refs > 1) {
++		/* IOGPUCommandQueue::free waited for its own command buffers */
++		q->refs--;
++		lck_mtx_unlock(&g_grp_lock);
++		return;
++	}
+ 	/* Stop the stream before its ring goes away. */
+ 	if (!stream_set_state(q, CS_STATE_STOP)) {
+ 		/* The firmware may still read the ring: leak it rather than free memory under a live stream. */
+ 		BR_LOG("HUSKY IOGPU bridge: queue_destroy: leaking CSG%u CS%u ring\n", q->csg, q->cs);
+ 		queue_dump_state(q);
+ 		__atomic_store_n(&q->vm->wedged, true, __ATOMIC_RELEASE);
++		if (q->grp->queue == q) {
++			q->grp->queue = NULL;
++		}
++		lck_mtx_unlock(&g_grp_lock);
+ 		lck_mtx_free(q->lock, &g_bridge_grp);
+ 		kfree_data(q, sizeof(mali_queue_t));
+ 		return;
+ 	}
+ 	queue_free_buffers(q);
+ 	queue_put_stream(q);
++	lck_mtx_unlock(&g_grp_lock);
+ 	lck_mtx_free(q->lock, &g_bridge_grp);
+ 	kfree_data(q, sizeof(mali_queue_t));
+ }
