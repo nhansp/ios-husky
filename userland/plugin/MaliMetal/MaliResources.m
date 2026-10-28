@@ -447,6 +447,19 @@ id<MTLTexture> MaliNewTexture(id<MTLDevice> dev, MTLTextureDescriptor *d, IOSurf
         if ((planes && plane >= planes) || (!planes && plane)) { [t maliRefuse:@"IOSurface plane out of range"]; return t; }
         char *base = IOSurfaceGetBaseAddress(s);
         char *pbase = planes ? IOSurfaceGetBaseAddressOfPlane(s, plane) : base;
+        if (planes > 1 && (!base || !pbase)) {
+            /* a surface this process never mapped reports no addresses until it is locked */
+            uint32_t seed = 0;
+            if (IOSurfaceLock(s, kIOSurfaceLockReadOnly, &seed) == kIOReturnSuccess) {
+                base = IOSurfaceGetBaseAddress(s);
+                pbase = IOSurfaceGetBaseAddressOfPlane(s, plane);
+                IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, &seed);
+            }
+        }
+        if (plane && (!base || !pbase || pbase < base)) {
+            [t maliRefuse:[NSString stringWithFormat:@"IOSurface %u plane %lu offset unknown", IOSurfaceGetID(s), (unsigned long)plane]];
+            return t;
+        }
         const size_t row = planes ? IOSurfaceGetBytesPerRowOfPlane(s, plane) : IOSurfaceGetBytesPerRow(s);
         const size_t bpe = planes ? IOSurfaceGetBytesPerElementOfPlane(s, plane) : IOSurfaceGetBytesPerElement(s);
         const size_t sw = planes ? IOSurfaceGetWidthOfPlane(s, plane) : IOSurfaceGetWidth(s);
@@ -460,6 +473,11 @@ id<MTLTexture> MaliNewTexture(id<MTLDevice> dev, MTLTextureDescriptor *d, IOSurf
         }
         if (base && pbase >= base && (size_t)(pbase - base) < alloc) [t maliSetCPU:base bytes:alloc];
         const uint64_t plane_off = (base && pbase >= base) ? (uint64_t)(pbase - base) : 0;
+        if (planes > 1)
+            MaliLogOnce([NSString stringWithFormat:@"IOSurface %u '%.4s' plane %lu/%zu: fmt %lu %lux%lu row %zu offset %llu",
+                         IOSurfaceGetID(s), (const char *)&(uint32_t){OSSwapHostToBigInt32(IOSurfaceGetPixelFormat(s))},
+                         (unsigned long)plane, planes, (unsigned long)d.pixelFormat, (unsigned long)d.width,
+                         (unsigned long)d.height, row, (unsigned long long)plane_off]);
         /* rows that are not 64-byte multiples (CoreImage's 1,120-byte RGBA16F rows): aligned shadow, single-plane 2D only */
         if ((row & 63) && !plane_off && planes <= 1 && d.textureType == MTLTextureType2D && d.mipmapLevelCount == 1 &&
             d.sampleCount == 1 && d.arrayLength == 1 && d.depth == 1) {

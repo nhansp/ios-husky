@@ -4,6 +4,8 @@
 <dict>
 	<key>Label</key>
 	<string>com.husky.fsprobe</string>
+	<key>Program</key>
+	<string>/usr/local/bin/fsprobe</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/local/bin/fsprobe</string>
@@ -13,10 +15,12 @@
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
+	<key>KeepAlive</key>
+	<false/>
 	<key>LaunchOnlyOnce</key>
 	<true/>
 	<key>UserName</key>
-	<string>mobile</string>
+	<string>root</string>
 	<key>StandardOutPath</key>
 	<string>/dev/console</string>
 	<key>StandardErrorPath</key>
