@@ -1,6 +1,8 @@
 /*
- * air2vh API served from a precompiled MVP1 pack instead of compiling on the device. A key miss dumps
- * the request's AIR to MVP_MISS_DIR for the host packer (userland/shadercache).
+ * air2vh API served from a precompiled MVP1 pack. A key miss goes to the per-user record cache, then to
+ * the on-device compiler (Frameworks/libMaliCompiler.dylib, loaded on first use), whose results are cached
+ * as MVP1 records; when that fails too, the request's AIR is dumped to MVP_MISS_DIR for the host packer
+ * (userland/shadercache). Same lookup order as SnapMetal's AdrenoShader.m.
  */
 #include "mvpack.h"
 #include "air2vh_ext.h"
@@ -8,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,10 +20,28 @@
 #include <unistd.h>
 
 #define MVP_MISS_DIR "/private/var/tmp/malimetal"
+#define MVP_COMPILER "Frameworks/libMaliCompiler.dylib"
+#define MVP_CACHE_SUBDIR "org.mali-ios.MaliMetal"
 
 struct air2vh_compiler {
-    int unused;
+    uint64_t gpu_id;
+    uint32_t core_count;
+    uint64_t gpu_features;
 };
+
+/* the on-device compiler, shared by every air2vh_compiler of the process */
+static struct {
+    pthread_once_t once;
+    air2vh_compiler *comp;
+    int (*compile)(air2vh_compiler *, const air2vh_compile_info *, air2vh_result *);
+    int (*compile_blend)(air2vh_compiler *, const void *, size_t, air2vh_result *);
+    void (*result_free)(air2vh_result *);
+    const air2vh_program_ext *(*get_ext)(const air2vh_program *);
+    char cache_dir[1024];       /* "" = no disk cache */
+    char error[256];
+    pthread_mutex_t lock;       /* the compiler object is not reentrant */
+} g_rt = { .once = PTHREAD_ONCE_INIT, .lock = PTHREAD_MUTEX_INITIALIZER };
+static air2vh_compiler g_rt_params;
 
 static struct {
     pthread_once_t once;
@@ -50,15 +71,22 @@ static void mvp_log(const char *fmt, ...)
     }
 }
 
-static void pack_load(void)
+static int bundle_path(char *path, size_t cap, const char *name)
 {
     Dl_info di;
-    char path[1024];
-    if (!dladdr((const void *)&pack_load, &di) || !di.dli_fname)
-        return;
+    if (!dladdr((const void *)&bundle_path, &di) || !di.dli_fname)
+        return -1;
     const char *slash = strrchr(di.dli_fname, '/');
     int dir_len = slash ? (int)(slash - di.dli_fname) : 0;
-    snprintf(path, sizeof(path), "%.*s/%s", dir_len, di.dli_fname, MVP_FILENAME);
+    snprintf(path, cap, "%.*s/%s", dir_len, di.dli_fname, name);
+    return 0;
+}
+
+static void pack_load(void)
+{
+    char path[1024];
+    if (bundle_path(path, sizeof(path), MVP_FILENAME) != 0)
+        return;
 
     int fd = open(path, O_RDONLY);
     struct stat st;
@@ -161,14 +189,13 @@ static char *dup_str(const char *s)
     return d;
 }
 
-static int fill_result(const mvp_index *e, air2vh_result *r)
+static int fill_record(const uint8_t *p, uint64_t length, const char key[64], air2vh_result *r)
 {
-    if (e->offset > g_pack.size || e->length > g_pack.size - e->offset || e->length < sizeof(mvp_record))
+    if (length < sizeof(mvp_record))
         return -1;
-    const uint8_t *p = g_pack.base + e->offset;
     const mvp_record *rec = (const mvp_record *)p;
     uint64_t need = (uint64_t)sizeof(*rec) + rec->program_size + rec->code_size + rec->sidecar_size + rec->layout_size;
-    if (need > e->length || (rec->program_size != sizeof(air2vh_program) &&
+    if (need > length || (rec->program_size != sizeof(air2vh_program) &&
                              rec->program_size != sizeof(air2vh_program) + sizeof(air2vh_program_ext)))
         return -1;
     p += sizeof(*rec);
@@ -199,9 +226,161 @@ static int fill_result(const mvp_index *e, air2vh_result *r)
     r->sidecar_size = rec->sidecar_size;
     r->program = prog;
     r->vs_layout_out = prog->vs.layout;
-    memcpy(r->key_hex, e->key, 64);
+    memcpy(r->key_hex, key, 64);
     r->key_hex[64] = 0;
     return 0;
+}
+
+static int fill_result(const mvp_index *e, air2vh_result *r)
+{
+    if (e->offset > g_pack.size || e->length > g_pack.size - e->offset)
+        return -1;
+    return fill_record(g_pack.base + e->offset, e->length, e->key, r);
+}
+
+/* ---- on-device compiler ---- */
+static void rt_load(void)
+{
+    char path[1024];
+    if (bundle_path(path, sizeof(path), MVP_COMPILER) != 0) {
+        snprintf(g_rt.error, sizeof(g_rt.error), "cannot locate the bundle");
+        return;
+    }
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        snprintf(g_rt.error, sizeof(g_rt.error), "%s", dlerror());
+        return;
+    }
+    uint32_t (*api)(void) = (uint32_t (*)(void))dlsym(h, "air2vh_api_version");
+    uint32_t (*abi)(void) = (uint32_t (*)(void))dlsym(h, "air2vh_abi_version");
+    const char *(*id)(void) = (const char *(*)(void))dlsym(h, "air2vh_compiler_id");
+    air2vh_compiler *(*create)(uint64_t, uint32_t, uint64_t, char **) =
+        (air2vh_compiler *(*)(uint64_t, uint32_t, uint64_t, char **))dlsym(h, "air2vh_compiler_create");
+    void (*rt_free)(void *) = (void (*)(void *))dlsym(h, "air2vh_free");
+    g_rt.compile = (int (*)(air2vh_compiler *, const air2vh_compile_info *, air2vh_result *))dlsym(h, "air2vh_compile");
+    g_rt.compile_blend = (int (*)(air2vh_compiler *, const void *, size_t, air2vh_result *))dlsym(h, "air2vh_compile_blend_shader");
+    g_rt.result_free = (void (*)(air2vh_result *))dlsym(h, "air2vh_result_free");
+    g_rt.get_ext = (const air2vh_program_ext *(*)(const air2vh_program *))dlsym(h, "air2vh_program_get_ext");
+    if (!api || !abi || !id || !create || !rt_free || !g_rt.compile || !g_rt.compile_blend || !g_rt.result_free ||
+        !g_rt.get_ext) {
+        snprintf(g_rt.error, sizeof(g_rt.error), "%s lacks the air2vh API", path);
+        return;
+    }
+    if (api() != AIR2VH_API_VERSION || abi() != AIR2VH_ABI_VERSION) {
+        snprintf(g_rt.error, sizeof(g_rt.error), "compiler API %u ABI %u, plug-in wants %u/%u", api(), abi(),
+                 AIR2VH_API_VERSION, AIR2VH_ABI_VERSION);
+        return;
+    }
+    char *err = NULL;
+    g_rt.comp = create(g_rt_params.gpu_id, g_rt_params.core_count, g_rt_params.gpu_features, &err);
+    if (!g_rt.comp) {
+        snprintf(g_rt.error, sizeof(g_rt.error), "compiler_create: %s", err ? err : "failed");
+        rt_free(err);
+        return;
+    }
+
+    /* records are only valid for the compiler that wrote them: one directory per compiler id */
+    char base[768];
+    const char *cid = id();
+    if (confstr(_CS_DARWIN_USER_CACHE_DIR, base, sizeof(base)) > 0 && base[0]) {
+        uint64_t fnv = 0xcbf29ce484222325ull;
+        for (const char *c = cid; *c; c++)
+            fnv = (fnv ^ (uint8_t)*c) * 0x100000001b3ull;
+        snprintf(g_rt.cache_dir, sizeof(g_rt.cache_dir), "%s/" MVP_CACHE_SUBDIR, base);
+        mkdir(g_rt.cache_dir, 0755);
+        size_t n = strlen(g_rt.cache_dir);
+        snprintf(g_rt.cache_dir + n, sizeof(g_rt.cache_dir) - n, "/%016llx", (unsigned long long)fnv);
+        if (mkdir(g_rt.cache_dir, 0755) != 0 && errno != EEXIST)
+            g_rt.cache_dir[0] = 0;
+    }
+    mvp_log("MaliMetal: on-device compiler %s, cache %s\n", cid, g_rt.cache_dir[0] ? g_rt.cache_dir : "off");
+}
+
+static int cache_read(const char key[65], air2vh_result *r)
+{
+    char path[1200];
+    if (!g_rt.cache_dir[0])
+        return -1;
+    snprintf(path, sizeof(path), "%s/%s.mvr", g_rt.cache_dir, key);
+    int fd = open(path, O_RDONLY);
+    struct stat st;
+    if (fd < 0)
+        return -1;
+    int rc = -1;
+    if (fstat(fd, &st) == 0 && st.st_size >= (off_t)sizeof(mvp_record) && st.st_size < (64 << 20)) {
+        uint8_t *buf = malloc((size_t)st.st_size);
+        if (buf && read(fd, buf, (size_t)st.st_size) == (ssize_t)st.st_size)
+            rc = fill_record(buf, (uint64_t)st.st_size, key, r);
+        free(buf);
+    }
+    close(fd);
+    return rc;
+}
+
+/* the result as one MVP1 record (the host packer's layout), into the cache and back through fill_record */
+static int adopt_result(const char key[65], const air2vh_result *rr, air2vh_result *r)
+{
+    const air2vh_program_ext *ext = g_rt.get_ext(rr->program);
+    mvp_record rec = {
+        .program_size = (uint32_t)(sizeof(air2vh_program) + (ext ? sizeof(air2vh_program_ext) : 0)),
+        .code_size = (uint32_t)rr->code_size,
+        .sidecar_size = (uint32_t)rr->sidecar_size,
+        .layout_size = rr->vs_layout_out.blob ? rr->vs_layout_out.blob_size : 0,
+    };
+    size_t total = sizeof(rec) + rec.program_size + rec.code_size + rec.sidecar_size + rec.layout_size;
+    uint8_t *buf = malloc(total), *p = buf;
+    if (!buf)
+        return -1;
+    memcpy(p, &rec, sizeof(rec));
+    p += sizeof(rec);
+    memcpy(p, rr->program, rec.program_size);
+    ((air2vh_program *)p)->vs.layout.blob = NULL;
+    p += rec.program_size;
+    memcpy(p, rr->code, rec.code_size);
+    p += rec.code_size;
+    if (rec.sidecar_size)
+        memcpy(p, rr->sidecar_json, rec.sidecar_size);
+    p += rec.sidecar_size;
+    if (rec.layout_size)
+        memcpy(p, rr->vs_layout_out.blob, rec.layout_size);
+
+    if (g_rt.cache_dir[0]) {
+        char path[1200], tmp[1240];
+        snprintf(path, sizeof(path), "%s/%s.mvr", g_rt.cache_dir, key);
+        snprintf(tmp, sizeof(tmp), "%s.%d", path, (int)getpid());
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            bool ok = write(fd, buf, total) == (ssize_t)total;
+            close(fd);
+            if (!ok || rename(tmp, path) != 0)
+                unlink(tmp);
+        }
+    }
+    int rc = fill_record(buf, total, key, r);
+    free(buf);
+    return rc;
+}
+
+static int rt_compile(const air2vh_compile_info *info, const char key[65], air2vh_result *r)
+{
+    pthread_once(&g_rt.once, rt_load);
+    if (!g_rt.comp)
+        return -1;
+    if (cache_read(key, r) == 0)
+        return 0;
+    air2vh_result rr;
+    memset(&rr, 0, sizeof(rr));
+    pthread_mutex_lock(&g_rt.lock);
+    int rc = g_rt.compile(g_rt.comp, info, &rr);
+    pthread_mutex_unlock(&g_rt.lock);
+    if (rc == 0 && rr.program && rr.code)
+        rc = adopt_result(key, &rr, r);
+    else {
+        snprintf(g_rt.error, sizeof(g_rt.error), "%s", rr.error ? rr.error : "compile failed");
+        rc = -1;
+    }
+    g_rt.result_free(&rr);
+    return rc;
 }
 
 uint32_t air2vh_api_version(void) { return AIR2VH_API_VERSION; }
@@ -216,11 +395,18 @@ const char *air2vh_compiler_id(void)
 
 air2vh_compiler *air2vh_compiler_create(uint64_t gpu_id, uint32_t core_count, uint64_t gpu_features, char **error)
 {
-    (void)gpu_id; (void)core_count; (void)gpu_features;
     pthread_once(&g_pack.once, pack_load);
     air2vh_compiler *c = calloc(1, sizeof(*c));
-    if (!c && error)
-        *error = dup_str("out of memory");
+    if (!c) {
+        if (error)
+            *error = dup_str("out of memory");
+        return NULL;
+    }
+    c->gpu_id = gpu_id;
+    c->core_count = core_count;
+    c->gpu_features = gpu_features;
+    if (!g_rt_params.gpu_id)
+        g_rt_params = *c;
     return c;
 }
 
@@ -245,10 +431,12 @@ int air2vh_compile(air2vh_compiler *c, const air2vh_compile_info *info, air2vh_r
                 info->entry);
     if (e && fill_result(e, r) == 0)
         return 0;
+    if (rt_compile(info, key, r) == 0)
+        return 0;
 
     dump_miss(info, key);
-    snprintf(msg, sizeof(msg), "UNSUPPORTED: no offline binary for %s (key %s, AIR in " MVP_MISS_DIR ")",
-             info->entry ? info->entry : "(first entry)", key);
+    snprintf(msg, sizeof(msg), "UNSUPPORTED: no binary for %s (key %s, AIR in " MVP_MISS_DIR "): %s",
+             info->entry ? info->entry : "(first entry)", key, g_rt.error[0] ? g_rt.error : "?");
     mvp_log("MaliMetal: %s\n", msg);
     memcpy(r->key_hex, key, sizeof(key));
     r->error = dup_str(msg);
@@ -319,10 +507,32 @@ int air2vh_link_varyings(const air2vh_program *vs, const air2vh_program *fs, air
 
 int air2vh_compile_blend_shader(air2vh_compiler *c, const void *key, size_t key_size, air2vh_result *r)
 {
-    (void)c; (void)key; (void)key_size;
+    (void)c;
     memset(r, 0, sizeof(*r));
-    r->error = dup_str("UNSUPPORTED: blend shaders are not in the offline pack yet");
-    return -1;
+    pthread_once(&g_rt.once, rt_load);
+    if (!g_rt.comp) {
+        r->error = dup_str(g_rt.error[0] ? g_rt.error : "no on-device compiler");
+        return -1;
+    }
+    air2vh_result rr;
+    memset(&rr, 0, sizeof(rr));
+    pthread_mutex_lock(&g_rt.lock);
+    int rc = g_rt.compile_blend(g_rt.comp, key, key_size, &rr);
+    pthread_mutex_unlock(&g_rt.lock);
+    if (rc == 0 && rr.code) {
+        void *code = malloc(rr.code_size ? rr.code_size : 1);
+        if (code) {
+            memcpy(code, rr.code, rr.code_size);
+            r->code = code;
+            r->code_size = rr.code_size;
+        } else
+            rc = -1;
+    } else {
+        r->error = dup_str(rr.error ? rr.error : "blend shader compile failed");
+        rc = -1;
+    }
+    g_rt.result_free(&rr);
+    return rc;
 }
 
 void air2vh_result_free(air2vh_result *r)
