@@ -13,7 +13,7 @@ rm -rf "$OBJ"
 mkdir -p "$OBJ"
 
 ARCH="-arch arm64e -isysroot $SDK -miphoneos-version-min=26.0"
-DEFS="$(cat "$MESA_TREE/mesa_defs.txt") -D_DARWIN_C_SOURCE"
+DEFS="$(cat "$MESA_TREE/mesa_defs.txt") -D_DARWIN_C_SOURCE -DNDEBUG"
 T=$MESA_TREE
 S=$MESA_SRC
 INC="-I$HERE/include -I$HERE/src -I$CONTRACT -I$HERE/../mesa-build/shims/include"
