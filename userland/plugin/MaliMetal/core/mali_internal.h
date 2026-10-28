@@ -32,7 +32,7 @@ void mali_state_prim_flags(const mali_gfx_pipeline_t *pipe, const mali_draw_stat
                            uint32_t *flags2, uint32_t *override);
 bool mali_state_emit_zsd(mali_arena_t *a, const mali_gfx_pipeline_t *pipe, const mali_draw_state_t *s,
                          uint64_t *zsd_gpu);
-bool mali_state_emit_tiler_ctx(mali_arena_t *a, const mali_ctx_t *ctx, uint64_t heap_desc_gpu, uint32_t width,
+bool mali_state_emit_tiler_ctx(mali_arena_t *a, const mali_ctx_t *ctx, uint64_t heap_desc_gpu, uint32_t samples, uint32_t width,
                                uint32_t height, uint32_t tile_size_px, uint64_t *gpu);
 
 #endif

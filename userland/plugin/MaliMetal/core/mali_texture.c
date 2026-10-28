@@ -73,8 +73,9 @@ mali_texture_new(const mali_ctx_t *ctx, const mali_texture_params_t *p, uint64_t
     if (!p || !mali_fmt_lookup(p->mtl_pixel_format, &fi) || !(fi.flags & MALI_FMT_SAMPLED || fi.flags & MALI_FMT_COLOR_RT ||
                                                                fi.flags & (MALI_FMT_DEPTH | MALI_FMT_STENCIL)))
         return NULL;
-    if (p->sample_count > 1 || p->mtl_texture_type == MALI_TEX_2D_MS || p->mtl_texture_type == MALI_TEX_2D_MS_ARRAY ||
-        p->mtl_texture_type == MALI_TEX_BUFFER)
+    const uint32_t samples = p->sample_count ? p->sample_count : 1;
+    if ((samples > 1) != (p->mtl_texture_type == MALI_TEX_2D_MS) || p->mtl_texture_type == MALI_TEX_2D_MS_ARRAY ||
+        p->mtl_texture_type == MALI_TEX_BUFFER || (samples > 1 && (p->mip_levels != 1 || p->explicit_row_pitch)))
         return NULL;
     if (!p->width || !p->height || !p->mip_levels || p->mip_levels > MAX_MIP_LEVELS)
         return NULL;
@@ -102,7 +103,7 @@ mali_texture_new(const mali_ctx_t *ctx, const mali_texture_params_t *p, uint64_t
         .modifier = DRM_FORMAT_MOD_LINEAR,
         .format = (enum pipe_format)fi.pipe_format,
         .extent_px = {.width = p->width, .height = p->height, .depth = depth},
-        .nr_samples = 1,
+        .nr_samples = samples,
         .dim = is3d ? MALI_TEXTURE_DIMENSION_3D : (p->mtl_texture_type <= MALI_TEX_1D_ARRAY ? MALI_TEXTURE_DIMENSION_1D
                                                                                             : MALI_TEXTURE_DIMENSION_2D),
         .nr_slices = p->mip_levels,
@@ -143,7 +144,7 @@ mali_texture_new(const mali_ctx_t *ctx, const mali_texture_params_t *p, uint64_t
         .min_lod = 0.0f,
         .swizzle = {PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W},
         .planes = {{.image = &img->image, .plane_idx = 0}},
-        .nr_samples = 1,
+        .nr_samples = samples,
     };
     /* A single-slice non-array 2D texture is viewed as a plain 2D texture; a
      * 3D texture one slice deep is also fine [spec 05: CA binds 1x1x1 ones]. */

@@ -264,7 +264,9 @@ static BOOL params_from_descriptor(MTLTextureDescriptor *d, mali_texture_params_
     p->array_length = (uint32_t)MAX(d.arrayLength, (NSUInteger)1);
     p->mip_levels = (uint32_t)MAX(d.mipmapLevelCount, (NSUInteger)1);
     p->sample_count = (uint32_t)MAX(d.sampleCount, (NSUInteger)1);
-    return p->sample_count == 1 && d.textureType != MTLTextureTypeTextureBuffer;
+    if (p->sample_count > 1)
+        return (p->sample_count == 2 || p->sample_count == 4) && d.textureType == MTLTextureType2DMultisample && p->mip_levels == 1;
+    return d.textureType != MTLTextureTypeTextureBuffer;
 }
 
 @implementation MaliTexture {

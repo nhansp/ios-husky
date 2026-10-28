@@ -332,7 +332,11 @@ mali_state_dcd(const mali_gfx_pipeline_t *pipe, const mali_draw_state_t *s, bool
             cfg.allow_forward_pixel_to_be_killed = !fp->writes_global;
             cfg.pixel_kill_operation = (enum mali_pixel_kill)ez.kill;
             cfg.zs_update_operation = (enum mali_pixel_kill)ez.update;
-            cfg.evaluate_per_sample = false;
+            /* a blend shader stores one sample per invocation [MV:panvk_vX_cmd_draw.c:2532-2540] */
+            bool blend_shader = false;
+            for (unsigned i = 0; i < pipe->rt_count; i++)
+                blend_shader |= pipe->blend_shader_gpu[i] != 0;
+            cfg.evaluate_per_sample = pipe->sample_count > 1 && (fp->fs.sample_shading || blend_shader);
             cfg.shader_modifies_coverage = shader_modifies_coverage;
         } else {
             cfg.allow_forward_pixel_to_kill = true;
@@ -347,7 +351,7 @@ mali_state_dcd(const mali_gfx_pipeline_t *pipe, const mali_draw_state_t *s, bool
         cfg.front_face_ccw = s->winding == 0;
         cfg.cull_front_face = triangles && s->cull_mode == 1;
         cfg.cull_back_face = triangles && s->cull_mode == 2;
-        cfg.multisample_enable = false;
+        cfg.multisample_enable = pipe->sample_count > 1;
         cfg.occlusion_query = MALI_OCCLUSION_MODE_DISABLED;
         cfg.alpha_to_coverage = alpha_to_cov;
         cfg.scissor_to_bounding_box = true;
@@ -477,7 +481,7 @@ mali_state_emit_zsd(mali_arena_t *a, const mali_gfx_pipeline_t *pipe, const mali
  * zeroed memory because a Metal command buffer is one-shot, S06 5.4 step 2]
  * ---------------------------------------------------------------------- */
 bool
-mali_state_emit_tiler_ctx(mali_arena_t *a, const mali_ctx_t *ctx, uint64_t heap_desc_gpu, uint32_t width,
+mali_state_emit_tiler_ctx(mali_arena_t *a, const mali_ctx_t *ctx, uint64_t heap_desc_gpu, uint32_t samples, uint32_t width,
                           uint32_t height, uint32_t tile_size_px, uint64_t *gpu)
 {
     mali_gpu_ptr_t m = mali_arena_alloc(a, MALI_TILER_CONTEXT_LENGTH, MALI_TILER_CONTEXT_ALIGN);
@@ -488,7 +492,7 @@ mali_state_emit_tiler_ctx(mali_arena_t *a, const mali_ctx_t *ctx, uint64_t heap_
             width, height, ctx->tiler_max_levels, tile_size_px, ctx->tiler_chunk_size - 64);
         cfg.fb_width = width;
         cfg.fb_height = height;
-        cfg.sample_pattern = pan_sample_pattern(1);
+        cfg.sample_pattern = pan_sample_pattern(samples);
         cfg.first_provoking_vertex = true;           /* Metal flat shading uses the first vertex */
         cfg.layer_count = 1;
         cfg.layer_offset = 0;

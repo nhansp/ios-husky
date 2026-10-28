@@ -464,7 +464,9 @@ mali_pass_begin(mali_cs_t *csp, const mali_ctx_t *ctx, const mali_pass_desc_t *d
     struct cs_builder *b = &cs->b;
     mali_arena_t *a = d->desc_arena;
 
-    if (!d->width || !d->height || d->width > 65535 || d->height > 65535 || d->sample_count > 1 || d->layers > 1)
+    const uint32_t samples = d->sample_count ? d->sample_count : 1;
+    if (!d->width || !d->height || d->width > 65535 || d->height > 65535 || (samples != 1 && samples != 2 && samples != 4) ||
+        d->layers > 1)
         return NULL;
 
     /* ---- framebuffer layout [M:lib/pan_fb.h struct pan_fb_layout; MV:panvk_vX_cmd_draw.c get_fb_descs] ---- */
@@ -474,7 +476,7 @@ mali_pass_begin(mali_cs_t *csp, const mali_ctx_t *ctx, const mali_pass_desc_t *d
     fb.height_px = d->height;
     fb.render_area_px = pan_fb_bbox_from_xywh(0, 0, d->width, d->height);
     fb.tiling_area_px = fb.render_area_px;
-    fb.sample_count = 1;
+    fb.sample_count = samples;
     fb.rt_count = d->color_count ? d->color_count : 1;   /* the hardware needs >= 1 RT even if a dummy */
     for (unsigned i = 0; i < PAN_MAX_RTS; i++)
         fb.rt_formats[i] = i < d->color_count ? att_format(&d->color[i]) : PIPE_FORMAT_NONE;
@@ -488,7 +490,7 @@ mali_pass_begin(mali_cs_t *csp, const mali_ctx_t *ctx, const mali_pass_desc_t *d
     GENX(pan_select_fb_tile_size)(&fb);
 
     /* ---- load / store ---- */
-    struct pan_image_view rt_views[PAN_MAX_RTS], z_view, s_view;
+    struct pan_image_view rt_views[PAN_MAX_RTS], resolve_views[PAN_MAX_RTS], z_view, s_view;
     struct pan_fb_load load;
     struct pan_fb_store store;
     memset(&load, 0, sizeof(load));
@@ -501,6 +503,16 @@ mali_pass_begin(mali_cs_t *csp, const mali_ctx_t *ctx, const mali_pass_desc_t *d
         store.rts[i].iview = &rt_views[i];
         store.rts[i].store = at->store == MALI_STORE_STORE;
         store.rts[i].msaa = PAN_FB_MSAA_COPY_ALL;
+        if (at->resolve) {
+            /* the tile buffer is resolved while it is written back; the multisample texture is not stored */
+            const mali_attachment_t r = {.tex = at->resolve, .level = at->resolve_level, .slice = at->resolve_slice};
+            mali_fmt_info_t fi;
+            att_view(&r, &resolve_views[i]);
+            store.rts[i].iview = &resolve_views[i];
+            store.rts[i].store = true;
+            store.rts[i].msaa = mali_fmt_lookup(mali_texture_mtl_format(at->resolve), &fi) && (fi.flags & MALI_FMT_BLENDABLE)
+                                    ? PAN_FB_MSAA_COPY_AVERAGE : PAN_FB_MSAA_COPY_SAMPLE_0;
+        }
         if (at->load == MALI_LOAD_CLEAR) {
             load.rts[i].in_bounds_load = load.rts[i].border_load = PAN_FB_LOAD_CLEAR;
             load.rts[i].always = true;           /* clears write even tiles with no primitives */
@@ -535,7 +547,7 @@ mali_pass_begin(mali_cs_t *csp, const mali_ctx_t *ctx, const mali_pass_desc_t *d
 
     /* ---- tiler context + sample positions ---- */
     uint64_t tiler_gpu;
-    if (!mali_state_emit_tiler_ctx(a, ctx, d->heap_desc_gpu, d->width, d->height, fb.tile_size_px, &tiler_gpu))
+    if (!mali_state_emit_tiler_ctx(a, ctx, d->heap_desc_gpu, samples, d->width, d->height, fb.tile_size_px, &tiler_gpu))
         return NULL;
     if (!cs->sample_pos_gpu) {
         const unsigned sz = pan_sample_positions_buffer_size();
@@ -552,7 +564,7 @@ mali_pass_begin(mali_cs_t *csp, const mali_ctx_t *ctx, const mali_pass_desc_t *d
         .fb = &fb,
         .load = &load,
         .store = &store,
-        .sample_pos_array_pointer = cs->sample_pos_gpu + pan_sample_positions_offset(pan_sample_pattern(1)),
+        .sample_pos_array_pointer = cs->sample_pos_gpu + pan_sample_positions_offset(pan_sample_pattern(samples)),
         .provoking_vertex_first = true,
         .tiler_ctx = &tiler,
         .layer = 0,

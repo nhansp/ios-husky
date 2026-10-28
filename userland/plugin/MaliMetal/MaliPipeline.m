@@ -269,7 +269,7 @@ static BOOL link_varyings(MaliShaderProgram *vsp, MaliShaderProgram *fsp, mali_g
         if (err) *err = v.inputError ?: f.inputError ?: @"compiler variant does not match the render pipeline entry";
         return nil;
     }
-    if (d.rasterSampleCount > 1) { if (err) *err = @"MSAA pipelines are not supported (v1)"; return nil; }
+    if (d.rasterSampleCount > 4 || d.rasterSampleCount == 3) { if (err) *err = @"only 1, 2 and 4 samples are supported"; return nil; }
 
     MaliShaderProgram *vsp = [comp compile:v.input flags:0 vsLayout:nil error:err];
     if (!vsp) return nil;
@@ -287,7 +287,7 @@ static BOOL link_varyings(MaliShaderProgram *vsp, MaliShaderProgram *fsp, mali_g
     if (fsp && !MaliUploadShader(self, fsp, &gp->fs, res, err)) return nil;
     if (fsp && fsp->prog.fs.uses_ld_var && !link_varyings(vsp, fsp, gp, err)) return nil;
 
-    gp->sample_count = 1;
+    gp->sample_count = (uint32_t)MAX(d.rasterSampleCount, (NSUInteger)1);
     gp->alpha_to_coverage = d.alphaToCoverageEnabled;
     gp->alpha_to_one = d.alphaToOneEnabled;
     gp->rasterization_enabled = d.rasterizationEnabled;

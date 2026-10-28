@@ -168,7 +168,7 @@ typedef struct mali_texture_params {
     uint32_t width, height, depth;
     uint32_t array_length;       /* MTLTextureDescriptor.arrayLength (>= 1)     */
     uint32_t mip_levels;         /* >= 1                                        */
-    uint32_t sample_count;       /* 1 only in v1                                */
+    uint32_t sample_count;       /* 2 and 4 only for MALI_TEX_2D_MS              */
     uint32_t explicit_row_pitch; /* bytes; 0 = natural (64-byte aligned rows)   */
     uint64_t plane_offset_B;     /* offset of level 0 inside the resource       */
 } mali_texture_params_t;
@@ -364,6 +364,8 @@ typedef struct mali_attachment {
     const mali_texture_t *tex;   /* NULL = unused                                */
     uint32_t level, slice;
     uint32_t load, store;
+    mali_texture_t *resolve;     /* colour: MultisampleResolve target (stored instead of tex) */
+    uint32_t resolve_level, resolve_slice;
     float    clear_color[4];
     double   clear_depth;
     uint32_t clear_stencil;
@@ -371,7 +373,7 @@ typedef struct mali_attachment {
 
 typedef struct mali_pass_desc {
     uint32_t width, height;      /* render target size                           */
-    uint32_t sample_count;       /* 1                                            */
+    uint32_t sample_count;       /* 1, 2 or 4: the attachments' sample count     */
     uint32_t layers;             /* 1                                            */
     mali_attachment_t color[MALI_MAX_RTS];
     uint32_t color_count;        /* highest used + 1                             */

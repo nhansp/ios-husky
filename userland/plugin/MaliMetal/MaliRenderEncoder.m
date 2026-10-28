@@ -93,7 +93,6 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
     MaliTexture *t = [d.texture isKindOfClass:[MaliTexture class]] ? (MaliTexture *)d.texture : nil;
     if (!d.texture) return;
     if (!t || ![t maliTexture]) { *refusal = @"an attachment texture has no Mali layout"; return; }
-    if (d.texture.sampleCount > 1) { *refusal = @"multisample attachments are not supported"; return; }
     a->tex = [t maliTexture];
     a->level = (uint32_t)d.level;
     a->slice = (uint32_t)(d.texture.textureType == MTLTextureType3D ? d.depthPlane : d.slice);
@@ -102,7 +101,16 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
         case MTLStoreActionStore: case MTLStoreActionStoreAndMultisampleResolve: case MTLStoreActionUnknown: a->store = MALI_STORE_STORE; break;
         default: a->store = MALI_STORE_DONTCARE;
     }
-    (void)color;
+    const BOOL resolve = d.storeAction == MTLStoreActionMultisampleResolve || d.storeAction == MTLStoreActionStoreAndMultisampleResolve;
+    if (resolve && d.resolveTexture) {
+        MaliTexture *r = [d.resolveTexture isKindOfClass:[MaliTexture class]] ? (MaliTexture *)d.resolveTexture : nil;
+        if (!r || ![r maliTexture]) { *refusal = @"a resolve texture has no Mali layout"; return; }
+        if (!color) { MALI_UNSUPPORTED("depth/stencil multisample resolve (not stored)"); a->store = MALI_STORE_DONTCARE; return; }
+        if (d.storeAction == MTLStoreActionStoreAndMultisampleResolve) MALI_UNSUPPORTED("StoreAndMultisampleResolve (only the resolve is stored)");
+        a->resolve = [r maliTexture];
+        a->resolve_level = (uint32_t)d.resolveLevel;
+        a->resolve_slice = (uint32_t)(d.resolveTexture.textureType == MTLTextureType3D ? d.resolveDepthPlane : d.resolveSlice);
+    }
 }
 
 - (void)maliBeginPass:(MTLRenderPassDescriptor *)rp {
@@ -124,8 +132,10 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
         a->clear_color[0] = (float)c.red; a->clear_color[1] = (float)c.green; a->clear_color[2] = (float)c.blue; a->clear_color[3] = (float)c.alpha;
         pd.color_count = i + 1;
         if (!w) { w = level_dim(ca.texture.width, ca.level); h = level_dim(ca.texture.height, ca.level); }
+        if (!pd.sample_count) pd.sample_count = (uint32_t)ca.texture.sampleCount;
     }
     if (rp.depthAttachment.texture) {
+        if (!pd.sample_count) pd.sample_count = (uint32_t)rp.depthAttachment.texture.sampleCount;
         fill_attachment(&pd.depth, rp.depthAttachment, NO, &refusal);
         pd.depth.clear_depth = rp.depthAttachment.clearDepth;
         if (pd.depth.load == MALI_LOAD_LOAD) { MALI_UNSUPPORTED("depth LoadActionLoad (treated as DontCare)"); pd.depth.load = MALI_LOAD_DONTCARE; }
@@ -145,20 +155,27 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
     if (!w || !h) [NSException raise:NSInvalidArgumentException format:@"MaliMetal: render pass without attachments"];
 
     /* LoadActionLoad is drawn below; the FBD itself preloads nothing */
+    if (!pd.sample_count) pd.sample_count = 1;
     BOOL loads[MALI_MAX_RTS] = {NO};
     for (uint32_t i = 0; i < pd.color_count; i++)
-        if (pd.color[i].tex && pd.color[i].load == MALI_LOAD_LOAD) { loads[i] = YES; pd.color[i].load = MALI_LOAD_DONTCARE; }
+        if (pd.color[i].tex && pd.color[i].load == MALI_LOAD_LOAD) {
+            /* the load draw samples a single-sample view */
+            if (pd.sample_count > 1) MALI_UNSUPPORTED("LoadActionLoad of a multisample attachment (treated as DontCare)");
+            else loads[i] = YES;
+            pd.color[i].load = MALI_LOAD_DONTCARE;
+        }
 
     pd.width = _width = w;
     pd.height = _height = h;
-    pd.sample_count = 1;
     pd.layers = 1;
     pd.heap_desc_gpu = [(IOGPUMetalBuffer *)qstate gpuAddress] + MALI_QSTATE_HEAP_DESC_OFF;
     pd.desc_arena = [_cb maliArena];
 
     /* every attachment is read and written by the pass */
-    for (uint32_t i = 0; i < pd.color_count; i++)
+    for (uint32_t i = 0; i < pd.color_count; i++) {
         if (rp.colorAttachments[i].texture) [_cb maliUseResource:rp.colorAttachments[i].texture usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        if (pd.color[i].resolve) [_cb maliUseResource:rp.colorAttachments[i].resolveTexture usage:MTLResourceUsageWrite];
+    }
     if (rp.depthAttachment.texture) [_cb maliUseResource:rp.depthAttachment.texture usage:MTLResourceUsageRead | MTLResourceUsageWrite];
     if (rp.stencilAttachment.texture) [_cb maliUseResource:rp.stencilAttachment.texture usage:MTLResourceUsageRead | MTLResourceUsageWrite];
 
