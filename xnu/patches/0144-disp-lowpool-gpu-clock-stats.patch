@@ -1,0 +1,196 @@
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+index ae8c399..3376457 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+@@ -23,6 +23,7 @@
+ #include "IOGPU.h"
+ #include "IOGPUMemory.h"
+ #include "IOGPUNotificationQueue.h"
++#include "husky_mali_backend_bridge.h"
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -48,16 +49,19 @@ static const uint64_t     kHangUS = 500000;
+ 
+ /* Submit-to-retire latency, logged every 10 s while the GPU is busy (gPollLock). */
+ static struct {
+-	uint64_t t0, n, sum_us, max_us;
++	uint64_t t0, cycles0, n, sum_us, max_us, exec_us;
+ 	uint32_t hist[5];                       /* < 4, 8, 16, 33 ms, more */
+ } gLat;
+ 
++/* tStart: when the GPU could start it (submitted, and the queue's previous one retired) */
+ static void
+-lat_note(uint64_t now, uint64_t tSubmit)
++lat_note(uint64_t now, uint64_t tSubmit, uint64_t tStart)
+ {
+-	uint64_t us;
++	uint64_t us, ex;
+ 	absolutetime_to_nanoseconds(now - tSubmit, &us);
++	absolutetime_to_nanoseconds(now - tStart, &ex);
+ 	us /= NSEC_PER_USEC;
++	gLat.exec_us += ex / NSEC_PER_USEC;
+ 	gLat.n++;
+ 	gLat.sum_us += us;
+ 	gLat.max_us = us > gLat.max_us ? us : gLat.max_us;
+@@ -66,12 +70,16 @@ lat_note(uint64_t now, uint64_t tSubmit)
+ 	absolutetime_to_nanoseconds(now - gLat.t0, &ns);
+ 	if (gLat.t0 == 0) {
+ 		gLat.t0 = now;
++		gLat.cycles0 = husky_gpu_cycles();
+ 	} else if (ns >= 10 * NSEC_PER_SEC) {
+-		IOLog("HUSKY IOGPU: 10 s: %llu command buffers, latency avg %llu max %llu us, <4/8/16/33/more ms %u/%u/%u/%u/%u\n",
+-		    gLat.n, gLat.sum_us / gLat.n, gLat.max_us, gLat.hist[0], gLat.hist[1], gLat.hist[2], gLat.hist[3],
+-		    gLat.hist[4]);
++		uint64_t cycles = husky_gpu_cycles();
++		IOLog("HUSKY IOGPU: 10 s: %llu command buffers, latency avg %llu max %llu us, exec avg %llu us, "
++		    "<4/8/16/33/more ms %u/%u/%u/%u/%u, GPU %llu MHz avg\n", gLat.n, gLat.sum_us / gLat.n, gLat.max_us,
++		    gLat.exec_us / gLat.n, gLat.hist[0], gLat.hist[1], gLat.hist[2], gLat.hist[3], gLat.hist[4],
++		    (cycles - gLat.cycles0) / (ns / NSEC_PER_USEC));
+ 		bzero(&gLat, sizeof(gLat));
+ 		gLat.t0 = now;
++		gLat.cycles0 = cycles;
+ 	}
+ }
+ 
+@@ -205,8 +213,9 @@ IOGPUCommandQueue::service(uint64_t now)
+ 			st = kIOGPUStatus_ParseError;       /* GPU timeout / hang treated as error */
+ 		}
+ 		if (p->target > 0) {
+-			lat_note(now, p->tSubmit);
++			lat_note(now, p->tSubmit, p->tSubmit > fLastRetire ? p->tSubmit : fLastRetire);
+ 		}
++		fLastRetire = now;
+ 		if (p->ref != 0 && fNotifQueue != NULL) {
+ 			fNotifQueue->enqueueCompletion(p->ref, p->t0, now, st, 0);
+ 		}
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.h b/iokit/Families/IOGPU/IOGPUCommandQueue.h
+index 9135194..f0b3b2f 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.h
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.h
+@@ -47,6 +47,7 @@ class IOGPUCommandQueue : public OSObject {
+ 	IOGPUCommandQueue      *fPollNext;
+ 	bool                    fPolled;
+ 	bool                    fDumped;
++	uint64_t                fLastRetire;
+ 
+ public:
+ 	bool initQueue(IOGPUDevice *dev, const iogpu_new_command_queue_args_t *args);
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 824c5d3..5a7d7fb 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -119,6 +119,9 @@ bridge_flush_on(void)
+ #define GPU_MAP_SIZE            0x101000ULL         /* up to doorbell 8 [husky_gpu.c GPU_MAP_SIZE] */
+ 
+ #define AS0                     0x2400u             /* [husky_gpu.c:188] */
++#define GPU_COMMAND_REG         0x30u               /* kbase GPU_CONTROL__GPU_COMMAND */
++#define GPU_COMMAND_CYCLE_COUNT_START 0x103u        /* GPU_COMMAND_CODE_TIME | TIME_ENABLE << 8 */
++#define GPU_CYCLE_COUNT         0x90u               /* kbase GPU_CONTROL__CYCLE_COUNT, 64-bit */
+ #define AS_TRANSTAB             0x00u               /* [husky_gpu.c:189] */
+ #define AS_MEMATTR              0x08u               /* [husky_gpu.c:190] */
+ #define AS_LOCKADDR             0x10u               /* kbase AS_LOCKADDR_LO/HI */
+@@ -1910,6 +1913,26 @@ const mali_backend_ops_t mali_backend_ops = {
+ 	.tiler_heap_destroy = op_tiler_heap_destroy,
+ };
+ 
++/* GPU_COMMAND TIME ENABLE (kbase GPU_COMMAND_CYCLE_COUNT_START), then the 64-bit CYCLE_COUNT. */
++uint64_t
++husky_gpu_cycles(void)
++{
++	static bool counting;
++	if (husky_gpu_get_regs() == 0) {
++		return 0;
++	}
++	if (!counting) {
++		counting = true;
++		gwr(GPU_COMMAND_REG, GPU_COMMAND_CYCLE_COUNT_START);
++	}
++	uint32_t hi, lo;
++	do {
++		hi = grd(GPU_CYCLE_COUNT + 4);
++		lo = grd(GPU_CYCLE_COUNT);
++	} while (grd(GPU_CYCLE_COUNT + 4) != hi);
++	return ((uint64_t)hi << 32) | lo;
++}
++
+ int
+ husky_mali_backend_init(void)
+ {
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.h b/iokit/Families/IOGPU/husky_mali_backend_bridge.h
+index 4ff0802..66f194d 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.h
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.h
+@@ -28,6 +28,9 @@ extern const mali_backend_ops_t mali_backend_ops;
+ /* Bridge initialisation hook called during kernel bring-up / huskygpu=6 */
+ int husky_mali_backend_init(void);
+ 
++/* GPU top-level clock cycles since the counter was first enabled (0 before the GPU is up). */
++uint64_t husky_gpu_cycles(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/iokit/Kernel/arm/HuskyDisplay.cpp b/iokit/Kernel/arm/HuskyDisplay.cpp
+index 082e0ed..deecd9b 100644
+--- a/iokit/Kernel/arm/HuskyDisplay.cpp
++++ b/iokit/Kernel/arm/HuskyDisplay.cpp
+@@ -41,12 +41,16 @@
+ #include <machine/atomic.h>
+ #include <libkern/OSAtomic.h>
+ #include <pexpert/pexpert.h>
++#include <arm/memory_types.h>             /* VM_WIMG_COPYBACK */
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" int husky_irq_register(uint32_t intid, void (*fn)(void *arg, uint32_t intid), void *arg);
+ extern "C" void husky_gic_spi_enable(uint32_t intid, uint8_t prio);
+ extern "C" int husky_gic_spi_probe(uint32_t intid, uint32_t *grp, uint32_t *cfg, uint32_t *en, uint64_t *route);
+ extern unsigned long gPhysBase, gPhysSize;
++/* osfmk/arm/io_map.c */
++extern "C" vm_offset_t io_map(vm_map_offset_t phys_addr, vm_size_t size, unsigned int flags, vm_prot_t prot,
++    bool unmappable);
+ 
+ #define HD_DECON_PHYS           0x19470000ULL
+ #define HD_WIN_PHYS             0x19480000ULL
+@@ -667,7 +671,26 @@ HuskyDisplay::allocPool(void)
+ 			one->release();
+ 		}
+ 	}
+-	for (; n < want && husky_pool.whole == NULL; n++) {
++	/*
++	 * The RDMA base registers are 32-bit and the DPU SysMMU stays in bypass, but XNU manages no RAM
++	 * below 4 GiB here (its DRAM starts at 0x880000000). Take the pool from the low bank instead:
++	 * Android's System RAM, outside every firmware carve-out (/proc/iomem; GSA..AOC end at 0xbfffffff),
++	 * which nothing touches while XNU runs.
++	 */
++	if (n == 0 && gPhysBase >= 0x100000000ULL) {
++		uint64_t base = hd_boot_arg("huskydisp_poolpa", 0xc0000000u);
++		uint64_t len = (uint64_t)want * HD_SLOT_SIZE;
++		vm_offset_t kva = base + len <= 0xd8100000ULL ?
++		    io_map(base, len, VM_WIMG_COPYBACK, VM_PROT_READ | VM_PROT_WRITE, false) : 0;
++		if (kva != 0) {
++			for (uint32_t i = 0; i < want; i++) {
++				husky_pool.pa[i] = base + (uint64_t)i * HD_SLOT_SIZE;
++				husky_pool.kva[i] = (uint8_t *)kva + (uint64_t)i * HD_SLOT_SIZE;
++			}
++			n = want;
++		}
++	}
++	for (; n < want && husky_pool.whole == NULL && husky_pool.kva[0] == NULL; n++) {
+ 		IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    opts, HD_SLOT_SIZE, mask);
+ 		IOByteCount seg = 0;
+diff --git a/iokit/Kernel/arm/HuskySurface.cpp b/iokit/Kernel/arm/HuskySurface.cpp
+index 9303ad3..338504c 100644
+--- a/iokit/Kernel/arm/HuskySurface.cpp
++++ b/iokit/Kernel/arm/HuskySurface.cpp
+@@ -819,7 +819,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		IOMemoryDescriptor *scan = husky_surface_scanout_backing(s, &nopool);
+ 		if (scan != NULL) {
+ 			s->memory = scan;
+-			s->mapCache = kIOMapDefaultCache;
++			/* explicit: the pool may be RAM XNU does not manage, which defaults to device memory */
++			s->mapCache = kIOMapCopybackCache;
+ 			if (!husky_surface_publish(s)) {
+ 				ret = kIOReturnNoResources;
+ 			}
