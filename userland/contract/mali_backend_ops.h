@@ -134,6 +134,8 @@ enum mali_bo_flag {
     MALI_BO_NONCACHEABLE = (1u << 4),  /* map write-combined/NC (ml_io_map_wcomb, HG:621) */
     MALI_BO_FIXED_VA     = (1u << 5),  /* honour the requested GPU VA (sel 8 args +0x20) */
     MALI_BO_ZERO         = (1u << 6),  /* zero-filled on allocation */
+    MALI_BO_GPU_CACHED   = (1u << 7),  /* GPU side write-back (L2) even when the CPU view is NC; never for
+                                        * memory the CPU polls while the GPU runs (sync objects) */
 };
 
 /* ===================================================================== *

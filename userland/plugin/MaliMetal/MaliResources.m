@@ -35,9 +35,10 @@ static void args_init(mali_new_resource_args_t *a, uint32_t bo_flags, uint32_t m
     a->tail.bo_flags = bo_flags;
     a->tail.mtl_pixel_format = mtl_format;
 }
-/* Flags for a resource created with `options` (MTLResourceOptions): everything the CPU can map is NC (S06 6.3). */
+/* Flags for a resource created with `options` (MTLResourceOptions): everything the CPU can map is NC on the CPU (S06 6.3).
+ * The GPU side stays cached (MALI_BO_GPU_CACHED): its L2 is cleaned at every encoder barrier. */
 static uint32_t bo_flags_for(MTLResourceOptions o, BOOL texture) {
-    uint32_t f = MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_ZERO;
+    uint32_t f = MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_ZERO | MALI_BO_GPU_CACHED;
     const NSUInteger storage = (o >> MTLResourceStorageModeShift) & 0xf;
     if (storage != MTLStorageModePrivate && storage != MTLStorageModeMemoryless) f |= MALI_BO_CPU_MAP | MALI_BO_NONCACHEABLE;
     (void)texture;
@@ -233,7 +234,7 @@ id<MTLBuffer> MaliNewBuffer(id<MTLDevice> dev, void *noCopy, NSUInteger len, MTL
 }
 id<MTLBuffer> MaliNewBufferWithIOSurface(id<MTLDevice> dev, IOSurfaceRef s) {
     mali_new_resource_args_t a;
-    args_init(&a, MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_CPU_MAP | MALI_BO_NONCACHEABLE, 0);
+    args_init(&a, MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_CPU_MAP | MALI_BO_NONCACHEABLE | MALI_BO_GPU_CACHED, 0);
     return [[MaliBuffer alloc] initWithDevice:dev iosurface:s args:&a argsSize:sizeof a];
 }
 id<MTLBuffer> MaliNewGPUBuffer(id<MTLDevice> dev, NSUInteger len, uint32_t boFlags) {
@@ -442,7 +443,7 @@ id<MTLTexture> MaliNewTexture(id<MTLDevice> dev, MTLTextureDescriptor *d, IOSurf
     mali_new_resource_args_t a;
 
     if (s) {
-        args_init(&a, MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_CPU_MAP | MALI_BO_NONCACHEABLE, (uint32_t)d.pixelFormat);
+        args_init(&a, MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_CPU_MAP | MALI_BO_NONCACHEABLE | MALI_BO_GPU_CACHED, (uint32_t)d.pixelFormat);
         MaliTexture *t = [[MaliTexture alloc] initWithDevice:dev descriptor:d iosurface:s plane:(unsigned)plane field:0 args:&a argsSize:sizeof a];
         if (!t) return nil;
         [t maliSetUsage:d.usage];
@@ -537,7 +538,7 @@ id<MTLTexture> MaliNewTextureNoCopy(id<MTLDevice> dev, MTLTextureDescriptor *d, 
     const uint32_t row0 = mali_texture_subresource(probe, 0, 0, &s0) ? s0.row_stride_B : 0;
     mali_texture_free(probe);
     mali_new_resource_args_t a;
-    args_init(&a, MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_CPU_MAP | MALI_BO_NONCACHEABLE, (uint32_t)d.pixelFormat);
+    args_init(&a, MALI_BO_GPU_READ | MALI_BO_GPU_WRITE | MALI_BO_CPU_MAP | MALI_BO_NONCACHEABLE | MALI_BO_GPU_CACHED, (uint32_t)d.pixelFormat);
     MaliTexture *t = [[MaliTexture alloc] initWithDevice:dev descriptor:d sysMemPointer:bytes sysMemSize:len sysMemLength:len
                                           sysMemRowBytes:row0 args:&a argsSize:sizeof a deallocator:dealloc];
     if (!t) return nil;
