@@ -29,22 +29,24 @@ typedef struct tex_span {
 
 @implementation MaliBlitCommandEncoder {
     MaliCommandBuffer *_cb;
-    BOOL _ended;
+    BOOL _ended, _began, _refused;
 }
 - (instancetype)initWithCommandBuffer:(id<MTLCommandBuffer>)cb {
     if (!(self = [super initWithCommandBuffer:cb])) return nil;
     _cb = (MaliCommandBuffer *)cb;
-    @try { [_cb maliBeginEncoder:@"blit"]; }
-    @catch (NSException *e) { _ended = YES; [super endEncoding]; @throw; }
+    @try { [_cb maliBeginEncoder:@"blit"]; _began = YES; }
+    @catch (NSException *e) { [_cb maliFail:e.reason]; _refused = YES; }
     return self;
 }
-- (void)maliCheckOpen {
+/* NO for a refused encoder: its command buffer has failed and every call is dropped */
+- (BOOL)maliCheckOpen {
     if (_ended || !_cb) [NSException raise:NSInternalInconsistencyException format:@"MaliMetal: blit encoder has ended"];
+    return !_refused;
 }
 - (void)endEncoding {
-    [self maliCheckOpen];
+    const BOOL open = [self maliCheckOpen];
     _ended = YES;
-    @try { [_cb maliEndEncoder]; } @finally { [super endEncoding]; }
+    @try { if (open || _began) [_cb maliEndEncoder]; } @finally { [super endEncoding]; }
 }
 
 /* ---- dispatch one built-in kernel ---- */
@@ -120,7 +122,7 @@ typedef struct tex_span {
 
 /* ---- buffer <-> buffer ---- */
 - (void)copyFromBuffer:(id<MTLBuffer>)src sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)dst destinationOffset:(NSUInteger)dof size:(NSUInteger)size {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     if (!size) return;
     if (so + size > src.length || dof + size > dst.length) { MaliLogOnce(@"blit: buffer copy out of range: dropped"); return; }
     [_cb maliUseResource:src usage:MTLResourceUsageRead];
@@ -134,7 +136,7 @@ typedef struct tex_span {
 - (void)copyFromBuffer:(id<MTLBuffer>)src sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)sbpr sourceBytesPerImage:(NSUInteger)sbpi
             sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)dst destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
      destinationOrigin:(MTLOrigin)origin {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     tex_span_t t;
     if (![self maliSpan:&t ofTexture:dst slice:slice level:level origin:origin size:size]) return;
     const uint64_t span = (uint64_t)(size.depth - 1) * sbpi + (uint64_t)(size.height - 1) * sbpr + t.row_bytes;
@@ -155,7 +157,7 @@ typedef struct tex_span {
 - (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)origin
              sourceSize:(MTLSize)size toBuffer:(id<MTLBuffer>)dst destinationOffset:(NSUInteger)dof destinationBytesPerRow:(NSUInteger)dbpr
    destinationBytesPerImage:(NSUInteger)dbpi {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     tex_span_t t;
     if (![self maliSpan:&t ofTexture:src slice:slice level:level origin:origin size:size]) return;
     const uint64_t span = (uint64_t)(size.depth - 1) * dbpi + (uint64_t)(size.height - 1) * dbpr + t.row_bytes;
@@ -176,7 +178,7 @@ typedef struct tex_span {
 /* ---- texture -> texture ---- */
 - (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size
               toTexture:(id<MTLTexture>)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     tex_span_t a, b;
     if (![self maliSpan:&a ofTexture:src slice:ss level:sl origin:so size:size] || ![self maliSpan:&b ofTexture:dst slice:ds level:dl origin:dorg size:size]) return;
     if (a.bpp != b.bpp) { MaliLogOnce(@"blit: texture copy between formats of different pixel size: dropped"); return; }
@@ -206,7 +208,7 @@ typedef struct tex_span {
 
 /* ---- fill ---- */
 - (void)fillBuffer:(id<MTLBuffer>)buffer range:(NSRange)range value:(uint8_t)value {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     if (!range.length) return;
     if (range.location + range.length > buffer.length) { MaliLogOnce(@"blit: fill range out of range: dropped"); return; }
     [_cb maliUseResource:buffer usage:MTLResourceUsageWrite];
@@ -225,7 +227,7 @@ typedef struct tex_span {
 
 /* ---- mipmaps: 2x2 box filter, float-class colour formats ---- */
 - (void)generateMipmapsForTexture:(id<MTLTexture>)tex {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     MaliTexture *t = [tex isKindOfClass:[MaliTexture class]] ? (MaliTexture *)tex : nil;
     mali_texture_t *mt = [t maliTexture];
     mali_fmt_info_t fi;

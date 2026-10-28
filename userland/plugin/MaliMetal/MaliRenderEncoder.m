@@ -40,6 +40,7 @@ static inline uint32_t level_dim(NSUInteger v, NSUInteger level) { return (uint3
     MaliCommandBuffer *_cb;
     BOOL _ended;
     mali_pass_t *_pass;
+    BOOL _began, _refused;
     uint32_t _width, _height;
     MaliRenderPipelineState *_pipeline;
     MaliDepthStencilState *_dss;
@@ -74,14 +75,15 @@ static _Atomic unsigned gPassDiagCount;
     MaliBindsInit(&_vs);
     MaliBindsInit(&_fs);
     _winding = MTLWindingClockwise;
+    /* A refused pass still returns an encoder: RenderBox caches encoder methods and cannot take nil
+     * (UniXNU docs/drivers/adreno-metal.md). The command buffer then completes with an error. */
     @try {
         [_cb maliBeginEncoder:@"render"];
+        _began = YES;
         [self maliBeginPass:rp];
     } @catch (NSException *e) {
         [_cb maliFail:e.reason];
-        _ended = YES;
-        [super endEncoding];
-        @throw;
+        _refused = YES;
     }
     return self;
 }
@@ -217,14 +219,21 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
     if (!mali_pass_draw(_pass, &s)) [_cb maliFail:@"load draw failed"];
 }
 
-- (void)maliCheckOpen {
+/* NO for a refused encoder: its command buffer has failed and every call is dropped */
+- (BOOL)maliCheckOpen {
     if (_ended || !_cb) [NSException raise:NSInternalInconsistencyException format:@"MaliMetal: render encoder has ended"];
+    return !_refused;
 }
 - (void)endEncoding {
-    [self maliCheckOpen];
+    const BOOL open = [self maliCheckOpen];
     mali_pass_t *pass = _pass;
     _pass = NULL;
     _ended = YES;
+    if (!open) {
+        if (pass) mali_pass_abort(pass);
+        @try { if (_began) [_cb maliEndEncoder]; } @finally { [super endEncoding]; }
+        return;
+    }
     @try {
         [_cb maliEndEncoder];
         if (_diag) MaliDiagLine([_diag stringByAppendingFormat:@" | draws %lu%@", (unsigned long)_diagDraws,
@@ -239,7 +248,7 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
 
 /* ---- resource usage ---- */
 - (void)maliUse:(const id<MTLResource> [])rs count:(NSUInteger)n usage:(MTLResourceUsage)u {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     for (NSUInteger i = 0; i < n; i++) [_cb maliUseResource:rs[i] usage:u];
 }
 - (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { [self maliUse:&r count:1 usage:u]; }
@@ -254,16 +263,16 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
 
 /* ---- pipeline and fixed-function state ---- */
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)s {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     if (s && ![s isKindOfClass:[MaliRenderPipelineState class]]) { MaliLogOnce(@"setRenderPipelineState: not a MaliMetal pipeline"); _pipeline = nil; return; }
     _pipeline = (MaliRenderPipelineState *)s;
     for (id h in [_pipeline maliResources]) [_cb maliUseResource:h usage:MTLResourceUsageRead];
     _constDirty = YES;
 }
-- (void)setDepthStencilState:(id<MTLDepthStencilState>)s { [self maliCheckOpen]; _dss = [s isKindOfClass:[MaliDepthStencilState class]] ? (MaliDepthStencilState *)s : nil; }
-- (void)setViewport:(MTLViewport)v { [self maliCheckOpen]; _viewport = v; _viewportSet = YES; }
+- (void)setDepthStencilState:(id<MTLDepthStencilState>)s { if (![self maliCheckOpen]) return; _dss = [s isKindOfClass:[MaliDepthStencilState class]] ? (MaliDepthStencilState *)s : nil; }
+- (void)setViewport:(MTLViewport)v { if (![self maliCheckOpen]) return; _viewport = v; _viewportSet = YES; }
 - (void)setViewports:(const MTLViewport *)v count:(NSUInteger)n { if (n) [self setViewport:v[0]]; }
-- (void)setScissorRect:(MTLScissorRect)r { [self maliCheckOpen]; _scissor = r; _scissorSet = YES; }
+- (void)setScissorRect:(MTLScissorRect)r { if (![self maliCheckOpen]) return; _scissor = r; _scissorSet = YES; }
 - (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)n { if (n) [self setScissorRect:r[0]]; }
 - (void)setCullMode:(MTLCullMode)m { _cull = m; }
 - (void)setFrontFacingWinding:(MTLWinding)w { _winding = w; }
@@ -282,34 +291,34 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
 - (void)setLevel:(NSUInteger)l {}
 
 /* ---- bindings ---- */
-- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { [self maliCheckOpen]; if (i < MALI_MAX_BUFFERS) _vbuf[i] = b; MaliBindBuffer(&_vs, _cb, i, b, o); }
+- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { if (![self maliCheckOpen]) return; if (i < MALI_MAX_BUFFERS) _vbuf[i] = b; MaliBindBuffer(&_vs, _cb, i, b, o); }
 - (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < MALI_MAX_BUFFERS) MaliBindBufferOffset(&_vs, i, o, _vbuf[i]); }
-- (void)setVertexBytes:(const void *)b length:(NSUInteger)l atIndex:(NSUInteger)i { [self maliCheckOpen]; if (i < MALI_MAX_BUFFERS) _vbuf[i] = nil; MaliBindBytes(&_vs, _cb, i, b, l); }
+- (void)setVertexBytes:(const void *)b length:(NSUInteger)l atIndex:(NSUInteger)i { if (![self maliCheckOpen]) return; if (i < MALI_MAX_BUFFERS) _vbuf[i] = nil; MaliBindBytes(&_vs, _cb, i, b, l); }
 - (void)setVertexBuffers:(const id<MTLBuffer> [])bs offsets:(const NSUInteger [])os withRange:(NSRange)r {
     for (NSUInteger k = 0; k < r.length; k++) [self setVertexBuffer:bs[k] offset:os[k] atIndex:r.location + k];
 }
-- (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { [self maliCheckOpen]; if (i < MALI_MAX_BUFFERS) _fbuf[i] = b; MaliBindBuffer(&_fs, _cb, i, b, o); }
+- (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { if (![self maliCheckOpen]) return; if (i < MALI_MAX_BUFFERS) _fbuf[i] = b; MaliBindBuffer(&_fs, _cb, i, b, o); }
 - (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < MALI_MAX_BUFFERS) MaliBindBufferOffset(&_fs, i, o, _fbuf[i]); }
-- (void)setFragmentBytes:(const void *)b length:(NSUInteger)l atIndex:(NSUInteger)i { [self maliCheckOpen]; if (i < MALI_MAX_BUFFERS) _fbuf[i] = nil; MaliBindBytes(&_fs, _cb, i, b, l); }
+- (void)setFragmentBytes:(const void *)b length:(NSUInteger)l atIndex:(NSUInteger)i { if (![self maliCheckOpen]) return; if (i < MALI_MAX_BUFFERS) _fbuf[i] = nil; MaliBindBytes(&_fs, _cb, i, b, l); }
 - (void)setFragmentBuffers:(const id<MTLBuffer> [])bs offsets:(const NSUInteger [])os withRange:(NSRange)r {
     for (NSUInteger k = 0; k < r.length; k++) [self setFragmentBuffer:bs[k] offset:os[k] atIndex:r.location + k];
 }
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     if (i < MALI_MAX_TEXTURES) { if (_fragTex[i] == t && t) return; _fragTex[i] = t; }
     MaliBindTexture(&_fs, _cb, i, t);
 }
 - (void)setFragmentTextures:(const id<MTLTexture> [])ts withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setFragmentTexture:ts[k] atIndex:r.location + k]; }
 - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     if (i < MALI_MAX_TEXTURES) { if (_vertTex[i] == t && t) return; _vertTex[i] = t; }
     MaliBindTexture(&_vs, _cb, i, t);
 }
 - (void)setVertexTextures:(const id<MTLTexture> [])ts withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setVertexTexture:ts[k] atIndex:r.location + k]; }
-- (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { [self maliCheckOpen]; MaliBindSampler(&_fs, i, s); _constDirty = YES; }
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (![self maliCheckOpen]) return; MaliBindSampler(&_fs, i, s); _constDirty = YES; }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)a lodMaxClamp:(float)b atIndex:(NSUInteger)i { [self setFragmentSamplerState:s atIndex:i]; }
 - (void)setFragmentSamplerStates:(const id<MTLSamplerState> [])ss withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setFragmentSamplerState:ss[k] atIndex:r.location + k]; }
-- (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { [self maliCheckOpen]; MaliBindSampler(&_vs, i, s); _constDirty = YES; }
+- (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (![self maliCheckOpen]) return; MaliBindSampler(&_vs, i, s); _constDirty = YES; }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)a lodMaxClamp:(float)b atIndex:(NSUInteger)i { [self setVertexSamplerState:s atIndex:i]; }
 - (void)setVertexSamplerStates:(const id<MTLSamplerState> [])ss withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setVertexSamplerState:ss[k] atIndex:r.location + k]; }
 - (void)setTileBytes:(const void *)b length:(NSUInteger)l atIndex:(NSUInteger)i { MALI_UNSUPPORTED("tile bytes"); }
@@ -317,7 +326,7 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
 /* ---- draws ---- */
 - (void)maliDraw:(BOOL)indexed prim:(MTLPrimitiveType)prim start:(NSUInteger)start count:(NSUInteger)count instances:(NSUInteger)inst
       baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi indexType:(MTLIndexType)it indexBuffer:(id<MTLBuffer>)ib indexOffset:(NSUInteger)ioff {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     if (!_pass || !_pipeline) { MaliLogOnce(@"draw without a pass or a (Mali) pipeline state: dropped"); return; }
     if (!count || !inst) return;
     if (_constDirty) {

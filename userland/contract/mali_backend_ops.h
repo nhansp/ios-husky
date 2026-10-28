@@ -210,6 +210,7 @@ enum mali_kcmd_type {
                                   * { mali_gpu_va_t stream; u32 size; u32 flush_id;
                                   *   u32 n_wait; u32 n_signal; <sync ids...> } */
     MALI_KCMD_HEAP_OP   = 0x16,  /* tiler-heap set/operation for render passes */
+    MALI_KCMD_ABORT     = 0x17,  /* encoding failed: the command buffer completes with an error status */
 };
 
 /* ===================================================================== *

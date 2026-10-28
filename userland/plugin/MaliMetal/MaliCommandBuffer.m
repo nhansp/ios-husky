@@ -211,7 +211,7 @@ static const mali_arena_ops_t kArenaOps = {.new_chunk = arena_new_chunk};
     return _uses;
 }
 - (void)maliUseResource:(id)resource usage:(MTLResourceUsage)usage {
-    if (!resource) return;
+    if (!resource || _failed) return;
     id backing = MaliGPUBacking(resource);               /* an IOSurface texture's GPU resource is its aligned shadow */
     if (backing != resource) [_held addObject:backing];
     if (usage & MTLResourceUsageWrite) [self maliNoteShadowWrite:MaliShadowOfBacking(backing)];
@@ -254,11 +254,8 @@ static bool arena_new_chunk(void *ctx, uint32_t min_size, mali_gpu_ptr_t *out, u
 - (void)maliCommit {
     /* let the native implementation reject repeated commits without touching storage that may be in flight */
     if (self.status >= MTLCommandBufferStatusCommitted) { [super commit]; return; }
-    if (_failed) [NSException raise:NSInternalInconsistencyException format:@"MaliMetal: command buffer encoding previously failed"];
-    if (_activeKind) {
-        _failed = YES;
-        [NSException raise:NSInternalInconsistencyException format:@"MaliMetal: encoder was not ended before commit"];
-    }
+    if (_activeKind) [self maliFail:@"encoder was not ended before commit"];
+    if (_failed) { [self maliCommitAborted]; return; }
 
     MaliCommandQueue *queue = (MaliCommandQueue *)self.commandQueue;
     @synchronized(queue) {              /* commits of one queue are serialised: heap creation must precede its first user */
@@ -333,6 +330,17 @@ static bool arena_new_chunk(void *ctx, uint32_t min_size, mali_gpu_ptr_t *out, u
         @try { [super commit]; }
         @catch (NSException *e) { if (heap) [queue maliHeapCreateFailed]; @throw; }
     }
+}
+
+/* The kernel rejects MALI_KCMD_ABORT, so the command buffer completes with an error status and its handlers run. */
+- (void)maliCommitAborted {
+    const struct { uint32_t type, size; } rec = {MALI_KCMD_ABORT, sizeof rec};
+    uint8_t *cmd = [self _reserveKernelCommandBufferSpace:sizeof rec];
+    if (!cmd) [NSException raise:NSInternalInconsistencyException format:@"MaliMetal: kernel command allocation failed"];
+    [self beginSegment:cmd];
+    memcpy(cmd, &rec, sizeof rec);
+    [self endCurrentSegment];
+    [super commit];
 }
 
 - (void)maliRunWriteBack { [(MaliShadowWriteBackOnce *)_writeBack run]; }

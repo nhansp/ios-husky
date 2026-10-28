@@ -1,0 +1,26 @@
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+index 6a87acd..6b65028 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+@@ -760,6 +760,9 @@ IOGPUCommandQueue::processSegmentKernelCommands(const uint8_t *k, uint32_t start
+ 			break;
+ 		}
+ 
++		case MALI_KCMD_ABORT:                     /* Vendor 0x17: the client's encoding failed */
++			return kIOGPUStatus_ParseError;
++
+ 		case MALI_KCMD_FENCE:                     /* Vendor 0x13: stamp write completion marker */
+ 		case MALI_KCMD_FILL:                      /* Vendor 0x14: buffer fill */
+ 			/* Decoded and accepted */
+diff --git a/iokit/Families/IOGPU/mali_backend_ops.h b/iokit/Families/IOGPU/mali_backend_ops.h
+index a21fb78..f9c9fa0 100644
+--- a/iokit/Families/IOGPU/mali_backend_ops.h
++++ b/iokit/Families/IOGPU/mali_backend_ops.h
+@@ -210,6 +210,7 @@ enum mali_kcmd_type {
+                                   * { mali_gpu_va_t stream; u32 size; u32 flush_id;
+                                   *   u32 n_wait; u32 n_signal; <sync ids...> } */
+     MALI_KCMD_HEAP_OP   = 0x16,  /* tiler-heap set/operation for render passes */
++    MALI_KCMD_ABORT     = 0x17,  /* encoding failed: the command buffer completes with an error status */
+ };
+ 
+ /* ===================================================================== *

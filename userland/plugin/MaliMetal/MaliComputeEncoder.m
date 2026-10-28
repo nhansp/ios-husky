@@ -17,7 +17,7 @@
 
 @implementation MaliComputeCommandEncoder {
     MaliCommandBuffer *_cb;
-    BOOL _ended;
+    BOOL _ended, _began, _refused;
     MaliComputePipelineState *_pipe;
     mali_stage_binds_t _b;
     BOOL _constDirty;
@@ -29,20 +29,22 @@
     if (!(self = [super initWithCommandBuffer:cb])) return nil;
     _cb = (MaliCommandBuffer *)cb;
     MaliBindsInit(&_b);
-    @try { [_cb maliBeginEncoder:@"compute"]; }
-    @catch (NSException *e) { _ended = YES; [super endEncoding]; @throw; }
+    @try { [_cb maliBeginEncoder:@"compute"]; _began = YES; }
+    @catch (NSException *e) { [_cb maliFail:e.reason]; _refused = YES; }
     return self;
 }
-- (void)maliCheckOpen {
+/* NO for a refused encoder: its command buffer has failed and every call is dropped */
+- (BOOL)maliCheckOpen {
     if (_ended || !_cb) [NSException raise:NSInternalInconsistencyException format:@"MaliMetal: compute encoder has ended"];
+    return !_refused;
 }
 - (void)endEncoding {
-    [self maliCheckOpen];
+    const BOOL open = [self maliCheckOpen];
     _ended = YES;
-    @try { [_cb maliEndEncoder]; } @finally { [super endEncoding]; }
+    @try { if (open || _began) [_cb maliEndEncoder]; } @finally { [super endEncoding]; }
 }
 
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { [self maliCheckOpen]; [_cb maliUseResource:r usage:u]; }
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { if (![self maliCheckOpen]) return; [_cb maliUseResource:r usage:u]; }
 - (void)useResources:(const id<MTLResource> [])rs count:(NSUInteger)n usage:(MTLResourceUsage)u { for (NSUInteger i = 0; i < n; i++) [self useResource:rs[i] usage:u]; }
 - (void)useHeap:(id<MTLHeap>)h { MALI_UNSUPPORTED("useHeap"); }
 - (void)useHeaps:(const id<MTLHeap> [])h count:(NSUInteger)n { MALI_UNSUPPORTED("useHeaps"); }
@@ -50,30 +52,30 @@
 - (void)memoryBarrierWithResources:(const id<MTLResource> [])r count:(NSUInteger)n {}
 
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)s {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     if (s && ![s isKindOfClass:[MaliComputePipelineState class]]) { MaliLogOnce(@"setComputePipelineState: not a MaliMetal pipeline"); _pipe = nil; return; }
     _pipe = (MaliComputePipelineState *)s;
     for (id h in [_pipe maliResources]) [_cb maliUseResource:h usage:MTLResourceUsageRead];
     _constDirty = YES;
 }
 
-- (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { [self maliCheckOpen]; if (i < MALI_MAX_BUFFERS) _buf[i] = b; MaliBindBuffer(&_b, _cb, i, b, o); }
+- (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { if (![self maliCheckOpen]) return; if (i < MALI_MAX_BUFFERS) _buf[i] = b; MaliBindBuffer(&_b, _cb, i, b, o); }
 - (void)setBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < MALI_MAX_BUFFERS) MaliBindBufferOffset(&_b, i, o, _buf[i]); }
-- (void)setBytes:(const void *)p length:(NSUInteger)l atIndex:(NSUInteger)i { [self maliCheckOpen]; if (i < MALI_MAX_BUFFERS) _buf[i] = nil; MaliBindBytes(&_b, _cb, i, p, l); }
+- (void)setBytes:(const void *)p length:(NSUInteger)l atIndex:(NSUInteger)i { if (![self maliCheckOpen]) return; if (i < MALI_MAX_BUFFERS) _buf[i] = nil; MaliBindBytes(&_b, _cb, i, p, l); }
 - (void)setBuffers:(const id<MTLBuffer> [])bs offsets:(const NSUInteger [])os withRange:(NSRange)r {
     for (NSUInteger k = 0; k < r.length; k++) [self setBuffer:bs[k] offset:os[k] atIndex:r.location + k];
 }
 - (void)setTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     if (i < MALI_MAX_TEXTURES) { if (_tex[i] == t && t) return; _tex[i] = t; }
     MaliBindTexture(&_b, _cb, i, t);
 }
 - (void)setTextures:(const id<MTLTexture> [])ts withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setTexture:ts[k] atIndex:r.location + k]; }
-- (void)setSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { [self maliCheckOpen]; MaliBindSampler(&_b, i, s); _constDirty = YES; }
+- (void)setSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (![self maliCheckOpen]) return; MaliBindSampler(&_b, i, s); _constDirty = YES; }
 - (void)setSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)a lodMaxClamp:(float)b atIndex:(NSUInteger)i { [self setSamplerState:s atIndex:i]; }
 - (void)setSamplerStates:(const id<MTLSamplerState> [])ss withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setSamplerState:ss[k] atIndex:r.location + k]; }
 - (void)setThreadgroupMemoryLength:(NSUInteger)len atIndex:(NSUInteger)i {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     if (i >= MALI_MAX_BUFFERS || len > 32768) { MaliLogOnce(@"threadgroup memory length out of range"); return; }
     _b.tg_mem_len[i] = (uint32_t)len;
     _b.serial++;
@@ -84,7 +86,7 @@
 - (void)setImageblockWidth:(NSUInteger)w height:(NSUInteger)h { MALI_UNSUPPORTED("imageblocks"); }
 
 - (void)maliDispatchGrid:(MTLSize)grid threadgroup:(MTLSize)tg threads:(MTLSize)threads nonUniform:(BOOL)nu {
-    [self maliCheckOpen];
+    if (![self maliCheckOpen]) return;
     if (!_pipe) { MaliLogOnce(@"dispatch without a (Mali) compute pipeline state: dropped"); return; }
     if (!tg.width || !tg.height || !tg.depth || !grid.width || !grid.height || !grid.depth) return;
     if (tg.width * tg.height * tg.depth > [_pipe maxTotalThreadsPerThreadgroup]) {
