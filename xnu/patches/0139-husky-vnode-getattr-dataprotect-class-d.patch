@@ -1,0 +1,68 @@
+diff --git a/bsd/vfs/kpi_vfs.c b/bsd/vfs/kpi_vfs.c
+index 272ad01..639ad18 100644
+--- a/bsd/vfs/kpi_vfs.c
++++ b/bsd/vfs/kpi_vfs.c
+@@ -86,6 +86,7 @@
+ #include <sys/time.h>
+ #include <sys/disk.h>
+ #include <sys/vnode_internal.h>
++#include <sys/content_protection.h>
+ #include <sys/stat.h>
+ #include <sys/namei.h>
+ #include <sys/ucred.h>
+@@ -2986,7 +2987,19 @@ vnode_getattr(vnode_t vp, struct vnode_attr *vap, vfs_context_t ctx)
+ 
+ 	if (!VATTR_IS_SUPPORTED(vap, va_flags)) {
+ 		VATTR_RETURN(vap, va_flags, 0);
+-	} else if (VATTR_IS_ACTIVE(vap, va_flags)) {
++	}
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
++	/*
++	 * HUSKY's HFS+ is built without content protection (no AppleKeyStore): every file on a mount
++	 * without MNT_CPROTECT is effectively class D. iOS daemons require NSURLFileProtectionKey to
++	 * read back NSFileProtectionNone (PosterBoard's data store viability check); without this the
++	 * attribute is unsupported and getattrlist drops it.
++	 */
++	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class) && !VATTR_IS_SUPPORTED(vap, va_dataprotect_class) &&
++	    vp->v_mount != NULL && !(vfs_flags(vp->v_mount) & MNT_CPROTECT)) {
++		VATTR_RETURN(vap, va_dataprotect_class, PROTECTION_CLASS_D);
++	}
++#endif else if (VATTR_IS_ACTIVE(vap, va_flags)) {
+ 		if ((vap->va_flags & APPEND) && !is_appendonly) {
+ 			os_atomic_or(&vp->v_ext_flag, VE_APPENDONLY, relaxed);
+ 		} else if (!(vap->va_flags & APPEND) && is_appendonly) {
+diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
+index e879e2a..f83e29b 100644
+--- a/bsd/vfs/vfs_attrlist.c
++++ b/bsd/vfs/vfs_attrlist.c
+@@ -46,7 +46,6 @@
+ #include <sys/uio_internal.h>
+ #include <kern/kalloc.h>
+ #include <sys/attr.h>
+-#include <sys/content_protection.h>
+ #include <sys/sysproto.h>
+ #include <sys/xattr.h>
+ #include <sys/fsevents.h>
+@@ -2140,22 +2139,9 @@ attr_pack_common(vfs_context_t ctx, mount_t mp, vnode_t vp, struct attrlist *alp
+ 		}
+ 	}
+ 	if (alp->commonattr & ATTR_CMN_DATA_PROTECT_FLAGS) {
+-#if defined(ARM64_BOARD_CONFIG_HUSKY)
+-		mount_t pmp = vp != NULLVP ? vnode_mount(vp) : mp;
+-#endif
+ 		if (VATTR_IS_SUPPORTED(vap, va_dataprotect_class)) {
+ 			ATTR_PACK4((*abp), vap->va_dataprotect_class);
+ 			abp->actual.commonattr |= ATTR_CMN_DATA_PROTECT_FLAGS;
+-#if defined(ARM64_BOARD_CONFIG_HUSKY)
+-		} else if (pmp != NULL && !(vfs_flags(pmp) & MNT_CPROTECT)) {
+-			/*
+-			 * HUSKY's HFS+ is built without content protection (no AppleKeyStore), so every
+-			 * file is effectively class D; iOS daemons (PosterBoard's data store viability
+-			 * check) require NSURLFileProtectionKey to read back as NSFileProtectionNone.
+-			 */
+-			ATTR_PACK4((*abp), PROTECTION_CLASS_D);
+-			abp->actual.commonattr |= ATTR_CMN_DATA_PROTECT_FLAGS;
+-#endif
+ 		} else if (!return_valid || pack_invalid) {
+ 			ATTR_PACK4((*abp), 0);
+ 		}
