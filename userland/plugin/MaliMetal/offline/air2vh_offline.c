@@ -282,12 +282,21 @@ static void rt_load(void)
     /* records are only valid for the compiler that wrote them: one directory per compiler id */
     char base[768];
     const char *cid = id();
+    uint64_t fnv = 0xcbf29ce484222325ull;
+    for (const char *c = cid; *c; c++)
+        fnv = (fnv ^ (uint8_t)*c) * 0x100000001b3ull;
     if (confstr(_CS_DARWIN_USER_CACHE_DIR, base, sizeof(base)) > 0 && base[0]) {
-        uint64_t fnv = 0xcbf29ce484222325ull;
-        for (const char *c = cid; *c; c++)
-            fnv = (fnv ^ (uint8_t)*c) * 0x100000001b3ull;
         snprintf(g_rt.cache_dir, sizeof(g_rt.cache_dir), "%s/" MVP_CACHE_SUBDIR, base);
         mkdir(g_rt.cache_dir, 0755);
+    } else {
+        /* no per-user cache dir without dirhelper (/var/folders is empty here): a private one in /var/tmp */
+        struct stat st;
+        snprintf(g_rt.cache_dir, sizeof(g_rt.cache_dir), "/private/var/tmp/" MVP_CACHE_SUBDIR ".%u", (unsigned)getuid());
+        mkdir(g_rt.cache_dir, 0700);
+        if (lstat(g_rt.cache_dir, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 077))
+            g_rt.cache_dir[0] = 0;
+    }
+    if (g_rt.cache_dir[0]) {
         size_t n = strlen(g_rt.cache_dir);
         snprintf(g_rt.cache_dir + n, sizeof(g_rt.cache_dir) - n, "/%016llx", (unsigned long long)fnv);
         if (mkdir(g_rt.cache_dir, 0755) != 0 && errno != EEXIST)
