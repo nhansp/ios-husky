@@ -45,14 +45,17 @@ static uint32_t bo_flags_for(MTLResourceOptions o, BOOL texture) {
 }
 
 /* ====================================================================== *
- * IOSurface aligned shadows
- *   One per IOSurface id in this process, shared by every texture and view over it. The GPU reads and writes the
- *   shadow (64-byte aligned rows, the layout pan_image accepts); CPU writes to the surface (its seed, or a
- *   replaceRegion) refill it before the next GPU use, and command buffers that wrote it copy it back on completion.
+ * Aligned shadows
+ *   For a source whose rows are not 64-byte multiples (the layout pan_image accepts): an IOSurface (one shadow per
+ *   surface id in this process, shared by every texture and view over it) or a buffer range (one per texture). The
+ *   GPU reads and writes the shadow; CPU writes to the source refill it before the next GPU use (an IOSurface's seed
+ *   or a replaceRegion; a buffer has no seed, so every use), and command buffers that wrote it copy it back.
  * ====================================================================== */
 @interface MaliSurfaceShadow : NSObject {
 @public
     IOSurfaceRef _surface;
+    id<MTLBuffer> _src;                  /* buffer source when _surface is NULL */
+    NSUInteger _srcOffset;
     id<MTLBuffer> _buffer;
     NSUInteger _rowBytes, _surfaceRow, _width, _height, _cpp;
     uint32_t _seed;
@@ -65,6 +68,13 @@ static uint32_t bo_flags_for(MTLResourceOptions o, BOOL texture) {
 @implementation MaliSurfaceShadow
 - (void)dealloc { if (_surface) CFRelease(_surface); }
 - (void)fillLocked {
+    if (!_surface) {
+        const char *src = (const char *)_src.contents + _srcOffset;
+        char *dst = _buffer.contents;
+        if (_src.contents && dst) for (NSUInteger y = 0; y < _height; y++) memcpy(dst + y * _rowBytes, src + y * _surfaceRow, _width * _cpp);
+        _dirty = NO;
+        return;
+    }
     uint32_t seed = 0;
     if (IOSurfaceLock(_surface, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) {
         os_log_error(mali_res_log(), "IOSurface %u shadow fill: lock refused", IOSurfaceGetID(_surface));
@@ -79,10 +89,16 @@ static uint32_t bo_flags_for(MTLResourceOptions o, BOOL texture) {
     _dirty = NO;
 }
 - (void)syncIfNeeded {
-    @synchronized(self) { if (_dirty || IOSurfaceGetSeed(_surface) != _seed) [self fillLocked]; }
+    @synchronized(self) { if (!_surface || _dirty || IOSurfaceGetSeed(_surface) != _seed) [self fillLocked]; }
 }
 - (void)writeBack {
     @synchronized(self) {
+        if (!_surface) {
+            char *dst = (char *)_src.contents + _srcOffset;
+            const char *src = _buffer.contents;
+            if (_src.contents && src) for (NSUInteger y = 0; y < _height; y++) memcpy(dst + y * _surfaceRow, src + y * _rowBytes, _width * _cpp);
+            return;
+        }
         if (IOSurfaceLock(_surface, 0, NULL) != kIOReturnSuccess) {
             os_log_error(mali_res_log(), "IOSurface %u shadow write-back: lock refused", IOSurfaceGetID(_surface));
             return;
@@ -133,6 +149,18 @@ static MaliSurfaceShadow *shadow_for_surface(id<MTLDevice> dev, IOSurfaceRef s, 
         return sh;
     }
 }
+static MaliSurfaceShadow *shadow_for_buffer(id<MTLDevice> dev, id<MTLBuffer> src, NSUInteger offset, NSUInteger row,
+                                            NSUInteger width, NSUInteger height, NSUInteger cpp) {
+    const NSUInteger aligned = align_up(width * cpp, 64);
+    MaliSurfaceShadow *sh = [MaliSurfaceShadow new];
+    sh->_buffer = [dev newBufferWithLength:aligned * height options:MTLResourceStorageModeShared];
+    if (!sh->_buffer || !sh->_buffer.contents || sh->_buffer.length < aligned * height) return nil;
+    sh->_buffer.label = @"MaliMetal buffer-texture shadow";
+    sh->_src = src; sh->_srcOffset = offset;
+    sh->_rowBytes = aligned; sh->_surfaceRow = row; sh->_width = width; sh->_height = height; sh->_cpp = cpp;
+    @synchronized(shadows_by_buffer()) { [shadows_by_buffer() setObject:sh forKey:sh->_buffer]; }
+    return sh;
+}
 id MaliShadowOfBacking(id resource) {
     if (!resource) return nil;
     @synchronized(shadows_by_buffer()) { return [shadows_by_buffer() objectForKey:resource]; }
@@ -149,6 +177,8 @@ void MaliShadowWriteBack(id shadow) {
 - (void)maliAttachLinearBacking:(MaliBuffer *)buffer descriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)o bytesPerRow:(NSUInteger)bpr
                             ctx:(const mali_ctx_t *)ctx;
 - (void)maliAttachShadow:(MaliSurfaceShadow *)sh;
+- (void)maliAttachShadowedBacking:(MaliBuffer *)buffer shadow:(MaliSurfaceShadow *)sh descriptor:(MTLTextureDescriptor *)d
+                           offset:(NSUInteger)o ctx:(const mali_ctx_t *)ctx;
 - (void)maliSetCPU:(void *)base bytes:(NSUInteger)n;
 - (void)maliInheritFrom:(MaliTexture *)parent;
 - (void)maliSetMali:(mali_texture_t *)mt;
@@ -161,19 +191,26 @@ void MaliShadowWriteBack(id shadow) {
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)o bytesPerRow:(NSUInteger)bpr {
     return [self newTiledTextureWithDescriptor:d offset:o bytesPerRow:bpr];
 }
-/* A linear 2D texture aliasing this buffer (SkyLight / CoreImage). Needs bytesPerRow a 64-byte multiple (pan_image). */
+/* A linear 2D texture aliasing this buffer (SkyLight / CoreImage / CoreAnimation masks). pan_image needs 64-byte
+ * aligned rows and base; anything else samples an aligned shadow of the range. */
 - (id<MTLTexture>)newTiledTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)o bytesPerRow:(NSUInteger)bpr {
     MaliMTLDevice *dev = (MaliMTLDevice *)self.device;
     mali_fmt_info_t fi;
     if (!d || d.textureType != MTLTextureType2D || !d.width || !d.height || d.depth > 1 || d.arrayLength > 1 ||
         d.mipmapLevelCount > 1 || d.sampleCount > 1 || !mali_fmt_lookup((uint32_t)d.pixelFormat, &fi) || !fi.bytes_per_pixel ||
-        bpr < d.width * fi.bytes_per_pixel || (bpr & 63) || (o & 63) || o > self.length || d.height > (self.length - o) / bpr) {
+        bpr < d.width * fi.bytes_per_pixel || o > self.length || d.height > (self.length - o) / bpr) {
         MaliLogOnce([NSString stringWithFormat:@"buffer texture refused: fmt %lu %lux%lu bpr %lu offset %lu", (unsigned long)d.pixelFormat,
                      (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr, (unsigned long)o]);
         return nil;
     }
     MaliTexture *t = [[MaliTexture alloc] initWithBuffer:self descriptor:d offset:o bytesPerRow:bpr];
     if (!t) return nil;
+    if ((bpr & 63) || (o & 63)) {
+        MaliSurfaceShadow *sh = shadow_for_buffer(dev, self, o, bpr, d.width, d.height, fi.bytes_per_pixel);
+        if (!sh) { [t maliRefuse:@"cannot create an aligned shadow for the buffer texture"]; return t; }
+        [t maliAttachShadowedBacking:self shadow:sh descriptor:d offset:o ctx:[dev maliCtx]];
+        return t;
+    }
     [t maliAttachLinearBacking:self descriptor:d offset:o bytesPerRow:bpr ctx:[dev maliCtx]];
     return t;
 }
@@ -271,6 +308,17 @@ static BOOL params_from_descriptor(MTLTextureDescriptor *d, mali_texture_params_
 }
 
 - (void)maliAttachShadow:(MaliSurfaceShadow *)sh { _shadow = sh; }
+- (void)maliAttachShadowedBacking:(MaliBuffer *)buffer shadow:(MaliSurfaceShadow *)sh descriptor:(MTLTextureDescriptor *)d
+                           offset:(NSUInteger)o ctx:(const mali_ctx_t *)ctx {
+    [self maliSetUsage:d.usage];
+    mali_texture_params_t p;
+    if (!params_from_descriptor(d, &p)) { [self maliRefuse:@"unsupported buffer texture descriptor"]; return; }
+    p.explicit_row_pitch = (uint32_t)sh->_rowBytes;
+    if (![self maliAttachLayout:&p ctx:ctx baseGPU:[(IOGPUMetalResource *)sh->_buffer gpuAddress] available:sh->_buffer.length]) return;
+    _shadow = sh;
+    _keepAlive = buffer;
+    if (buffer.contents) { _cpu = (char *)buffer.contents + o; _cpuBytes = buffer.length - o; }
+}
 - (void)maliSetCPU:(void *)base bytes:(NSUInteger)n { _cpu = base; _cpuBytes = base ? n : 0; }
 - (void)maliInheritFrom:(MaliTexture *)parent {
     _cpu = parent->_cpu; _cpuBytes = parent->_cpuBytes; _shadow = parent->_shadow; _keepAlive = parent;
