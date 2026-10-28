@@ -473,7 +473,12 @@ id<MTLTexture> MaliNewTexture(id<MTLDevice> dev, MTLTextureDescriptor *d, IOSurf
         const size_t sw = planes ? IOSurfaceGetWidthOfPlane(s, plane) : IOSurfaceGetWidth(s);
         const size_t sh = planes ? IOSurfaceGetHeightOfPlane(s, plane) : IOSurfaceGetHeight(s);
         mali_fmt_info_t fi;
-        if (!mali_fmt_lookup(p.mtl_pixel_format, &fi) || !fi.bytes_per_pixel) { [t maliRefuse:@"IOSurface format has no linear layout"]; return t; }
+        if (!mali_fmt_lookup(p.mtl_pixel_format, &fi) || !fi.bytes_per_pixel) {
+            const uint32_t sf = OSSwapHostToBigInt32(IOSurfaceGetPixelFormat(s));
+            [t maliRefuse:[NSString stringWithFormat:@"IOSurface '%.4s' as pixel format %lu has no linear layout", (const char *)&sf,
+                                                     (unsigned long)d.pixelFormat]];
+            return t;
+        }
         if (bpe != fi.bytes_per_pixel || sw < d.width || sh < d.height) {
             [t maliRefuse:[NSString stringWithFormat:@"IOSurface element %zu B, %zux%zu does not fit fmt %lu %lux%lu", bpe, sw, sh,
                            (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height]];
