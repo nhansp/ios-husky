@@ -181,10 +181,27 @@ index 082e0ed..deecd9b 100644
  		    opts, HD_SLOT_SIZE, mask);
  		IOByteCount seg = 0;
 diff --git a/iokit/Kernel/arm/HuskySurface.cpp b/iokit/Kernel/arm/HuskySurface.cpp
-index 9303ad3..338504c 100644
+index 9303ad3..00ef86d 100644
 --- a/iokit/Kernel/arm/HuskySurface.cpp
 +++ b/iokit/Kernel/arm/HuskySurface.cpp
-@@ -819,7 +819,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -72,6 +72,7 @@ enum {
+ #define HUSKY_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
+ #define HUSKY_SURFACE_FMT_BGRA          0x42475241
++#define HUSKY_SURFACE_FMT_BGRA_C        0x26424741      /* '&BGA': CoreAnimation's pick with huskysurfcompressed, laid out as BGRA here */
+ #define HUSKY_SCANOUT_SLOT_SIZE         (16u << 20)
+ 
+ static IOLock       *husky_surface_lock;
+@@ -421,7 +422,7 @@ husky_surface_scanout_backing(HuskySurface *s, const char **why)
+ 		*why = "planes";
+ 	} else if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
+ 		*why = "element";
+-	} else if (s->pixelFormat != HUSKY_SURFACE_FMT_BGRA) {
++	} else if (s->pixelFormat != HUSKY_SURFACE_FMT_BGRA && s->pixelFormat != HUSKY_SURFACE_FMT_BGRA_C) {
+ 		*why = "format";
+ 	} else if (s->bytesPerRow != stride || s->offset != 0) {
+ 		*why = "layout";
+@@ -819,7 +820,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  		IOMemoryDescriptor *scan = husky_surface_scanout_backing(s, &nopool);
  		if (scan != NULL) {
  			s->memory = scan;
