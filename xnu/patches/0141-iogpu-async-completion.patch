@@ -1,0 +1,680 @@
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+index 671ff64..49a6d1e 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+@@ -24,10 +24,196 @@
+ #include "IOGPUMemory.h"
+ #include "IOGPUNotificationQueue.h"
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <mach/mach_time.h>
+ 
+ OSDefineMetaClassAndStructors(IOGPUCommandQueue, OSObject);
+ 
++/* osfmk/kern/thread.h declares it for MACH_KERNEL_PRIVATE only */
++extern "C" kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
++#define IOGPU_POLLER_PRI        80      /* MAXPRI_KERNEL - 15: above user UI threads */
++
++/*
++ * Completion poller. The GPU's job IRQ is not wired up, so one kernel thread retires command
++ * buffers by reading each busy queue's sync object every kPollUS, posts their completions in
++ * submission order, and advances the global fence that husky_gpu_fence_wait sleeps on.
++ */
++static IOLock            *gPollLock;
++static IOGPUCommandQueue *gPollList;
++static uint64_t           gSubmitGen;           /* last generation handed out */
++static uint64_t           gDoneGen;             /* every generation <= gDoneGen has retired */
++static const uint32_t     kPollUS = 200;
++static const uint64_t     kHangUS = 500000;
++
++static uint64_t
++deadline_in_us(uint64_t us)
++{
++	uint64_t d;
++	clock_interval_to_deadline((uint32_t)us, NSEC_PER_USEC, &d);
++	return d;
++}
++
++extern "C" uint64_t
++husky_gpu_fence(void)
++{
++	if (gPollLock == NULL) {
++		return 0;
++	}
++	IOLockLock(gPollLock);
++	uint64_t t = gSubmitGen;
++	IOLockUnlock(gPollLock);
++	return t;
++}
++
++extern "C" bool
++husky_gpu_fence_wait(uint64_t token, uint32_t timeout_us)
++{
++	if (gPollLock == NULL || token == 0) {
++		return true;
++	}
++	uint64_t deadline = deadline_in_us(timeout_us);
++	IOLockLock(gPollLock);
++	while (gDoneGen < token && mach_absolute_time() < deadline) {
++		IOLockSleepDeadline(gPollLock, &gDoneGen, deadline, THREAD_UNINT);
++	}
++	bool done = gDoneGen >= token;
++	IOLockUnlock(gPollLock);
++	return done;
++}
++
++void
++IOGPUCommandQueue::pollerMain(void *, wait_result_t)
++{
++	IOLockLock(gPollLock);
++	for (;;) {
++		if (gPollList == NULL) {
++			if (gDoneGen != gSubmitGen) {
++				gDoneGen = gSubmitGen;
++				IOLockWakeup(gPollLock, &gDoneGen, false);
++			}
++			IOLockSleep(gPollLock, &gPollList, THREAD_UNINT);
++			continue;
++		}
++		uint64_t now = mach_absolute_time();
++		uint64_t done = gSubmitGen;
++		IOGPUCommandQueue **pp = &gPollList;
++		while (*pp != NULL) {
++			IOGPUCommandQueue *q = *pp;
++			if (q->service(now)) {
++				uint64_t g = q->fPend[q->fPendHead].gen - 1;
++				done = g < done ? g : done;
++				pp = &q->fPollNext;
++			} else {
++				*pp = q->fPollNext;
++				q->fPollNext = NULL;
++				q->fPolled = false;
++				IOLockWakeup(gPollLock, &q->fPendCount, false);
++			}
++		}
++		if (done != gDoneGen) {
++			gDoneGen = done;
++			IOLockWakeup(gPollLock, &gDoneGen, false);
++		}
++		if (gPollList != NULL) {
++			/* Without urgency the timer is coalesced to ~1 ms, which would cap the UI near 60 fps. */
++			assert_wait_deadline_with_leeway((event_t)&gPollList, THREAD_UNINT, TIMEOUT_URGENCY_SYS_CRITICAL,
++			    deadline_in_us(kPollUS), 0);
++			IOLockUnlock(gPollLock);
++			thread_block(THREAD_CONTINUE_NULL);
++			IOLockLock(gPollLock);
++		}
++	}
++}
++
++void
++IOGPUCommandQueue::pushPending(uint64_t ref, uint64_t t0, uint32_t status)
++{
++	IOLockLock(gPollLock);
++	/* The poller frees a slot within kHangUS: it times out a stuck head. */
++	while (fPendCount == kPendMax) {
++		IOLockSleep(gPollLock, &fPendCount, THREAD_UNINT);
++	}
++	Pending *p = &fPend[(fPendHead + fPendCount) % kPendMax];
++	p->target = fSubmitSeq;
++	p->gen = ++gSubmitGen;
++	p->ref = ref;
++	p->t0 = t0;
++	p->tSubmit = mach_absolute_time();
++	p->status = status;
++	fPendCount++;
++	if (!fPolled) {
++		fPolled = true;
++		fPollNext = gPollList;
++		gPollList = this;
++	}
++	IOLockWakeup(gPollLock, &gPollList, false);
++	IOLockUnlock(gPollLock);
++}
++
++bool
++IOGPUCommandQueue::service(uint64_t now)
++{
++	if (fMaliQueue != NULL) {
++		mali_backend_ops.queue_service(fMaliQueue, 0);
++	}
++	uint64_t v = fSync ? mali_backend_ops.syncobj_read(fSync) : UINT64_MAX;
++	while (fPendCount > 0) {
++		Pending *p = &fPend[fPendHead];
++		uint32_t st = p->status;
++		if (v < p->target) {
++			uint64_t ns;
++			absolutetime_to_nanoseconds(now - p->tSubmit, &ns);
++			if (ns < kHangUS * NSEC_PER_USEC) {
++				break;
++			}
++			IOLog("HUSKY IOGPU: queue 0x%llx: command buffer stuck %llu ms (sync %llu, want %llu)\n",
++			    fTraceId, ns / NSEC_PER_MSEC, v, p->target);
++			if (!fDumped && fMaliQueue != NULL) {
++				fDumped = true;
++				mali_backend_ops.queue_service(fMaliQueue, MALI_QUEUE_SERVICE_DUMP);
++			}
++			st = kIOGPUStatus_ParseError;       /* GPU timeout / hang treated as error */
++		}
++		if (p->ref != 0 && fNotifQueue != NULL) {
++			fNotifQueue->enqueueCompletion(p->ref, p->t0, now, st, 0);
++		}
++		fPendHead = (fPendHead + 1) % kPendMax;
++		fPendCount--;
++		IOLockWakeup(gPollLock, &fPendCount, false);
++	}
++	return fPendCount > 0;
++}
++
++bool
++IOGPUCommandQueue::waitIdle(uint64_t timeout_us)
++{
++	if (gPollLock == NULL) {
++		return true;
++	}
++	uint64_t deadline = deadline_in_us(timeout_us);
++	IOLockLock(gPollLock);
++	while ((fPendCount > 0 || fPolled) && mach_absolute_time() < deadline) {
++		IOLockSleepDeadline(gPollLock, &fPendCount, deadline, THREAD_UNINT);
++	}
++	bool idle = fPendCount == 0;
++	IOLockUnlock(gPollLock);
++	return idle;
++}
++
++void
++IOGPUCommandQueue::setNotificationQueue(IOGPUNotificationQueue *nq)
++{
++	if (nq != NULL) {
++		nq->retain();
++	}
++	IOLockLock(gPollLock);
++	IOGPUNotificationQueue *old = fNotifQueue;
++	fNotifQueue = nq;
++	IOLockUnlock(gPollLock);
++	OSSafeReleaseNULL(old);
++}
++
+ bool
+ IOGPUCommandQueue::initQueue(IOGPUDevice *dev, const iogpu_new_command_queue_args_t *args)
+ {
+@@ -42,6 +228,24 @@ IOGPUCommandQueue::initQueue(IOGPUDevice *dev, const iogpu_new_command_queue_arg
+ 	fSubmitSeq = 0;
+ 	fStatus = kIOGPUStatus_Success;
+ 
++	if (gPollLock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (l != NULL && OSCompareAndSwapPtr(NULL, l, (void * volatile *)&gPollLock)) {
++			thread_t t;
++			if (kernel_thread_start_priority(pollerMain, NULL, IOGPU_POLLER_PRI, &t) == KERN_SUCCESS) {
++				thread_set_thread_name(t, "iogpu.poller");
++				thread_deallocate(t);
++			} else {
++				IOLog("HUSKY IOGPU: no completion poller thread\n");
++			}
++		} else if (l != NULL) {
++			IOLockFree(l);
++		}
++	}
++	if (gPollLock == NULL) {
++		return false;
++	}
++
+ 	mali_vm_t *vm = dev->task()->vm();
+ 
+ 	/* Allocate hardware queue on CSG0 / CS0 (compute-only v0) [spec 06 lines 170-174] */
+@@ -62,6 +266,22 @@ IOGPUCommandQueue::initQueue(IOGPUDevice *dev, const iogpu_new_command_queue_arg
+ void
+ IOGPUCommandQueue::free()
+ {
++	if (gPollLock != NULL) {
++		if (!waitIdle(2 * kHangUS)) {
++			IOLog("HUSKY IOGPU: queue 0x%llx freed with %u command buffers in flight\n", fTraceId, fPendCount);
++		}
++		IOLockLock(gPollLock);
++		for (IOGPUCommandQueue **pp = &gPollList; *pp != NULL; pp = &(*pp)->fPollNext) {
++			if (*pp == this) {
++				*pp = fPollNext;
++				break;
++			}
++		}
++		fPolled = false;
++		fPendCount = 0;
++		IOLockUnlock(gPollLock);
++	}
++	OSSafeReleaseNULL(fNotifQueue);
+ 	/* Terminate the group (queue_destroy) before freeing the sync object it writes. */
+ 	if (fMaliQueue != NULL) {
+ 		mali_backend_ops.queue_destroy(fMaliQueue);
+@@ -357,39 +577,12 @@ IOGPUCommandQueue::processOneCommandBuffer(const iogpu_cmdbuf_args_t *cb)
+ 	}
+ 
+ 	/*
+-	 * Sync accounting tied strictly to SUBMIT_CS dispatches:
+-	 * Each SUBMIT_CS bumps the sync object by +1 via MALI_CS_SYNC_ADD64.
+-	 * If no SUBMIT_CS jobs were dispatched (e.g. empty buffer or fences only),
+-	 * we do NOT wait (fixes REVIEWS.md:36, 76).
++	 * Each SUBMIT_CS bumps the queue's sync object by one (MALI_CS_SYNC_ADD64); the command buffer
++	 * retires when it reaches fSubmitSeq. One without GPU work still queues behind the earlier ones
++	 * so completions stay in submission order.
+ 	 */
+-	if (status == kIOGPUStatus_Success && submits_dispatched > 0) {
+-		uint64_t target = fSubmitSeq + submits_dispatched;
+-
+-		/* Poll sync object for GPU completion [spec 06 lines 160, 275] */
+-		uint64_t us;
+-		for (us = 0; us < 500000; us += 10) {
+-			if (mali_backend_ops.syncobj_read(fSync) >= target) {
+-				break;
+-			}
+-			IODelay(10);
+-		}
+-
+-		if (mali_backend_ops.syncobj_read(fSync) >= target) {
+-			fSubmitSeq = target;
+-		} else {
+-			status = kIOGPUStatus_ParseError;   /* GPU timeout / hang treated as error */
+-		}
+-	}
+-
+-	uint64_t t1 = mach_absolute_time();
+-
+-	/*
+-	 * Post completed notification with accurate status and timestamps
+-	 * [spec 01 lines 565-569; fixes REVIEWS.md:120].
+-	 */
+-	if (cb->completedRef && fNotifQueue) {
+-		fNotifQueue->enqueueCompletion(cb->completedRef, t0, t1, status, 0);
+-	}
++	fSubmitSeq += submits_dispatched;
++	pushPending(cb->completedRef, t0, status);
+ 
+ 	OSSafeReleaseNULL(kS);
+ 	OSSafeReleaseNULL(sS);
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.h b/iokit/Families/IOGPU/IOGPUCommandQueue.h
+index e9e97f4..9135194 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.h
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.h
+@@ -34,6 +34,20 @@ class IOGPUCommandQueue : public OSObject {
+ 	uint64_t                fSubmitSeq;     /* Monotonic sync count [spec 06 line 180] */
+ 	uint32_t                fStatus;        /* Last submission status */
+ 
++	/* Command buffers in flight, oldest first; completed by the poller thread (gPollLock). */
++	struct Pending {
++		uint64_t target;                /* fSync value that retires it */
++		uint64_t gen;                   /* global submission number, for husky_gpu_fence */
++		uint64_t ref, t0, tSubmit;
++		uint32_t status;
++	};
++	enum { kPendMax = 64 };
++	Pending                 fPend[kPendMax];
++	uint32_t                fPendHead, fPendCount;
++	IOGPUCommandQueue      *fPollNext;
++	bool                    fPolled;
++	bool                    fDumped;
++
+ public:
+ 	bool initQueue(IOGPUDevice *dev, const iogpu_new_command_queue_args_t *args);
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -41,7 +55,9 @@ public:
+ 	uint64_t traceObjectId() const { return fTraceId; }
+ 	/* Current value of the queue's CS sync object (0 if none); used by the huskygpu=6 self-test. */
+ 	uint64_t syncValue() const { return fSync ? mali_backend_ops.syncobj_read(fSync) : 0; }
+-	void setNotificationQueue(IOGPUNotificationQueue *nq) { fNotifQueue = nq; }
++	void setNotificationQueue(IOGPUNotificationQueue *nq);
++	/* True once every command buffer submitted so far has retired. */
++	bool waitIdle(uint64_t timeout_us);
+ 
+ 	/*
+ 	 * Submission entry (selector 25 / trap 0) [spec 01 lines 211, 254, 537-551].
+@@ -56,6 +72,11 @@ private:
+ 
+ 	uint32_t heapOp(const struct mali_kcmd_heap_op *cmd);
+ 
++	void pushPending(uint64_t ref, uint64_t t0, uint32_t status);
++	/* gPollLock held; true while command buffers remain in flight */
++	bool service(uint64_t now);
++	static void pollerMain(void *arg, wait_result_t wr);
++
+ 	/* Decode kernel commands inside one segment [spec 01 lines 576-607] */
+ 	uint32_t processSegmentKernelCommands(const uint8_t *k, uint32_t start,
+ 	    uint32_t end, uint32_t *submits_dispatched);
+diff --git a/iokit/Families/IOGPU/IOGPUNotificationQueue.cpp b/iokit/Families/IOGPU/IOGPUNotificationQueue.cpp
+index d7ac58b..b28b6c5 100644
+--- a/iokit/Families/IOGPU/IOGPUNotificationQueue.cpp
++++ b/iokit/Families/IOGPU/IOGPUNotificationQueue.cpp
+@@ -22,6 +22,10 @@ IOGPUNotificationQueue::initWithEntries(uint32_t numEntries, uint32_t entrySize,
+ 	}
+ 
+ 	fEntrySize = entrySize;
++	fLock = IOLockAlloc();
++	if (fLock == NULL) {
++		return false;
++	}
+ 	fQueue = IOSharedDataQueue::withEntries(numEntries, entrySize);
+ 	if (fQueue == NULL) {
+ 		return false;
+@@ -48,6 +52,10 @@ IOGPUNotificationQueue::free()
+ {
+ 	OSSafeReleaseNULL(fMap);
+ 	OSSafeReleaseNULL(fQueue);
++	if (fLock != NULL) {
++		IOLockFree(fLock);
++		fLock = NULL;
++	}
+ 	OSObject::free();
+ }
+ 
+@@ -85,6 +93,14 @@ IOGPUNotificationQueue::enqueueCompletion(uint64_t ref, uint64_t tBegin, uint64_
+ 	e.extra  = extra;
+ 
+ 	uint32_t sendSize = (fEntrySize < sizeof(e)) ? fEntrySize : (uint32_t)sizeof(e);
+-	fQueue->enqueue(&e, sendSize);
++	IOLockLock(fLock);
++	bool queued = fQueue->enqueue(&e, sendSize);
++	IOLockUnlock(fLock);
++	if (!queued) {
++		static uint32_t logged;
++		if (logged++ < 8) {
++			IOLog("HUSKY IOGPU: notification queue full, completion 0x%llx dropped\n", ref);
++		}
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_HUSKY */
+diff --git a/iokit/Families/IOGPU/IOGPUNotificationQueue.h b/iokit/Families/IOGPU/IOGPUNotificationQueue.h
+index 2bd4c0f..3478731 100644
+--- a/iokit/Families/IOGPU/IOGPUNotificationQueue.h
++++ b/iokit/Families/IOGPU/IOGPUNotificationQueue.h
+@@ -20,6 +20,7 @@ class IOGPUNotificationQueue : public OSObject {
+ 	OSDeclareDefaultStructors(IOGPUNotificationQueue);
+ 
+ 	IOSharedDataQueue *fQueue;
++	IOLock            *fLock;         /* IOSharedDataQueue::enqueue is single-producer */
+ 	IOMemoryMap       *fMap;
+ 	uint64_t           fUserAddr;     /* Client task VA of the IODataQueueMemory */
+ 	mach_port_t        fPort;
+diff --git a/iokit/Families/IOGPU/husky_iogpu_selftest.cpp b/iokit/Families/IOGPU/husky_iogpu_selftest.cpp
+index 7e0c3b0..df054c5 100644
+--- a/iokit/Families/IOGPU/husky_iogpu_selftest.cpp
++++ b/iokit/Families/IOGPU/husky_iogpu_selftest.cpp
+@@ -415,10 +415,10 @@ husky_iogpu_selftest(void)
+ 	/* ------------------------------------------------------------------
+ 	 * [6/7] Poll Sync Object / Stamp Completion
+ 	 * ------------------------------------------------------------------ */
+-	/* The submit path waits for the sync object; read it back here instead of assuming. */
+ 	uint64_t syncVal = 0;
+ 	IOGPUCommandQueue *cq = uc->device() ? uc->device()->lookupQueue(queueId) : NULL;
+ 	if (cq != NULL) {
++		cq->waitIdle(500000);
+ 		syncVal = cq->syncValue();
+ 		cq->release();   /* lookupQueue retains */
+ 	}
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 6d91208..fe46aed 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -431,6 +431,8 @@ struct mali_queue {
+ 	unsigned            rv;
+ 	uint32_t            waitall;
+ 	uint32_t            csg;           /* CSG_FIRST..CSG_LAST, owned until queue_destroy */
++	lck_mtx_t          *lock;          /* submit vs the completion poller's queue_service */
++	bool                oom_failed;    /* stop answering OOM until the next submit */
+ };
+ 
+ struct mali_syncobj {
+@@ -1175,10 +1177,18 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 		return EBUSY;
+ 	}
+ 	mali_queue_t *q = (mali_queue_t *)kalloc_data(sizeof(mali_queue_t), Z_WAITOK | Z_ZERO);
+-	if (q == NULL) {
++	lck_mtx_t *lock = lck_mtx_alloc_init(&g_bridge_grp, LCK_ATTR_NULL);
++	if (q == NULL || lock == NULL) {
++		if (q != NULL) {
++			kfree_data(q, sizeof(mali_queue_t));
++		}
++		if (lock != NULL) {
++			lck_mtx_free(lock, &g_bridge_grp);
++		}
+ 		csg_slot_free((uint32_t)slot);
+ 		return ENOMEM;
+ 	}
++	q->lock = lock;
+ 	q->csg = (uint32_t)slot;
+ 
+ 	q->vm        = vm;
+@@ -1346,11 +1356,13 @@ op_queue_destroy(mali_queue_t *q)
+ 		BR_LOG("HUSKY IOGPU bridge: queue_destroy: leaking queue buffers, CSG%u and AS%d stay reserved\n", q->csg,
+ 		    q->vm->as_slot);
+ 		__atomic_store_n(&q->vm->wedged, true, __ATOMIC_RELEASE);
++		lck_mtx_free(q->lock, &g_bridge_grp);
+ 		kfree_data(q, sizeof(mali_queue_t));
+ 		return;
+ 	}
+ 	queue_free_buffers(q);
+ 	csg_slot_free(q->csg);
++	lck_mtx_free(q->lock, &g_bridge_grp);
+ 	kfree_data(q, sizeof(mali_queue_t));
+ }
+ 
+@@ -1360,10 +1372,20 @@ op_queue_destroy(mali_queue_t *q)
+  *   2. CS_MOVE48 + CS_MOVE32 + MALI_CS_CALL + CS_WAIT: user command stream chunk [mali_backend_ops.h:162-163]
+  *   3. CS_MOVE48 + CS_MOVE48 + CS_SYNC_ADD64 + CS_ERROR_BARRIER: sync object increment tail [husky_gpu.c:648-656, 932-936]
+  *   4. Pad to 64-byte lines ((n + 7) & ~7u), write to ring, dsb sy, update ring_in, dsb sy, kick doorbell [husky_gpu.c:658-670]
+- *   5. Poll sync object for hardware completion [husky_gpu.c:672-678]
++ * Completion is the IOGPUCommandQueue poller's job (sync object reads).
+  */
+ static bool queue_tiler_oom(mali_queue_t *q);
+ 
++/* q->lock held */
++static void
++queue_oom_service(mali_queue_t *q)
++{
++	if (!q->oom_failed && q->csout != 0 &&
++	    ((rd32(q->csout, CS_OUT_ACK) ^ rd32(q->csin, CS_IN_REQ)) & CS_REQ_TILER_OOM)) {
++		q->oom_failed = !queue_tiler_oom(q);
++	}
++}
++
+ /* CS status fields are only refreshed on request: ask for CSG_REQ STATUS_UPDATE before reading them. */
+ static void
+ queue_dump_state(mali_queue_t *q)
+@@ -1403,6 +1425,9 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 
+ 	uint64_t prog[32];
+ 	unsigned n = 0;
++
++	lck_mtx_lock(q->lock);
++	q->oom_failed = false;
+ 	unsigned ra = q->ra ? q->ra : 92;
+ 	unsigned rv = q->rv ? q->rv : 94;
+ 	uint32_t waitall = q->waitall ? q->waitall : 0xffff;
+@@ -1421,11 +1446,8 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 	}
+ 
+ 	/* 3. Sync object update tail [husky_gpu.c:648-656, 932-936] */
+-	const mali_syncobj_t *so = NULL;
+-	uint64_t expected_sync = 0;
+ 	if (desc->n_signals > 0 && desc->signals != NULL && desc->signals[0] != NULL) {
+-		so = desc->signals[0];
+-		expected_sync = (so->cpu != NULL) ? (*so->cpu + 1) : 1;
++		const mali_syncobj_t *so = desc->signals[0];
+ 		prog[n++] = CS_MOVE48(ra, so->gpu_va);
+ 		prog[n++] = CS_MOVE48(rv, 1);
+ 		prog[n++] = CS_SYNC_ADD64(ra, rv);
+@@ -1437,6 +1459,23 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 	/* Pad to whole 64-byte line (multiple of 8 64-bit words) [husky_gpu.c:658, 938] */
+ 	unsigned total = (n + 7) & ~7u;
+ 
++	/* Words the firmware has not consumed yet must not be overwritten. */
++	unsigned us = 0;
++	while (q->ring_out_cpu != NULL && q->ring_insert + 8 * total - q->ring_out_cpu[0] > q->ring_size) {
++		if (us >= 500000) {
++			BR_LOG("HUSKY IOGPU bridge: submit: ring full for 500 ms (insert 0x%llx, extract 0x%llx)\n",
++			    (unsigned long long)q->ring_insert, (unsigned long long)q->ring_out_cpu[0]);
++			if (q->csout != 0 && q->csgout != 0) {
++				queue_dump_state(q);
++			}
++			lck_mtx_unlock(q->lock);
++			return ETIMEDOUT;
++		}
++		queue_oom_service(q);
++		delay(10);
++		us += 10;
++	}
++
+ 	/* The firmware reads the ring modulo its size; a block may straddle the end [panthor_sched.c queue_run_job] */
+ 	if (q->ring_cpu != 0) {
+ 		for (unsigned i = 0; i < total; i++) {
+@@ -1452,35 +1491,27 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 
+-	/* Ring the queue's CS doorbell [husky_gpu.c:676, 997] (doorbell 2: CSG1/CS0) */
+-	BR_LOG("HUSKY IOGPU bridge: submit: %u words at ring +0x%llx, insert 0x%llx, doorbell %u, want sync %llu\n",
+-	    n, (unsigned long long)(q->ring_insert % q->ring_size), (unsigned long long)new_in, BRIDGE_DOORBELL(q->csg),
+-	    (unsigned long long)expected_sync);
++	/* Ring the queue's CS doorbell [husky_gpu.c:676, 997] */
++	BR_LOG("HUSKY IOGPU bridge: submit: %u words at ring +0x%llx, insert 0x%llx, doorbell %u\n",
++	    n, (unsigned long long)(q->ring_insert % q->ring_size), (unsigned long long)new_in, BRIDGE_DOORBELL(q->csg));
+ 	gwr(DOORBELL(BRIDGE_DOORBELL(q->csg)), 1);
++	q->ring_insert = new_in;
++	lck_mtx_unlock(q->lock);
++	return 0;
++}
+ 
+-	/* Poll sync object for hardware completion [husky_gpu.c:672-678] */
+-	unsigned us;
+-	bool oom_handled = true;
+-	for (us = 0; us < 500000; us += 10) {
+-		if (so != NULL && so->cpu != NULL && *so->cpu == expected_sync) {
+-			break;
+-		}
+-		if (oom_handled && q->csout != 0 &&
+-		    ((rd32(q->csout, CS_OUT_ACK) ^ rd32(q->csin, CS_IN_REQ)) & CS_REQ_TILER_OOM)) {
+-			oom_handled = queue_tiler_oom(q);
+-		}
+-		delay(10);
++static void
++op_queue_service(mali_queue_t *q, uint32_t flags)
++{
++	if (q == NULL) {
++		return;
+ 	}
+-
+-	BR_LOG("HUSKY IOGPU bridge: submit %s after %u us: sync %llu, ring extract 0x%llx\n",
+-	    us < 500000 ? "completed" : "TIMED OUT", us,
+-	    (unsigned long long)(so != NULL && so->cpu != NULL ? *so->cpu : 0),
+-	    (unsigned long long)(q->ring_out_cpu != NULL ? q->ring_out_cpu[0] : 0));
+-	if (us >= 500000 && q->csout != 0 && q->csgout != 0) {
++	lck_mtx_lock(q->lock);
++	queue_oom_service(q);
++	if ((flags & MALI_QUEUE_SERVICE_DUMP) && q->csout != 0 && q->csgout != 0) {
+ 		queue_dump_state(q);
+ 	}
+-	q->ring_insert = new_in;
+-	return (us < 500000) ? 0 : ETIMEDOUT;
++	lck_mtx_unlock(q->lock);
+ }
+ 
+ static mali_status_t
+@@ -1733,6 +1764,7 @@ const mali_backend_ops_t mali_backend_ops = {
+ 	.queue_destroy      = op_queue_destroy,
+ 	.queue_submit       = op_queue_submit,
+ 	.queue_wait_idle    = op_queue_wait_idle,
++	.queue_service      = op_queue_service,
+ 	.syncobj_create     = op_syncobj_create,
+ 	.syncobj_destroy    = op_syncobj_destroy,
+ 	.syncobj_gpu_va     = op_syncobj_gpu_va,
+diff --git a/iokit/Families/IOGPU/mali_backend_ops.h b/iokit/Families/IOGPU/mali_backend_ops.h
+index d1924f3..f08236b 100644
+--- a/iokit/Families/IOGPU/mali_backend_ops.h
++++ b/iokit/Families/IOGPU/mali_backend_ops.h
+@@ -214,6 +214,8 @@ enum mali_kcmd_type {
+  * 5. The backend ops table. The family calls these; the backend implements
+  *   them on top of husky_gpu.c's proven sequences. Return 0 on success.
+  * ===================================================================== */
++#define MALI_QUEUE_SERVICE_DUMP 1u
++
+ typedef struct mali_backend_ops {
+     /* --- accelerator lifecycle (IOGPU::configureDevice / teardownDevice) --- */
+     /* probe + power pd_g3d, open the G3D S2MPU, reset, L2 on, boot the CSF
+@@ -268,11 +270,13 @@ typedef struct mali_backend_ops {
+     mali_status_t (*queue_create)(mali_vm_t *, uint32_t cs_mask, mali_queue_t **out);
+     void          (*queue_destroy)(mali_queue_t *);
+     /* write the Layer-B ring wrapper for one command buffer and ring the
+-     * doorbell; the completion is read from the per-queue sync object. */
++     * doorbell; returns without waiting for the GPU (it waits only for ring
++     * space). Completion is read from the signalled sync object. */
+     mali_status_t (*queue_submit)(mali_queue_t *, const mali_submit_desc_t *);
+-    /* v0 synchronous completion: poll the sync object / stamp [HG:711-716];
+-     * v1 replaces this with the JOB IRQ + signalStampsUpdated path. */
+     mali_status_t (*queue_wait_idle)(mali_queue_t *, uint64_t timeout_us);
++    /* called by the completion poller while work is in flight: answers the
++     * firmware's tiler OOM requests; MALI_QUEUE_SERVICE_DUMP logs CS/CSG state. */
++    void          (*queue_service)(mali_queue_t *, uint32_t flags);
+ 
+     /* --- syncobj: 64-bit CS sync object {seqno,error,pad} (spec 06 3.5) --- */
+     mali_status_t (*syncobj_create)(mali_vm_t *, mali_syncobj_t **out);
+diff --git a/iokit/Kernel/arm/HuskyFramebuffer.cpp b/iokit/Kernel/arm/HuskyFramebuffer.cpp
+index cfa52eb..9247e6f 100644
+--- a/iokit/Kernel/arm/HuskyFramebuffer.cpp
++++ b/iokit/Kernel/arm/HuskyFramebuffer.cpp
+@@ -400,6 +400,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x14c);
+ 	static uint32_t husky_fb_swapends_logged;
++	static uint32_t husky_fb_fence_timeouts;
+ 
+ 	if (husky_fb_swapends_logged < 16) {
+ 		husky_fb_swapends_logged++;
+@@ -418,6 +419,10 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ 
+ 	uint32_t swapID = get32(rec, 0x98);
++	/* CoreAnimation swaps right after committing the frame's command buffer. */
++	if (!husky_gpu_fence_wait(husky_gpu_fence(), 100000) && husky_fb_fence_timeouts++ < 8) {
++		IOLog("HUSKY FB: swap %u: GPU work not retired after 100 ms\n", swapID);
++	}
+ 	if (fDisp != NULL) {
+ 		if (swapDirect(rec, mask, swapID)) {
+ 			return;
+diff --git a/iokit/Kernel/arm/HuskyScaler.cpp b/iokit/Kernel/arm/HuskyScaler.cpp
+index 72aaa2e..8675d08 100644
+--- a/iokit/Kernel/arm/HuskyScaler.cpp
++++ b/iokit/Kernel/arm/HuskyScaler.cpp
+@@ -218,6 +218,7 @@ husky_scaler_transfer(const struct husky_tsd *t)
+ 			    dx0, dy0, dw, dh, dst->width, dst->height);
+ 			goto out;
+ 		}
++		husky_gpu_fence_wait(husky_gpu_fence(), 100000);
+ 		husky_dcache_flush((vm_offset_t)s, (size_t)srow * src->height);
+ 
+ 		/* source position of destination pixel centre i: sx + (i + 0.5) * step - 0.5 */
+diff --git a/iokit/Kernel/arm/HuskySurface.cpp b/iokit/Kernel/arm/HuskySurface.cpp
+index 7920f6f..9303ad3 100644
+--- a/iokit/Kernel/arm/HuskySurface.cpp
++++ b/iokit/Kernel/arm/HuskySurface.cpp
+@@ -1000,6 +1000,8 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	/* IOSurfaceLock returns after GPU writes to the surface have landed. */
++	husky_gpu_fence_wait(husky_gpu_fence(), 100000);
+ 	IOReturn ret = husky_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+diff --git a/iokit/Kernel/arm/HuskySurface.h b/iokit/Kernel/arm/HuskySurface.h
+index 1b38dab..0a76b16 100644
+--- a/iokit/Kernel/arm/HuskySurface.h
++++ b/iokit/Kernel/arm/HuskySurface.h
+@@ -89,6 +89,9 @@ void husky_scanout_slot_put(int slot);
+ 
+ extern "C" void husky_dcache_flush(vm_offset_t va, size_t len);
+ extern "C" void husky_dcache_clean(vm_offset_t va, size_t len);
++/* IOGPUCommandQueue.cpp: token covering every command buffer submitted so far, and a wait for it. */
++extern "C" uint64_t husky_gpu_fence(void);
++extern "C" bool husky_gpu_fence_wait(uint64_t token, uint32_t timeout_us);
+ 
+ #endif /* HUSKY */
+ #endif /* _HUSKY_SURFACE_H */
