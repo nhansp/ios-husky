@@ -1,0 +1,67 @@
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index 29297b4..6d91208 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -417,7 +417,7 @@ struct mali_queue {
+ 	vm_offset_t         ring_cpu;
+ 	uint64_t            ring_gpu_va;
+ 	uint32_t            ring_size;
+-	uint32_t            ring_used;     /* in 8-byte instructions */
++	uint64_t            ring_insert;   /* bytes ever written: CSF ring pointers never wrap */
+ 	volatile uint64_t  *ring_in_cpu;
+ 	volatile uint64_t  *ring_out_cpu;
+ 	uint64_t            ring_in_gpu;
+@@ -1184,7 +1184,7 @@ op_queue_create(mali_vm_t *vm, uint32_t cs_mask, mali_queue_t **out)
+ 	q->vm        = vm;
+ 	q->cs_mask   = cs_mask;
+ 	q->ring_size = 64 * 1024;   /* 64 KiB ring buffer */
+-	q->ring_used = 0;
++	q->ring_insert = 0;
+ 
+ 	mali_status_t st = ENOMEM;
+ 
+@@ -1436,29 +1436,26 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 
+ 	/* Pad to whole 64-byte line (multiple of 8 64-bit words) [husky_gpu.c:658, 938] */
+ 	unsigned total = (n + 7) & ~7u;
+-	if ((q->ring_used + total) * 8 > q->ring_size) {
+-		q->ring_used = 0; /* Wrap ring */
+-	}
+ 
+-	/* Copy instructions into ring buffer [husky_gpu.c:663-666] */
++	/* The firmware reads the ring modulo its size; a block may straddle the end [panthor_sched.c queue_run_job] */
+ 	if (q->ring_cpu != 0) {
+ 		for (unsigned i = 0; i < total; i++) {
+ 			uint64_t w = (i < n) ? prog[i] : 0;
+-			*(volatile uint64_t *)(q->ring_cpu + 8 * (q->ring_used + i)) = w;
++			*(volatile uint64_t *)(q->ring_cpu + (vm_offset_t)((q->ring_insert + 8 * i) % q->ring_size)) = w;
+ 		}
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 
+-	/* Update ring input pointer [husky_gpu.c:668, 942] */
+-	uint32_t new_in = 8 * (q->ring_used + total);
++	uint64_t new_in = q->ring_insert + 8 * total;
+ 	if (q->ring_in_cpu != NULL) {
+ 		*q->ring_in_cpu = new_in;
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 
+ 	/* Ring the queue's CS doorbell [husky_gpu.c:676, 997] (doorbell 2: CSG1/CS0) */
+-	BR_LOG("HUSKY IOGPU bridge: submit: %u words at ring +0x%x, insert 0x%x, doorbell %u, want sync %llu\n",
+-	    n, 8 * q->ring_used, new_in, BRIDGE_DOORBELL(q->csg), (unsigned long long)expected_sync);
++	BR_LOG("HUSKY IOGPU bridge: submit: %u words at ring +0x%llx, insert 0x%llx, doorbell %u, want sync %llu\n",
++	    n, (unsigned long long)(q->ring_insert % q->ring_size), (unsigned long long)new_in, BRIDGE_DOORBELL(q->csg),
++	    (unsigned long long)expected_sync);
+ 	gwr(DOORBELL(BRIDGE_DOORBELL(q->csg)), 1);
+ 
+ 	/* Poll sync object for hardware completion [husky_gpu.c:672-678] */
+@@ -1482,7 +1479,7 @@ op_queue_submit(mali_queue_t *q, const mali_submit_desc_t *desc)
+ 	if (us >= 500000 && q->csout != 0 && q->csgout != 0) {
+ 		queue_dump_state(q);
+ 	}
+-	q->ring_used += total;
++	q->ring_insert = new_in;
+ 	return (us < 500000) ? 0 : ETIMEDOUT;
+ }
+ 
