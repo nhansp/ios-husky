@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/HuskyScaler.cpp b/iokit/Kernel/arm/HuskyScaler.cpp
 new file mode 100644
-index 0000000..90d2a34
+index 0000000..72aaa2e
 --- /dev/null
 +++ b/iokit/Kernel/arm/HuskyScaler.cpp
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,350 @@
 +/*
 + * Built-in AppleM2ScalerCSCDriver for HUSKY: Apple's scaler/colour-converter block, done on the CPU.
 + *
@@ -20,6 +20,7 @@ index 0000000..90d2a34
 +#if defined(HUSKY)
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOMemoryDescriptor.h>
 +#include <sys/proc.h>
