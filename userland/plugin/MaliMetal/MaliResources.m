@@ -54,6 +54,7 @@ static uint32_t bo_flags_for(MTLResourceOptions o, BOOL texture) {
 @interface MaliSurfaceShadow : NSObject {
 @public
     IOSurfaceRef _surface;
+    size_t _plane, _planes;              /* the IOSurface plane this shadows (_planes 0: not planar) */
     id<MTLBuffer> _src;                  /* buffer source when _surface is NULL */
     NSUInteger _srcOffset;
     id<MTLBuffer> _buffer;
@@ -80,7 +81,7 @@ static uint32_t bo_flags_for(MTLResourceOptions o, BOOL texture) {
         os_log_error(mali_res_log(), "IOSurface %u shadow fill: lock refused", IOSurfaceGetID(_surface));
         return;
     }
-    const char *src = IOSurfaceGetBaseAddress(_surface);
+    const char *src = _planes ? IOSurfaceGetBaseAddressOfPlane(_surface, _plane) : IOSurfaceGetBaseAddress(_surface);
     char *dst = _buffer.contents;
     const NSUInteger n = _width * _cpp;
     if (src && dst) for (NSUInteger y = 0; y < _height; y++) memcpy(dst + y * _rowBytes, src + y * _surfaceRow, n);
@@ -103,7 +104,7 @@ static uint32_t bo_flags_for(MTLResourceOptions o, BOOL texture) {
             os_log_error(mali_res_log(), "IOSurface %u shadow write-back: lock refused", IOSurfaceGetID(_surface));
             return;
         }
-        char *dst = IOSurfaceGetBaseAddress(_surface);
+        char *dst = _planes ? IOSurfaceGetBaseAddressOfPlane(_surface, _plane) : IOSurfaceGetBaseAddress(_surface);
         const char *src = _buffer.contents;
         const NSUInteger n = _width * _cpp;
         if (src && dst) for (NSUInteger y = 0; y < _height; y++) memcpy(dst + y * _surfaceRow, src + y * _rowBytes, n);
@@ -115,7 +116,7 @@ static uint32_t bo_flags_for(MTLResourceOptions o, BOOL texture) {
 - (void)markDirty { @synchronized(self) { _dirty = YES; } }
 @end
 
-static NSMapTable *shadows_by_surface(void) {          /* IOSurface id -> shadow (weak) */
+static NSMapTable *shadows_by_surface(void) {          /* IOSurface id, plane -> shadow (weak) */
     static NSMapTable *t;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ t = [NSMapTable strongToWeakObjectsMapTable]; });
@@ -127,21 +128,25 @@ static NSMapTable *shadows_by_buffer(void) {           /* shadow buffer -> shado
     dispatch_once(&once, ^{ t = [NSMapTable weakToWeakObjectsMapTable]; });
     return t;
 }
-static MaliSurfaceShadow *shadow_for_surface(id<MTLDevice> dev, IOSurfaceRef s, NSUInteger cpp) {
-    const NSUInteger width = IOSurfaceGetWidth(s), height = IOSurfaceGetHeight(s), row = IOSurfaceGetBytesPerRow(s);
+static MaliSurfaceShadow *shadow_for_surface(id<MTLDevice> dev, IOSurfaceRef s, size_t plane, NSUInteger cpp) {
+    const size_t planes = IOSurfaceGetPlaneCount(s);
+    const NSUInteger width = planes ? IOSurfaceGetWidthOfPlane(s, plane) : IOSurfaceGetWidth(s);
+    const NSUInteger height = planes ? IOSurfaceGetHeightOfPlane(s, plane) : IOSurfaceGetHeight(s);
+    const NSUInteger row = planes ? IOSurfaceGetBytesPerRowOfPlane(s, plane) : IOSurfaceGetBytesPerRow(s);
     if (!dev || !width || !height || !cpp || width > 16384 || height > 16384 || row < width * cpp) return nil;
     const NSUInteger aligned = align_up(width * cpp, 64);
-    NSNumber *key = @(IOSurfaceGetID(s));
+    NSNumber *key = @(((uint64_t)IOSurfaceGetID(s) << 4) | plane);
     @synchronized(shadows_by_surface()) {
         MaliSurfaceShadow *sh = [shadows_by_surface() objectForKey:key];
-        if (sh && sh->_surface == s && sh->_rowBytes == aligned && sh->_surfaceRow == row && sh->_width == width &&
-            sh->_height == height && sh->_cpp == cpp)
+        if (sh && sh->_surface == s && sh->_plane == plane && sh->_rowBytes == aligned && sh->_surfaceRow == row &&
+            sh->_width == width && sh->_height == height && sh->_cpp == cpp)
             return sh;
         sh = [MaliSurfaceShadow new];
         sh->_buffer = [dev newBufferWithLength:aligned * height options:MTLResourceStorageModeShared];
         if (!sh->_buffer || !sh->_buffer.contents || sh->_buffer.length < aligned * height) return nil;
         sh->_buffer.label = @"MaliMetal IOSurface shadow";
         sh->_surface = (IOSurfaceRef)CFRetain(s);
+        sh->_plane = plane; sh->_planes = planes;
         sh->_rowBytes = aligned; sh->_surfaceRow = row; sh->_width = width; sh->_height = height; sh->_cpp = cpp;
         @synchronized(sh) { [sh fillLocked]; }
         [shadows_by_surface() setObject:sh forKey:key];
@@ -478,12 +483,14 @@ id<MTLTexture> MaliNewTexture(id<MTLDevice> dev, MTLTextureDescriptor *d, IOSurf
                          IOSurfaceGetID(s), (const char *)&(uint32_t){OSSwapHostToBigInt32(IOSurfaceGetPixelFormat(s))},
                          (unsigned long)plane, planes, (unsigned long)d.pixelFormat, (unsigned long)d.width,
                          (unsigned long)d.height, row, (unsigned long long)plane_off]);
-        /* rows that are not 64-byte multiples (CoreImage's 1,120-byte RGBA16F rows): aligned shadow, single-plane 2D only */
-        if ((row & 63) && !plane_off && planes <= 1 && d.textureType == MTLTextureType2D && d.mipmapLevelCount == 1 &&
+        /* rows that are not 64-byte multiples (CoreImage's 1,120-byte RGBA16F rows, 944-byte 420f snapshot planes):
+         * an aligned shadow of the plane, 2D only */
+        if ((row & 63) && d.textureType == MTLTextureType2D && d.mipmapLevelCount == 1 &&
             d.sampleCount == 1 && d.arrayLength == 1 && d.depth == 1) {
-            MaliSurfaceShadow *sh2 = shadow_for_surface(dev, s, fi.bytes_per_pixel);
+            MaliSurfaceShadow *sh2 = shadow_for_surface(dev, s, planes ? plane : 0, fi.bytes_per_pixel);
             if (!sh2) { [t maliRefuse:@"cannot create an aligned shadow for the IOSurface"]; return t; }
             [t maliAttachShadow:sh2];
+            if (plane_off && pbase) [t maliSetCPU:pbase bytes:alloc - plane_off];
             p.explicit_row_pitch = (uint32_t)sh2->_rowBytes;
             [t maliAttachLayout:&p ctx:ctx baseGPU:[(IOGPUMetalResource *)sh2->_buffer gpuAddress] available:sh2->_buffer.length];
             [t maliApplySwizzle:d.swizzle];
