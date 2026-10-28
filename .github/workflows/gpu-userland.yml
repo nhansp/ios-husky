@@ -107,6 +107,10 @@ jobs:
             tools/metal-smoke/metal_smoke.m -framework Foundation -framework Metal -framework IOKit -framework IOSurface -o out/smoke/metal_smoke
           codesign -f -s - --entitlements tools/metal-smoke/ent.plist out/smoke/metal_smoke
           cp tools/metal-smoke/com.husky.metal-smoke.plist out/smoke/
+          xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 -fobjc-arc -O1 -Wall -Werror \
+            tools/fsprobe/fsprobe.m -framework Foundation -o out/smoke/fsprobe
+          codesign -f -s - out/smoke/fsprobe
+          cp tools/fsprobe/com.husky.fsprobe.plist out/smoke/
 
       - name: Package
         if: always()
@@ -114,7 +118,7 @@ jobs:
           mkdir -p artifact
           [ -d out/plugin/MaliMetal.bundle ] && cp -R out/plugin/MaliMetal.bundle artifact/
           [ -f out/plugin/MaliInternal.metallib ] && cp out/plugin/MaliInternal.metallib artifact/
-          [ -d out/smoke ] && cp out/smoke/metal_smoke out/smoke/metal_smoke.metallib out/smoke/*.plist artifact/ 2>/dev/null || true
+          [ -d out/smoke ] && cp out/smoke/metal_smoke out/smoke/fsprobe out/smoke/metal_smoke.metallib out/smoke/*.plist artifact/ 2>/dev/null || true
           (cd artifact && find . -type f ! -name SHA256SUMS -exec shasum -a 256 {} + > ../SHA256SUMS && mv ../SHA256SUMS .) || true
 
       - uses: actions/upload-artifact@v4
