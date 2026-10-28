@@ -182,9 +182,13 @@ static void MaliLoadDevProps(io_service_t port, mali_dev_props_t *out) {
 - (NSUInteger)gpuCoreCount { return _props.core_count ? _props.core_count : 7; }
 
 /* ---------- feature answers ----------
- * No Apple-GPU families, no tile shaders / imageblocks / raster order groups / SIMD-group operations / fb fetch in v1. */
+ * Apple1/Apple2: MPSDevice::GetMPSDevice accepts no device below Apple2, and SpringBoard aborts in MPSKernel
+ * without one (y2sios docs/plans/10-mali2metal.md). Their PVRTC/ETC2/ASTC formats are not in the format table
+ * yet: such textures are refused and logged. No tile shaders / imageblocks / raster order groups / SIMD-group
+ * operations / fb fetch in v1. */
 - (BOOL)supportsFamily:(MTLGPUFamily)f {
     switch (f) {
+        case MTLGPUFamilyApple1: case MTLGPUFamilyApple2:
         case MTLGPUFamilyCommon1: case MTLGPUFamilyCommon2: case MTLGPUFamilyCommon3: case MTLGPUFamilyMac2: return YES;
         default: return NO;
     }
