@@ -1,0 +1,46 @@
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index be2252c..fcf561a 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -1143,6 +1143,15 @@ DebuggerXCallEnter(
+ 			if ((target_cpu_datap == NULL) || (target_cpu_datap == cpu_data_ptr)) {
+ 				continue;
+ 			}
++#if defined(HUSKY)
++			/* A CPU still coming up has no IPI route (PE_cpu_signal faults on its NULL cpu_id). */
++			if ((os_atomic_load(&target_cpu_datap->cpu_flags, relaxed) & (InitState | StartedState)) !=
++			    (InitState | StartedState)) {
++				kprintf("%s: cpu=%d not started (flags 0x%x signal 0x%x), skipped\n", __func__, cpu,
++				    target_cpu_datap->cpu_flags, target_cpu_datap->cpu_signal);
++				continue;
++			}
++#endif
+ 
+ 			kern_return_t ret = cpu_signal(target_cpu_datap, SIGPdebug, (void *)NULL, NULL);
+ 			if (ret == KERN_SUCCESS) {
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 48f9405..41047bc 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1271,6 +1271,21 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ 		sync_internal();
+ 	}
+ 
++#if defined(HUSKY)
++	/*
++	 * The panic string is printed only after the debugger cross-call, which can nest (an IPI
++	 * to a half-started CPU) and lose it: put the first one into pmsg through kprintf now.
++	 */
++	if (CPUDEBUGGERCOUNT == 0 && panic_format_str != NULL && panic_args != NULL) {
++		char hbuf[256];
++		va_list hargs;
++		va_copy(hargs, *panic_args);
++		vsnprintf(hbuf, sizeof(hbuf), panic_format_str, hargs);
++		va_end(hargs);
++		kprintf("HUSKY PANIC: %s (caller 0x%lx)\n", hbuf, panic_caller);
++	}
++#endif
++
+ 	/* Turn off I/O tracing once we've panicked */
+ 	iotrace_disable();
+ 
