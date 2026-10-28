@@ -142,3 +142,53 @@ index 389ea66..392c320 100644
  	return false;
  }
  
+diff --git a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+index 49a6d1e..ae8c399 100644
+--- a/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
++++ b/iokit/Families/IOGPU/IOGPUCommandQueue.cpp
+@@ -46,6 +46,35 @@ static uint64_t           gDoneGen;             /* every generation <= gDoneGen
+ static const uint32_t     kPollUS = 200;
+ static const uint64_t     kHangUS = 500000;
+ 
++/* Submit-to-retire latency, logged every 10 s while the GPU is busy (gPollLock). */
++static struct {
++	uint64_t t0, n, sum_us, max_us;
++	uint32_t hist[5];                       /* < 4, 8, 16, 33 ms, more */
++} gLat;
++
++static void
++lat_note(uint64_t now, uint64_t tSubmit)
++{
++	uint64_t us;
++	absolutetime_to_nanoseconds(now - tSubmit, &us);
++	us /= NSEC_PER_USEC;
++	gLat.n++;
++	gLat.sum_us += us;
++	gLat.max_us = us > gLat.max_us ? us : gLat.max_us;
++	gLat.hist[us < 4000 ? 0 : us < 8000 ? 1 : us < 16000 ? 2 : us < 33000 ? 3 : 4]++;
++	uint64_t ns;
++	absolutetime_to_nanoseconds(now - gLat.t0, &ns);
++	if (gLat.t0 == 0) {
++		gLat.t0 = now;
++	} else if (ns >= 10 * NSEC_PER_SEC) {
++		IOLog("HUSKY IOGPU: 10 s: %llu command buffers, latency avg %llu max %llu us, <4/8/16/33/more ms %u/%u/%u/%u/%u\n",
++		    gLat.n, gLat.sum_us / gLat.n, gLat.max_us, gLat.hist[0], gLat.hist[1], gLat.hist[2], gLat.hist[3],
++		    gLat.hist[4]);
++		bzero(&gLat, sizeof(gLat));
++		gLat.t0 = now;
++	}
++}
++
+ static uint64_t
+ deadline_in_us(uint64_t us)
+ {
+@@ -175,6 +204,9 @@ IOGPUCommandQueue::service(uint64_t now)
+ 			}
+ 			st = kIOGPUStatus_ParseError;       /* GPU timeout / hang treated as error */
+ 		}
++		if (p->target > 0) {
++			lat_note(now, p->tSubmit);
++		}
+ 		if (p->ref != 0 && fNotifQueue != NULL) {
+ 			fNotifQueue->enqueueCompletion(p->ref, p->t0, now, st, 0);
+ 		}
