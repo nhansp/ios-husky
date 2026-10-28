@@ -1,5 +1,5 @@
 diff --git a/bsd/vfs/kpi_vfs.c b/bsd/vfs/kpi_vfs.c
-index 272ad01..639ad18 100644
+index 272ad01..de47f9f 100644
 --- a/bsd/vfs/kpi_vfs.c
 +++ b/bsd/vfs/kpi_vfs.c
 @@ -86,6 +86,7 @@
@@ -10,12 +10,10 @@ index 272ad01..639ad18 100644
  #include <sys/stat.h>
  #include <sys/namei.h>
  #include <sys/ucred.h>
-@@ -2986,7 +2987,19 @@ vnode_getattr(vnode_t vp, struct vnode_attr *vap, vfs_context_t ctx)
- 
- 	if (!VATTR_IS_SUPPORTED(vap, va_flags)) {
- 		VATTR_RETURN(vap, va_flags, 0);
--	} else if (VATTR_IS_ACTIVE(vap, va_flags)) {
-+	}
+@@ -2993,6 +2994,18 @@ vnode_getattr(vnode_t vp, struct vnode_attr *vap, vfs_context_t ctx)
+ 			os_atomic_andnot(&vp->v_ext_flag, VE_APPENDONLY, relaxed);
+ 		}
+ 	}
 +#if defined(ARM64_BOARD_CONFIG_HUSKY)
 +	/*
 +	 * HUSKY's HFS+ is built without content protection (no AppleKeyStore): every file on a mount
@@ -27,10 +25,10 @@ index 272ad01..639ad18 100644
 +	    vp->v_mount != NULL && !(vfs_flags(vp->v_mount) & MNT_CPROTECT)) {
 +		VATTR_RETURN(vap, va_dataprotect_class, PROTECTION_CLASS_D);
 +	}
-+#endif else if (VATTR_IS_ACTIVE(vap, va_flags)) {
- 		if ((vap->va_flags & APPEND) && !is_appendonly) {
- 			os_atomic_or(&vp->v_ext_flag, VE_APPENDONLY, relaxed);
- 		} else if (!(vap->va_flags & APPEND) && is_appendonly) {
++#endif
+ 
+ 	if (!VATTR_IS_SUPPORTED(vap, va_filerev)) {
+ 		VATTR_RETURN(vap, va_filerev, 0);
 diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
 index e879e2a..f83e29b 100644
 --- a/bsd/vfs/vfs_attrlist.c
