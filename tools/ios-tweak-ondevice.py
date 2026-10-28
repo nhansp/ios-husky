@@ -411,6 +411,17 @@ def remove_file(dest, dry):
     print(f'removed {dest}')
 
 
+def rename_path(spec, dry):
+    src, sep, dst = spec.partition(':')
+    if not sep or not src.startswith('/') or not dst.startswith('/') or '..' in spec or "'" in spec:
+        sys.exit(f'--rename wants /SRC:/DST, got {spec}')
+    if dry:
+        print(f'[dry-run] would rename {src} -> {dst}')
+        return
+    su(f'mv "{MNT}{src}" "{MNT}{dst}"')
+    print(f'renamed {src} -> {dst}')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dry-run', action='store_true', help='mount read-only and report, write nothing')
@@ -429,6 +440,8 @@ def main():
                     help='copy a host file onto the iOS root, root:wheel (repeatable)')
     ap.add_argument('--remove-file', action='append', default=[], metavar='/DEST',
                     help='delete a file from the iOS root (repeatable)')
+    ap.add_argument('--rename', action='append', default=[], metavar='/SRC:/DST',
+                    help='rename a file or directory on the iOS root (repeatable)')
     ap.add_argument('--add-launchd-job', action='append', default=[], metavar='JOB.plist:/KEY',
                     help='add a job to the launchd cache, keyed by its plist path on the device (repeatable)')
     ap.add_argument('--remove-launchd-job', action='append', default=[], metavar='/KEY',
@@ -472,6 +485,8 @@ def main():
                 install_file(spec, args.dry_run)
             for dest in args.remove_file:
                 remove_file(dest, args.dry_run)
+            for spec in args.rename:
+                rename_path(spec, args.dry_run)
             for spec in args.add_launchd_job:
                 src, _, key = spec.partition(':')
                 if not key.startswith('/'):
