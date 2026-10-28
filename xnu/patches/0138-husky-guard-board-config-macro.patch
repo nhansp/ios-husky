@@ -1,0 +1,46 @@
+diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
+index b946022..e879e2a 100644
+--- a/bsd/vfs/vfs_attrlist.c
++++ b/bsd/vfs/vfs_attrlist.c
+@@ -2140,13 +2140,13 @@ attr_pack_common(vfs_context_t ctx, mount_t mp, vnode_t vp, struct attrlist *alp
+ 		}
+ 	}
+ 	if (alp->commonattr & ATTR_CMN_DATA_PROTECT_FLAGS) {
+-#if defined(HUSKY)
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
+ 		mount_t pmp = vp != NULLVP ? vnode_mount(vp) : mp;
+ #endif
+ 		if (VATTR_IS_SUPPORTED(vap, va_dataprotect_class)) {
+ 			ATTR_PACK4((*abp), vap->va_dataprotect_class);
+ 			abp->actual.commonattr |= ATTR_CMN_DATA_PROTECT_FLAGS;
+-#if defined(HUSKY)
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
+ 		} else if (pmp != NULL && !(vfs_flags(pmp) & MNT_CPROTECT)) {
+ 			/*
+ 			 * HUSKY's HFS+ is built without content protection (no AppleKeyStore), so every
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index fcf561a..0fef4d9 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -1143,7 +1143,7 @@ DebuggerXCallEnter(
+ 			if ((target_cpu_datap == NULL) || (target_cpu_datap == cpu_data_ptr)) {
+ 				continue;
+ 			}
+-#if defined(HUSKY)
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
+ 			/* A CPU still coming up has no IPI route (PE_cpu_signal faults on its NULL cpu_id). */
+ 			if ((os_atomic_load(&target_cpu_datap->cpu_flags, relaxed) & (InitState | StartedState)) !=
+ 			    (InitState | StartedState)) {
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 41047bc..1c58461 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1271,7 +1271,7 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ 		sync_internal();
+ 	}
+ 
+-#if defined(HUSKY)
++#if defined(ARM64_BOARD_CONFIG_HUSKY)
+ 	/*
+ 	 * The panic string is printed only after the debugger cross-call, which can nest (an IPI
+ 	 * to a half-started CPU) and lose it: put the first one into pmsg through kprintf now.
