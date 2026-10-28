@@ -1,0 +1,144 @@
+diff --git a/bsd/dev/husky_acpm.c b/bsd/dev/husky_acpm.c
+index efae10c..ea2fc0b 100644
+--- a/bsd/dev/husky_acpm.c
++++ b/bsd/dev/husky_acpm.c
+@@ -413,6 +413,40 @@ husky_tmu_read(uint32_t zone, int *celsius)
+  */
+ #define HUSKY_THROTTLE_KHZ      1500000u
+ 
++/*
++ * GPU operating points: zuma-gpu.dtsi gpu_dvfs_table_v1 (gpu1 shader clock, gpu0 top-level clock,
++ * MIF floor). Raising sets gpu0 first and lowering sets gpu1 first, so gpu0 >= gpu1 throughout
++ * (pixel_gpu_dvfs.c gpu_dvfs_set_new_level).
++ */
++static const struct {
++	uint32_t g3d, g3dl2, mif_min;
++} g3d_opps[] = {
++	{890000, 900000, 3172000}, {807000, 900000, 1716000}, {723000, 900000, 1352000},
++	{649000, 749000, 1352000}, {580000, 749000, 1352000}, {521000, 659000, 845000},
++	{467000, 659000, 845000}, {419000, 531000, 0}, {376000, 531000, 0},
++	{337000, 430000, 0}, {302000, 386000, 0}, {150000, 160000, 0},
++};
++#define G3D_OPP_COUNT           (sizeof(g3d_opps) / sizeof(g3d_opps[0]))
++#define G3D_OPP_THROTTLE        10u                     /* 302 MHz */
++static unsigned g3d_opp_cur = G3D_OPP_COUNT - 1, g3d_opp_req = G3D_OPP_COUNT - 1;
++static uint32_t g3d_mif_floor;
++
++static void
++g3d_set_opp(unsigned opp)
++{
++	if (opp == g3d_opp_cur) {
++		return;
++	}
++	if (opp < g3d_opp_cur) {
++		(void)husky_dvfs_set(HUSKY_DVFS_G3DL2, g3d_opps[opp].g3dl2);
++		(void)husky_dvfs_set(HUSKY_DVFS_G3D, g3d_opps[opp].g3d);
++	} else {
++		(void)husky_dvfs_set(HUSKY_DVFS_G3D, g3d_opps[opp].g3d);
++		(void)husky_dvfs_set(HUSKY_DVFS_G3DL2, g3d_opps[opp].g3dl2);
++	}
++	g3d_opp_cur = opp;
++}
++
+ static uint32_t dvfs_req_cl1, dvfs_req_cl2;
+ static bool boost_enabled;              /* touch boost below */
+ static bool boost_thermal_cap;          /* set by the thermal guard */
+@@ -422,7 +456,7 @@ husky_thermal_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	static const char *names[] = {"BIG", "MID", "LITTLE", "G3D"};
+ 	uint32_t hot = 70;
+-	bool throttled = false;
++	bool throttled = false, g3d_hot = false;
+ 	int chan;
+ 
+ 	(void)PE_parse_boot_argn("huskytemphot", &hot, sizeof(hot));
+@@ -441,6 +475,15 @@ husky_thermal_thread(__unused void *arg, __unused wait_result_t wr)
+ 			HU_LOG("HUSKY TEMP: %s %d %s %d %s %d %s %d C%s\n", names[0], t[0], names[1], t[1],
+ 			    names[2], t[2], names[3], t[3], throttled ? " (throttled)" : "");
+ 		}
++		if (!g3d_hot && g3d_opp_req < G3D_OPP_THROTTLE && t[3] >= (int)hot) {
++			g3d_hot = true;
++			g3d_set_opp(G3D_OPP_THROTTLE);
++			HU_LOG("HUSKY TEMP: G3D %d C >= %u: GPU to %u kHz\n", t[3], hot, g3d_opps[G3D_OPP_THROTTLE].g3d);
++		} else if (g3d_hot && t[3] < (int)hot - 10) {
++			g3d_hot = false;
++			g3d_set_opp(g3d_opp_req);
++			HU_LOG("HUSKY TEMP: G3D %d C: GPU back to %u kHz\n", t[3], g3d_opps[g3d_opp_req].g3d);
++		}
+ 		if (!throttled && cpu_max >= (int)hot) {
+ 			throttled = true;
+ 			boost_thermal_cap = true;
+@@ -493,6 +536,9 @@ static uint32_t
+ boost_rate(unsigned i, bool boost)
+ {
+ 	uint32_t khz = boost ? boost_levels[i].boost_khz : boost_levels[i].base_khz;
++	if (boost_levels[i].domain == HUSKY_DVFS_MIF && khz < g3d_mif_floor) {
++		khz = g3d_mif_floor;
++	}
+ 	if (boost) {
+ 		uint32_t req = 0;
+ 		if (boost_levels[i].domain == HUSKY_DVFS_CPUCL1 && dvfs_req_cl1) {
+@@ -577,6 +623,7 @@ static const struct {
+ 	{HUSKY_DVFS_CPUCL2, "CPUCL2 X3", "huskycl2"},
+ 	{HUSKY_DVFS_DSU, "DSU", "huskydsu"},
+ 	{HUSKY_DVFS_G3D, "G3D", NULL},
++	{HUSKY_DVFS_G3DL2, "G3DL2", NULL},
+ };
+ 
+ static void
+@@ -616,6 +663,26 @@ husky_dvfs_report(void)
+ 		HU_LOG("HUSKY DVFS: request %s %u kHz (err %d)\n", dvfs_domains[i].name, khz, err);
+ 		changed = true;
+ 	}
++	/* huskyg3d=<kHz>: GPU shader clock, rounded down to an operating point (default: ABL's 150 MHz) */
++	uint32_t g3d = 0;
++	if (PE_parse_boot_argn("huskyg3d", &g3d, sizeof(g3d)) && g3d != 0) {
++		unsigned opp = G3D_OPP_COUNT - 1;
++		while (opp > 0 && g3d_opps[opp - 1].g3d <= g3d) {
++			opp--;
++		}
++		g3d_opp_req = opp;
++		g3d_mif_floor = g3d_opps[opp].mif_min;
++		if (g3d_mif_floor) {
++			(void)husky_dvfs_set(HUSKY_DVFS_MIF, g3d_mif_floor);
++		}
++		g3d_opp_cur = G3D_OPP_COUNT;            /* unknown: write both clocks */
++		(void)husky_dvfs_set(HUSKY_DVFS_G3DL2, g3d_opps[opp].g3dl2);
++		(void)husky_dvfs_set(HUSKY_DVFS_G3D, g3d_opps[opp].g3d);
++		g3d_opp_cur = opp;
++		HU_LOG("HUSKY DVFS: request GPU %u/%u kHz (shader/top), MIF floor %u\n", g3d_opps[opp].g3d,
++		    g3d_opps[opp].g3dl2, g3d_mif_floor);
++		changed = true;
++	}
+ 	if (changed) {
+ 		delay(50000);
+ 		dvfs_log("after request");
+diff --git a/bsd/dev/husky_acpm.h b/bsd/dev/husky_acpm.h
+index 62039b5..17efed2 100644
+--- a/bsd/dev/husky_acpm.h
++++ b/bsd/dev/husky_acpm.h
+@@ -33,7 +33,8 @@ int husky_pmic_update(uint8_t type, uint8_t reg, uint8_t val, uint8_t mask);
+ #define HUSKY_DVFS_CPUCL2       4u      /* 1x Cortex-X3 */
+ #define HUSKY_DVFS_DSU          5u
+ #define HUSKY_DVFS_BCI          6u
+-#define HUSKY_DVFS_G3D          7u
++#define HUSKY_DVFS_G3D          7u      /* shader cores (gpu1) */
++#define HUSKY_DVFS_G3DL2        8u      /* top level and L2 (gpu0), kept >= G3D */
+ 
+ /* Current rate of a DVFS domain in kHz, and a rate request (no reply). */
+ int husky_dvfs_get(uint32_t domain, uint32_t *khz);
+diff --git a/iokit/Families/IOGPU/IOGPU.cpp b/iokit/Families/IOGPU/IOGPU.cpp
+index 389ea66..392c320 100644
+--- a/iokit/Families/IOGPU/IOGPU.cpp
++++ b/iokit/Families/IOGPU/IOGPU.cpp
+@@ -46,6 +46,10 @@ iogpu_client_allowed(void)
+ 		}
+ 		p += len + (end ? 1 : 0);
+ 	}
++	static uint32_t refused;
++	if (refused++ < 32) {
++		IOLog("HUSKY IOGPU: %s refused (huskygpuclients)\n", name);
++	}
+ 	return false;
+ }
+ 
