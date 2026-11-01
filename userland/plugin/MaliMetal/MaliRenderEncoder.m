@@ -115,6 +115,10 @@ static void fill_attachment(mali_attachment_t *a, MTLRenderPassAttachmentDescrip
         case MTLStoreActionStore: case MTLStoreActionStoreAndMultisampleResolve: case MTLStoreActionUnknown: a->store = MALI_STORE_STORE; break;
         default: a->store = MALI_STORE_DONTCARE;
     }
+    if ([t maliMemoryless]) {                              /* Metal allows neither Load nor Store on memoryless */
+        if (a->load == MALI_LOAD_LOAD) a->load = MALI_LOAD_DONTCARE;
+        a->store = MALI_STORE_DONTCARE;
+    }
     const BOOL resolve = d.storeAction == MTLStoreActionMultisampleResolve || d.storeAction == MTLStoreActionStoreAndMultisampleResolve;
     if (resolve && d.resolveTexture) {
         MaliTexture *r = [d.resolveTexture isKindOfClass:[MaliTexture class]] ? (MaliTexture *)d.resolveTexture : nil;

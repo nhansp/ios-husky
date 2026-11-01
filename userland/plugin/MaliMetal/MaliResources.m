@@ -279,10 +279,13 @@ static BOOL params_from_descriptor(MTLTextureDescriptor *d, mali_texture_params_
     BOOL _usageKnown;
     id _keepAlive;                       /* the buffer a linear texture aliases */
     NSString *_why;
+    BOOL _memoryless;
 }
 - (void)dealloc { if (_mt) mali_texture_free(_mt); }
 - (mali_texture_t *)maliTexture { return _mt; }
 - (id)maliShadow { return _shadow; }
+- (BOOL)maliMemoryless { return _memoryless; }
+- (void)maliSetMemoryless { _memoryless = YES; }
 - (id)maliBackingResource { return _shadow ? (id)_shadow->_buffer : (id)self; }
 - (void)maliPrepareForGPUUse { [_shadow syncIfNeeded]; }
 - (MTLTextureUsage)usage { return _usageKnown ? _usage : [super usage]; }
@@ -526,6 +529,14 @@ id<MTLTexture> MaliNewTexture(id<MTLDevice> dev, MTLTextureDescriptor *d, IOSurf
                                                     args:&a argsSize:sizeof a];
     if (!t) return nil;
     [t maliSetUsage:d.usage];
+    /* IOGPUMetal gives memoryless textures no pages (resourceSize 0, bootJ SpringBoard): the pass keeps them in the
+     * tile buffer and never stores them */
+    if (d.storageMode == MTLStorageModeMemoryless) {
+        [t maliSetMemoryless];
+        [t maliAttachLayout:&p ctx:ctx baseGPU:0 available:need];
+        [t maliApplySwizzle:d.swizzle];
+        return t;
+    }
     [t maliAttachLayout:&p ctx:ctx baseGPU:t.gpuAddress available:[t resourceSize]];
     [t maliApplySwizzle:d.swizzle];
     void *va = [t virtualAddress];

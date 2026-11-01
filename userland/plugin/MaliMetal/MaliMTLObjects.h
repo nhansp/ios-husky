@@ -72,6 +72,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (id)maliBackingResource;
 - (void)maliPrepareForGPUUse;                      /* refill the shadow from the IOSurface if the CPU changed it */
 - (nullable id)maliShadow;                         /* MaliSurfaceShadow, or nil */
+- (BOOL)maliMemoryless;                            /* tile memory only: a layout without pages */
 @end
 
 @interface MaliSamplerState : _MTLSamplerState <MTLSamplerState>

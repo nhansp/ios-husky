@@ -212,6 +212,7 @@ static const mali_arena_ops_t kArenaOps = {.new_chunk = arena_new_chunk};
 }
 - (void)maliUseResource:(id)resource usage:(MTLResourceUsage)usage {
     if (!resource || _failed) return;
+    if ([resource isKindOfClass:[MaliTexture class]] && [(MaliTexture *)resource maliMemoryless]) return;
     id backing = MaliGPUBacking(resource);               /* an IOSurface texture's GPU resource is its aligned shadow */
     if (backing != resource) [_held addObject:backing];
     if (usage & MTLResourceUsageWrite) [self maliNoteShadowWrite:MaliShadowOfBacking(backing)];
