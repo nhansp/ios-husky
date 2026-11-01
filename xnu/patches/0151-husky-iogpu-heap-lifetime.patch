@@ -1,0 +1,139 @@
+diff --git a/bsd/dev/husky_ufs.c b/bsd/dev/husky_ufs.c
+index 07ed3cf..838ce3e 100644
+--- a/bsd/dev/husky_ufs.c
++++ b/bsd/dev/husky_ufs.c
+@@ -44,6 +44,7 @@
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
++#include <kern/thread_call.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <arm/memory_types.h>             /* VM_WIMG_COPYBACK */
+@@ -822,13 +823,32 @@ husky_log_final_flush(void)
+  * unmounted, so the HFS+ journal is empty), then HuskyPlatformExpert resets
+  * the SoC with PSCI SYSTEM_RESET and ABL starts Android. No force-reboot.
+  */
++#define HUSKY_REBOOT_STUCK_SECS 60   /* proc_shutdown alone may take 2 x (3 + 10) s */
++
++/* bootJ: the root unmount blocked forever after a GPU wedge, and only a force-reboot got Android back. */
++static void
++husky_reboot_stuck(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	HU_LOG("HUSKY REBOOT: reboot_kernel still running after %u s, PSCI SYSTEM_RESET\n", HUSKY_REBOOT_STUCK_SECS);
++	husky_log_final_flush();
++	register uint64_t x0 __asm__("x0") = 0x84000009ULL;   /* SYSTEM_RESET */
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++}
++
+ static void
+ husky_reboot_thread(void *arg, __unused wait_result_t wr)
+ {
+ 	uint32_t secs = (uint32_t)(uintptr_t)arg;
++	uint64_t deadline;
+ 
+ 	(void)tsleep(&husky_log_chan, PZERO, "huskyreboot", hz * (int)secs);
+ 	HU_LOG("HUSKY REBOOT: clean reboot after %u s (huskyreboot)\n", secs);
++	thread_call_t stuck = thread_call_allocate_with_options(husky_reboot_stuck, NULL, THREAD_CALL_PRIORITY_KERNEL,
++	    THREAD_CALL_OPTIONS_ONCE);
++	clock_interval_to_deadline(HUSKY_REBOOT_STUCK_SECS, NSEC_PER_SEC, &deadline);
++	if (stuck != NULL) {
++		(void)thread_call_enter_delayed(stuck, deadline);
++	}
+ 	(void)reboot_kernel(RB_AUTOBOOT, NULL);
+ 	HU_LOG("HUSKY REBOOT: reboot_kernel returned\n");
+ }
+diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+index af396d1..fbf117f 100644
+--- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
++++ b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
+@@ -1541,6 +1541,8 @@ fail:
+ 	return st;
+ }
+ 
++static void vm_free_retired_heaps(mali_vm_t *vm);
++
+ static void
+ op_queue_destroy(mali_queue_t *q)
+ {
+@@ -1570,6 +1572,7 @@ op_queue_destroy(mali_queue_t *q)
+ 	}
+ 	queue_free_buffers(q);
+ 	queue_put_stream(q);
++	vm_free_retired_heaps(q->vm);
+ 	lck_mtx_unlock(&g_grp_lock);
+ 	lck_mtx_free(q->lock, &g_bridge_grp);
+ 	kfree_data(q, sizeof(mali_queue_t));
+@@ -1887,6 +1890,7 @@ struct mali_tiler_heap {
+ 	mali_bo_t  *ctx;
+ 	mali_bo_t **chunks;
+ 	uint32_t    n_chunks, max_chunks, chunk_size;
++	bool        retired;    /* destroyed by its queue; freed when the VM's stream stops */
+ };
+ 
+ static void
+@@ -1957,21 +1961,59 @@ op_tiler_heap_create(mali_vm_t *vm, uint32_t chunk_size, uint32_t initial_chunks
+ 	return 0;
+ }
+ 
++/*
++ * The VM's queues share one stream, and HEAP_SET leaves the CS pointing at the last heap it set: a queue's
++ * heap freed while another queue keeps the stream is written by the tiler after it is unmapped (bootE, bootJ:
++ * AS translation fault at the heap context, then the stream never acks STOP).
++ */
+ static void
+ op_tiler_heap_destroy(mali_tiler_heap_t *heap)
+ {
+ 	if (heap == NULL) {
+ 		return;
+ 	}
++	lck_mtx_lock(&g_grp_lock);
++	const bool stream_live = heap->vm->group != NULL && heap->vm->group->queue != NULL;
+ 	lck_mtx_lock(&g_vm_lock);
+-	for (mali_tiler_heap_t **p = &heap->vm->heaps; *p != NULL; p = &(*p)->next) {
+-		if (*p == heap) {
+-			*p = heap->next;
+-			break;
++	if (stream_live) {
++		heap->retired = true;
++	} else {
++		for (mali_tiler_heap_t **p = &heap->vm->heaps; *p != NULL; p = &(*p)->next) {
++			if (*p == heap) {
++				*p = heap->next;
++				break;
++			}
++		}
++	}
++	lck_mtx_unlock(&g_vm_lock);
++	lck_mtx_unlock(&g_grp_lock);
++	if (!stream_live) {
++		tiler_heap_free(heap);
++	}
++}
++
++/* g_grp_lock held, the VM's stream stopped */
++static void
++vm_free_retired_heaps(mali_vm_t *vm)
++{
++	mali_tiler_heap_t *dead = NULL;
++	lck_mtx_lock(&g_vm_lock);
++	for (mali_tiler_heap_t **p = &vm->heaps; *p != NULL;) {
++		mali_tiler_heap_t *h = *p;
++		if (h->retired) {
++			*p = h->next;
++			h->next = dead;
++			dead = h;
++		} else {
++			p = &h->next;
+ 		}
+ 	}
+ 	lck_mtx_unlock(&g_vm_lock);
+-	tiler_heap_free(heap);
++	while (dead != NULL) {
++		mali_tiler_heap_t *h = dead;
++		dead = h->next;
++		tiler_heap_free(h);
++	}
+ }
+ 
+ /*
