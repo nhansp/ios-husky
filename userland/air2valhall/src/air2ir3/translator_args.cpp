@@ -250,7 +250,11 @@ inline void Translator::setupArgs() {
     else if (a.kind == "air.instance_id") { vals[A] = coerce({nir_load_instance_id(&b)}, A->getType()); R.sysvals.push_back("instance_id"); }
     else if (a.kind == "air.base_vertex") { vals[A] = coerce({nir_load_base_vertex(&b)}, A->getType()); R.sysvals.push_back("base_vertex"); }
     else if (a.kind == "air.base_instance") { vals[A] = coerce({nir_load_base_instance(&b)}, A->getType()); R.sysvals.push_back("base_instance"); }
-    else if (a.kind == "air.front_facing") { vals[A] = {nir_load_front_face(&b, 1)}; R.sysvals.push_back("front_facing"); }
+    else if (a.kind == "air.front_facing") {
+      // metalfe passes `bool [[front_facing]]` as i8 (RenderBox path_interior_fragment)
+      nir_def *ff = nir_load_front_face(&b, 1);
+      vals[A] = {A->getType()->isIntegerTy(1) ? ff : nir_b2iN(&b, ff, bits(A->getType()))}; R.sysvals.push_back("front_facing");
+    }
     else if (a.kind == "air.sample_id") { vals[A] = coerce({nir_load_sample_id(&b)}, A->getType()); R.sysvals.push_back("sample_id"); }
     else if (a.kind == "air.point_coord") {
       // Valhall (arch >= 6): pan_nir_lower_var_special_pan lowers load_point_coord to
