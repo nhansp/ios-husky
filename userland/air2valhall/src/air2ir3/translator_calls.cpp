@@ -71,6 +71,54 @@ inline std::vector<nir_def *> Translator::callAir(CallInst *CI) {
   auto narrow = [&](nir_def *x, nir_def *r) { return x->bit_size == 16 ? nir_f2f16(&b, r) : r; };
   UN("dfdx", narrow(x, nir_ddx(&b, wide(x)))) UN("dfdy", narrow(x, nir_ddy(&b, wide(x))))
   UN("fwidth", narrow(x, nir_fadd(&b, nir_fabs(&b, nir_ddx(&b, wide(x))), nir_fabs(&b, nir_ddy(&b, wide(x))))))
+  // round: half away from zero (rint is the even one); x - trunc(x) is exact
+  UN("round", ([&] { nir_def *t = nir_ftrunc(&b, x);
+    return nir_bcsel(&b, nir_fge_imm(&b, nir_fabs(&b, nir_fsub(&b, x, t)), 0.5), nir_fadd(&b, t, nir_fsign(&b, x)), t); }()))
+  UN("tan", narrow(x, nir_ftan(&b, wide(x)))) UN("asin", narrow(x, nir_asin(&b, wide(x))))
+  UN("acos", narrow(x, nir_fsub(&b, nir_imm_float(&b, 1.57079632679489661923f), nir_asin(&b, wide(x)))))
+  UN("atan", narrow(x, nir_atan(&b, wide(x))))
+  // sinh/tanh: below 2^-12 the exponential difference cancels to 0 where the answer is x
+  UN("sinh", narrow(x, ([&] { nir_def *w = wide(x);
+    nir_def *e = nir_fmul_imm(&b, nir_fsub(&b, nir_fexp(&b, w), nir_fexp(&b, nir_fneg(&b, w))), 0.5);
+    return nir_bcsel(&b, nir_flt_imm(&b, nir_fabs(&b, w), 1.0 / 4096), w, e); }())))
+  UN("cosh", narrow(x, nir_fmul_imm(&b, nir_fadd(&b, nir_fexp(&b, wide(x)), nir_fexp(&b, nir_fneg(&b, wide(x)))), 0.5)))
+  UN("tanh", narrow(x, ([&] { nir_def *w = wide(x);
+    return nir_bcsel(&b, nir_flt_imm(&b, nir_fabs(&b, w), 1.0 / 4096), w, nir_tanh_emulated(&b, w)); }())))
+  UN("exp10", nir_fexp2(&b, nir_fmul_imm(&b, x, 3.32192809488736234787)))
+  UN("log10", nir_fmul_imm(&b, nir_flog2(&b, x), 0.30102999566398119521))
+  BIN("fmod", nir_frem(&b, x, y)) BIN("mod", nir_frem(&b, x, y))
+  if (base("ldexp") || base("fast_ldexp")) return perComp([&](auto p) { return nir_ldexp(&b, p(0), nir_i2i32(&b, p(1))); }, 2);
+  if (base("mad") || base("fast_mad")) return perComp([&](auto p) { return nir_fadd(&b, nir_fmul(&b, p(0), p(1)), p(2)); }, 3);
+  if (base("fmedian3") || base("fast_fmedian3"))
+    return perComp([&](auto p) { return nir_fmax(&b, nir_fmin(&b, p(0), p(1)), nir_fmin(&b, nir_fmax(&b, p(0), p(1)), p(2))); }, 3);
+  if (starts("air.median3.s.")) return perComp([&](auto p) { return nir_imax(&b, nir_imin(&b, p(0), p(1)), nir_imin(&b, nir_imax(&b, p(0), p(1)), p(2))); }, 3);
+  if (starts("air.median3.u.")) return perComp([&](auto p) { return nir_umax(&b, nir_umin(&b, p(0), p(1)), nir_umin(&b, nir_umax(&b, p(0), p(1)), p(2))); }, 3);
+  // integer bit ops: the Valhall lowering wants 32-bit sources
+  auto in32 = [&](nir_def *x) { return x->bit_size == 32 ? x : nir_u2u32(&b, x); };
+  auto out = [&](nir_def *x, nir_def *r) { return r->bit_size == x->bit_size ? r : nir_u2uN(&b, r, x->bit_size); };
+  if (base("popcount")) return perComp([&](auto p) { nir_def *x = p(0); return out(x, nir_bit_count(&b, in32(x))); }, 1);
+  if (base("clz")) return perComp([&](auto p) { nir_def *x = p(0); return nir_clz_u(&b, x); }, 1);
+  if (base("ctz")) return perComp([&](auto p) { nir_def *x = p(0); return nir_ctz_u(&b, x); }, 1);
+  if (base("reverse_bits")) return perComp([&](auto p) { nir_def *x = p(0);
+    nir_def *r = nir_bitfield_reverse(&b, in32(x));
+    return out(x, x->bit_size == 32 ? r : nir_ushr_imm(&b, r, 32 - x->bit_size)); }, 1);
+  if (base("rotate")) return perComp([&](auto p) { nir_def *x = p(0); unsigned w = x->bit_size;
+    nir_def *n = nir_iand_imm(&b, nir_u2u32(&b, p(1)), w - 1);
+    return nir_ior(&b, nir_ishl(&b, x, n), nir_ushr(&b, x, nir_iand_imm(&b, nir_isub_imm(&b, w, n), w - 1))); }, 2);
+  if (starts("air.mul_hi.s.")) return perComp([&](auto p) { return nir_imul_high(&b, p(0), p(1)); }, 2);
+  if (starts("air.mul_hi.u.")) return perComp([&](auto p) { return nir_umul_high(&b, p(0), p(1)); }, 2);
+  if (starts("air.add_sat.s.")) return perComp([&](auto p) { return nir_iadd_sat(&b, p(0), p(1)); }, 2);
+  if (starts("air.add_sat.u.")) return perComp([&](auto p) { return nir_uadd_sat(&b, p(0), p(1)); }, 2);
+  if (starts("air.sub_sat.s.")) return perComp([&](auto p) { return nir_isub_sat(&b, p(0), p(1)); }, 2);
+  if (starts("air.sub_sat.u.")) return perComp([&](auto p) { return nir_usub_sat(&b, p(0), p(1)); }, 2);
+  if (starts("air.extract_bits.s.") || starts("air.extract_bits.u.")) {
+    const bool sgn = starts("air.extract_bits.s.");
+    return perComp([&](auto p) { nir_def *x = p(0), *o = nir_u2u32(&b, p(1)), *c = nir_u2u32(&b, p(2));
+      nir_def *v = sgn ? (x->bit_size == 32 ? x : nir_i2i32(&b, x)) : in32(x);
+      return out(x, sgn ? nir_ibitfield_extract(&b, v, o, c) : nir_ubitfield_extract(&b, v, o, c)); }, 3);
+  }
+  if (base("insert_bits")) return perComp([&](auto p) { nir_def *x = p(0);
+    return out(x, nir_bitfield_insert(&b, in32(x), in32(p(1)), nir_u2u32(&b, p(2)), nir_u2u32(&b, p(3)))); }, 4);
   BIN("fmax", nir_fmax(&b, x, y)) BIN("fmin", nir_fmin(&b, x, y))
   BIN("pow", nir_fpow(&b, x, y)) BIN("powr", nir_fpow(&b, x, y)) BIN("atan2", nir_atan2(&b, x, y))
   if (base("fmax3") || base("fast_fmax3")) return perComp([&](auto p) { return nir_fmax(&b, p(0), nir_fmax(&b, p(1), p(2))); }, 3);
