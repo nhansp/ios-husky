@@ -1,0 +1,53 @@
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index e035851..e253378 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -2318,6 +2318,14 @@ kern_feature_override_apply(const char *args)
+ #endif /* SCHED_HYGIENE_DEBUG */
+ }
+ STATIC_IF_INIT(kern_feature_override_apply);
++#if defined(HUSKY)
++void husky_kfo_direct(const char *args);
++void
++husky_kfo_direct(const char *args)
++{
++	kern_feature_override_apply(args);
++}
++#endif
+ 
+ boolean_t
+ kern_feature_override(uint32_t fmask)
+diff --git a/osfmk/kern/static_if_common.c b/osfmk/kern/static_if_common.c
+index 967dc08..ba0ea33 100644
+--- a/osfmk/kern/static_if_common.c
++++ b/osfmk/kern/static_if_common.c
+@@ -271,15 +271,25 @@ static_if_init(const char *args)
+ #endif
+ 
+ #if defined(HUSKY)
+-	/* bootK (DP11 bootloader): the last crumb on every boot was "chain loop done" */
++	/* bootK/L (DP11 bootloader): every boot stops between here and kern_feature_override_apply's first crumb */
+ 	extern void husky_vp_hex(const char *label, uint64_t v);
+-	uint64_t ia_lo, ia_hi, sctlr;
+-	__asm__ volatile ("mrs %0, S3_0_c2_c1_0; mrs %1, S3_0_c2_c1_1; mrs %2, sctlr_el1"
+-	    : "=r" (ia_lo), "=r" (ia_hi), "=r" (sctlr));
++	extern void husky_kfo_direct(const char *args);
++	uint64_t ia_lo, ia_hi, sctlr, tcr, pfr1, t0;
++	__asm__ volatile ("mrs %0, S3_0_c2_c1_0\n\tmrs %1, S3_0_c2_c1_1\n\tmrs %2, sctlr_el1\n\t"
++	    "mrs %3, tcr_el1\n\tmrs %4, id_aa64pfr1_el1\n\tmrs %5, cntvct_el0"
++	    : "=&r" (ia_lo), "=&r" (ia_hi), "=&r" (sctlr), "=&r" (tcr), "=&r" (pfr1), "=&r" (t0));
+ 	husky_vp_hex("  sif apiakey lo", ia_lo);
+ 	husky_vp_hex("  sif apiakey hi", ia_hi);
+ 	husky_vp_hex("  sif sctlr_el1", sctlr);
++	husky_vp_hex("  sif tcr_el1", tcr);
++	husky_vp_hex("  sif pfr1", pfr1);
+ 	husky_vp_hex("  sif n", (uint64_t)(__static_if_initializer_entries_end - __static_if_initializer_entries));
++	uint64_t t1;
++	__asm__ volatile ("isb\n\tmrs %0, cntvct_el0" : "=r" (t1));
++	husky_vp_hex("  sif ticks for 6 crumbs", t1 - t0);
++	husky_vp_bc("  sif: direct kern_feature_override_apply\n");
++	husky_kfo_direct(args);
++	husky_vp_bc("  sif: direct returned\n");
+ #endif
+ 	for (static_if_initializer *f = __static_if_initializer_entries;
+ 	    f < __static_if_initializer_entries_end; f++) {
