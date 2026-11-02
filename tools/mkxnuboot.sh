@@ -57,5 +57,15 @@ print(f'   kernel-xnu: {len(b)} bytes (image_size patched)')
 PY
 echo ">> packing boot image"
 python3 "$MKBOOTIMG" --header_version 4 --kernel out/boot/kernel-xnu -o "$OUT"
+# ABL verifies a fastboot-booted image against root vbmeta's boot chain whenever vbmeta keeps verification on
+# (an OTA rewrites vbmeta that way): with no AVB footer it drops back to fastboot before the first instruction.
+# Unlocked, a footer signed with any key passes. AVB_ROLLBACK/AVB_PROPS: copy them from the stock boot footer.
+if [[ -n "${AVBTOOL:-}" && -n "${AVBKEY:-}" ]]; then
+	props=()
+	for kv in ${AVB_PROPS:-}; do props+=(--prop "$kv"); done
+	python3 -I "$AVBTOOL" add_hash_footer --image "$OUT" --partition_name boot --partition_size $((64 << 20)) \
+		--algorithm SHA256_RSA4096 --key "$AVBKEY" --rollback_index "${AVB_ROLLBACK:-0}" "${props[@]}"
+	echo ">> AVB hash footer added"
+fi
 ls -l "$OUT" out/boot/payload.bin
 echo ">> deliver with:  fastboot boot $OUT"
