@@ -4,8 +4,13 @@
  */
 #import "MaliBindings.h"
 
+static uint32_t gNullTexDesc[8];
+static bool gNullTex;
+void MaliSetNullTextureDesc(const uint32_t desc[8]) { memcpy(gNullTexDesc, desc, sizeof gNullTexDesc); gNullTex = true; }
+
 void MaliBindsInit(mali_stage_binds_t *b) {
     memset(b, 0, sizeof *b);
+    if (gNullTex) { memcpy(b->null_tex_desc, gNullTexDesc, sizeof gNullTexDesc); b->null_tex = true; }
     /* the dummy sampler (T3[16], VH-ABI 1) is read by every stage: nearest, clamp to edge, no anisotropy */
     mali_sampler_params_t p;
     memset(&p, 0, sizeof p);

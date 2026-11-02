@@ -13,6 +13,7 @@
  *   -featureProfile.
  */
 #import "MaliMTLObjectsPrivate.h"
+#import "MaliBindings.h"
 #import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
 #import <sys/sysctl.h>
@@ -104,6 +105,8 @@ static void MaliLoadDevProps(io_service_t port, mali_dev_props_t *out) {
     MaliExecPool *_execPool;
     MaliInternalShaders *_internal;
     NSLock *_lazyLock;
+    id<MTLTexture> _nullTex;
+    id<MTLBuffer> _nullTexPayload;
 }
 
 - (instancetype)initWithAcceleratorPort:(io_service_t)port {
@@ -131,9 +134,41 @@ static void MaliLoadDevProps(io_service_t port, mali_dev_props_t *out) {
            _props.gpu_id, _shaderCompiler.compilerID ?: @"none");
     MaliDiagLine([NSString stringWithFormat:@"device up port=0x%x gpu_id=0x%llx cores=%u compiler=%@", port, _props.gpu_id, _props.core_count,
                   _shaderCompiler.compilerID ?: @"none"]);
+    [self maliMakeNullTexture];
     MaliConsole("MaliMetal: device up in %s, gpu_id 0x%llx, compiler %s\n", getprogname(), (unsigned long long)_props.gpu_id,
                 (_shaderCompiler.compilerID ?: @"none").UTF8String);
     return self;
+}
+
+typedef struct { void *cpu; uint64_t gpu; uint32_t size; bool given; } MaliOneChunk;
+static bool one_chunk(void *ctx, uint32_t min_size, mali_gpu_ptr_t *out, uint32_t *size_out) {
+    MaliOneChunk *c = ctx;
+    if (c->given || min_size > c->size) return false;
+    c->given = true;
+    out->cpu = c->cpu; out->gpu = c->gpu; *size_out = c->size;
+    return true;
+}
+
+- (void)maliMakeNullTexture {
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModeShared;
+    id<MTLTexture> t = [self newTextureWithDescriptor:d];
+    _nullTexPayload = MaliNewGPUBuffer(self, 4096, MALI_BO_GPU_READ | MALI_BO_CPU_MAP | MALI_BO_NONCACHEABLE);
+    if (![t isKindOfClass:[MaliTexture class]] || ![(MaliTexture *)t maliTexture] || !_nullTexPayload.contents) {
+        MaliConsole("MaliMetal: no null texture: unbound texture slots read zero descriptors\n");
+        return;
+    }
+    static const uint32_t transparent = 0;
+    [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&transparent bytesPerRow:4];
+    MaliOneChunk c = {_nullTexPayload.contents, [(IOGPUMetalBuffer *)_nullTexPayload gpuAddress], (uint32_t)_nullTexPayload.length, false};
+    static const mali_arena_ops_t ops = {.new_chunk = one_chunk};
+    mali_arena_t a;
+    mali_arena_init(&a, &ops, &c);
+    uint32_t desc[8];
+    if (!mali_emit_sampled_texture([(MaliTexture *)t maliTexture], &a, desc)) return;
+    MaliSetNullTextureDesc(desc);
+    _nullTex = t;
 }
 
 - (const mali_ctx_t *)maliCtx { return &_ctx; }

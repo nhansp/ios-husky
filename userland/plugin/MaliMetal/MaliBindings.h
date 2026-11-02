@@ -12,6 +12,8 @@
 NS_ASSUME_NONNULL_BEGIN
 
 void MaliBindsInit(mali_stage_binds_t *b);
+/* the device's 1x1 transparent texture, sampled by every unbound texture slot */
+void MaliSetNullTextureDesc(const uint32_t desc[_Nonnull 8]);
 /* bound buffer: VA incl. offset, remaining size; also lists the resource for the segment */
 void MaliBindBuffer(mali_stage_binds_t *b, MaliCommandBuffer *cb, NSUInteger index, id<MTLBuffer> _Nullable buf, NSUInteger offset);
 void MaliBindBufferOffset(mali_stage_binds_t *b, NSUInteger index, NSUInteger offset, id<MTLBuffer> _Nullable bound);

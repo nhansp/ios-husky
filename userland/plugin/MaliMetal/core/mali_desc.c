@@ -458,13 +458,20 @@ mali_build_srt(mali_arena_t *a, const air2vh_program *prog, const mali_stage_bin
                     if (i < MALI_MAX_BUFFERS && b->buf_gpu[i])
                         mali_emit_buffer_desc(b->buf_gpu[i], b->buf_size[i], d[i]);
                     break;
+                /* RenderBox's uber_fragment samples slots it never binds; an all-zero descriptor is
+                 * not a valid texture or sampler (hakios-dada air_metal.c: 1x1 transparent texture,
+                 * normalized default sampler) */
                 case AIR2VH_T_TEXTURES:
                     if (i < MALI_MAX_TEXTURES && (b->tex_mask & (1u << i)))
                         memcpy(d[i], b->tex_desc[i], 32);
+                    else if (i < MALI_MAX_TEXTURES && b->null_tex)
+                        memcpy(d[i], b->null_tex_desc, 32);
                     break;
                 case AIR2VH_T_SAMPLERS:
-                    if (i <= MALI_MAX_SAMPLERS && (i == MALI_DUMMY_SAMPLER || (b->samp_mask & (1u << i))))
+                    if (i < MALI_MAX_SAMPLERS && (b->samp_mask & (1u << i)))
                         memcpy(d[i], b->samp_desc[i], 32);
+                    else if (i <= MALI_MAX_SAMPLERS)
+                        memcpy(d[i], b->samp_desc[MALI_DUMMY_SAMPLER], 32);
                     break;
                 case AIR2VH_T_STORAGE:
                     if (i < MALI_MAX_TEXTURES && (b->stex_mask & (1u << i)))

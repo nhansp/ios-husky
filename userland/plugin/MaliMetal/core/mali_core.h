@@ -310,6 +310,8 @@ typedef struct mali_stage_binds {
     uint32_t samp_desc[MALI_MAX_SAMPLERS + 1][8]; /* [16] = dummy sampler (always valid) */
     uint32_t samp_mask;
     uint32_t tg_mem_len[MALI_MAX_BUFFERS];    /* threadgroup(n) lengths, compute only */
+    uint32_t null_tex_desc[8];                /* sampled by unbound texture slots when null_tex */
+    bool     null_tex;
 } mali_stage_binds_t;
 
 /* Build T0..T4 and the 8-entry SRT for one program; returns the SRT register
