@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # boot-180.sh TAG KERNELDIR USERLANDDIR [extra boot-args]: install MaliMetal (keeping the -h shader pack), boot, collect
-# pmsg, huskylog and the plug-in's per-process diag files.
+# pmsg, huskylog and the plug-in's per-process diag files. EXTRA_INSTALL="SRC:/DEST:MODE ...": more files to install.
 set -u
 cd /home/nhansp/aosp/ios-husky
 S=3A110DLJG0019U
@@ -17,6 +17,7 @@ for attempt in 1 2 3; do
 		--install-file $G/MaliMetal.bundle/_CodeSignature/CodeResources:/System/Library/Extensions/MaliMetal.bundle/_CodeSignature/CodeResources:644 \
 		--install-file $P:/System/Library/Extensions/MaliMetal.bundle/shaders.mvpack:644 \
 		$( [ -f $G/MaliMetal.bundle/Frameworks/libMaliCompiler.dylib ] && echo --install-file $G/MaliMetal.bundle/Frameworks/libMaliCompiler.dylib:/System/Library/Extensions/MaliMetal.bundle/Frameworks/libMaliCompiler.dylib:755 ) \
+		$(for f in ${EXTRA_INSTALL:-}; do echo --install-file $f; done) \
 		> $SP/deploy-$TAG.log 2>&1 && break
 done
 tail -3 $SP/deploy-$TAG.log | cut -c1-160
