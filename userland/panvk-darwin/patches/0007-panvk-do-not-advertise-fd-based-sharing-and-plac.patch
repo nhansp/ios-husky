@@ -1,0 +1,50 @@
+# panvk: do not advertise fd-based sharing and placed maps the kernel cannot do
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index 493f081..0cb30f4 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -393,6 +393,14 @@ get_device_sync_types(struct panvk_physical_device *device,
+                        "failed to query syncobj features");
+    }
+ 
++#ifdef HUSKY_DRM_SHIM
++   /* The kernel has no syncobj, sync_file or dma-buf fd export/import. */
++   device->drm_syncobj_type.import_opaque_fd = NULL;
++   device->drm_syncobj_type.export_opaque_fd = NULL;
++   device->drm_syncobj_type.import_sync_file = NULL;
++   device->drm_syncobj_type.export_sync_file = NULL;
++#endif
++
+    device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
+ 
+    if (arch >= 10) {
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index 6dcf02e..283e0b3 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -67,11 +67,15 @@ panvk_per_arch(get_physical_device_extensions)(
+       .KHR_dynamic_rendering_local_read = true,
+       .KHR_extended_flags = true,
+       .KHR_external_fence = true,
++#ifndef HUSKY_DRM_SHIM
+       .KHR_external_fence_fd = true,
++#endif
+       .KHR_external_memory = true,
+       .KHR_external_memory_fd = true,
+       .KHR_external_semaphore = true,
++#ifndef HUSKY_DRM_SHIM
+       .KHR_external_semaphore_fd = true,
++#endif
+       .KHR_format_feature_flags2 = true,
+       .KHR_get_memory_requirements2 = true,
+       .KHR_global_priority = true,
+@@ -188,7 +192,9 @@ panvk_per_arch(get_physical_device_extensions)(
+       .EXT_legacy_dithering = true,
+       .EXT_line_rasterization = true,
+       .EXT_load_store_op_none = true,
++#ifndef HUSKY_DRM_SHIM
+       .EXT_map_memory_placed = true,
++#endif
+       .EXT_nested_command_buffer = PAN_ARCH >= 10,
+       .EXT_memory_budget = true,
+       .EXT_non_seamless_cube_map = true,

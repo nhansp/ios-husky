@@ -1,0 +1,15 @@
+# meson: libdrm (the husky shim) for panvk on darwin
+diff --git a/meson.build b/meson.build
+index b36ec91..7f17fd5 100644
+--- a/meson.build
++++ b/meson.build
+@@ -800,7 +800,8 @@ endif
+ allow_fallback_for_libdrm = get_option('allow-fallback-for').contains('libdrm')
+ 
+ with_gallium_drisw_kms = false
+-if system_has_kms_drm
++# panvk on Darwin reaches the GPU through the husky libdrm replacement.
++if system_has_kms_drm or (with_panfrost_vk and host_machine.system() == 'darwin')
+   dep_libdrm = dependency(
+     'libdrm', version : '>=' + _drm_ver,
+     required : with_dri2 or with_dri or with_gbm,

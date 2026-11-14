@@ -1,0 +1,68 @@
+# panfrost/kmod: imported IOSurface BOs, sized by the shim and without dma-buf implicit sync
+diff --git a/src/panfrost/lib/kmod/panthor_kmod.c b/src/panfrost/lib/kmod/panthor_kmod.c
+index 4011b55..f994457 100644
+--- a/src/panfrost/lib/kmod/panthor_kmod.c
++++ b/src/panfrost/lib/kmod/panthor_kmod.c
+@@ -526,6 +526,17 @@ err_free_bo:
+    return NULL;
+ }
+ 
++#ifdef HUSKY_DRM_SHIM
++/* Imported IOSurfaces carry no dma-buf implicit sync: the kernel has no sync_file export/import. */
++#define PANTHOR_BO_SHARED(bo) false
++off_t husky_drm_dmabuf_size(int prime_fd);
++#define lseek_dmabuf_size(fd) husky_drm_dmabuf_size(fd)
++#else
++#define PANTHOR_BO_SHARED(bo) \
++   ((bo)->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED))
++#define lseek_dmabuf_size(fd) lseek(fd, 0, SEEK_END)
++#endif
++
+ static struct pan_kmod_bo *
+ panthor_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
+ {
+@@ -545,7 +556,7 @@ panthor_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
+ 
+       p_atomic_inc(&bo->refcnt);
+    } else {
+-      size_t bo_size = lseek(fd, 0, SEEK_END);
++      size_t bo_size = lseek_dmabuf_size(fd);
+       if (bo_size == 0 || bo_size == (size_t)-1) {
+          mesa_loge("invalid dmabuf size");
+          goto err_close_handle;
+@@ -572,7 +583,7 @@ panthor_kmod_bo_post_export(struct pan_kmod_bo *bo, int dmabuf_fd)
+       container_of(bo, struct panthor_kmod_bo, base);
+ 
+    bool shared =
+-      bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
++      PANTHOR_BO_SHARED(bo);
+ 
+    /* If the BO wasn't already shared, we migrate our internal sync points to
+     * the dmabuf itself, so implicit sync can work correctly after this point.
+@@ -669,7 +680,7 @@ panthor_kmod_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
+    struct panthor_kmod_bo *panthor_bo =
+       container_of(bo, struct panthor_kmod_bo, base);
+    bool shared =
+-      bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
++      PANTHOR_BO_SHARED(bo);
+ 
+    if (shared) {
+       /* If the object is shared, we have to do this export sync-file dance
+@@ -774,7 +785,7 @@ panthor_kmod_bo_attach_sync_point(struct pan_kmod_bo *bo, uint32_t sync_handle,
+          ? container_of(bo->exclusive_vm, struct panthor_kmod_vm, base)
+          : NULL;
+    bool shared =
+-      bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
++      PANTHOR_BO_SHARED(bo);
+ 
+    if (shared) {
+       /* Reconciling explicit/implicit sync again: we need to import the
+@@ -846,7 +857,7 @@ panthor_kmod_bo_get_sync_point(struct pan_kmod_bo *bo, uint32_t *sync_handle,
+    struct panthor_kmod_bo *panthor_bo =
+       container_of(bo, struct panthor_kmod_bo, base);
+    bool shared =
+-      bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
++      PANTHOR_BO_SHARED(bo);
+ 
+    if (shared) {
+       /* Explicit/implicit sync reconciliation point. We need to export

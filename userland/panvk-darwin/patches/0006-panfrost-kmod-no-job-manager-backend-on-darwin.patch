@@ -1,0 +1,48 @@
+# panfrost/kmod: no Job Manager backend on darwin
+diff --git a/src/panfrost/lib/kmod/meson.build b/src/panfrost/lib/kmod/meson.build
+index 20ee6db..41feab5 100644
+--- a/src/panfrost/lib/kmod/meson.build
++++ b/src/panfrost/lib/kmod/meson.build
+@@ -6,10 +6,14 @@ libpankmod_lib_link_with = []
+ libpankmod_lib_inc = []
+ libpankmod_lib_code = [
+   'pan_kmod.c',
+-  'panfrost_kmod.c',
+   'panthor_kmod.c',
+ ]
+ 
++# The Job Manager backend needs eventfd; Darwin only talks to the CSF kernel.
++if host_machine.system() != 'darwin'
++  libpankmod_lib_code += 'panfrost_kmod.c'
++endif
++
+ if with_panfrost_vdrm
+   libpankmod_lib_inc += [inc_virtio_gpu, inc_virtio_vdrm, include_directories('virtio')]
+   libpankmod_lib_args += '-DHAVE_PANFROST_VDRM'
+diff --git a/src/panfrost/lib/kmod/pan_kmod.c b/src/panfrost/lib/kmod/pan_kmod.c
+index 141bb49..e128d49 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.c
++++ b/src/panfrost/lib/kmod/pan_kmod.c
+@@ -12,7 +12,9 @@
+ #include "pan_kmod.h"
+ #include "pan_kmod_backend.h"
+ 
++#ifndef __APPLE__
+ extern const struct pan_kmod_ops panfrost_kmod_ops;
++#endif
+ extern const struct pan_kmod_ops panthor_kmod_ops;
+ #ifdef HAVE_PANFROST_VDRM
+ extern const struct pan_kmod_ops panfrost_virtio_gpu_ops;
+@@ -23,10 +25,12 @@ static const struct backend {
+    const char *name;
+    const struct pan_kmod_ops *ops;
+ } backends[] = {
++#ifndef __APPLE__
+    {
+       "panfrost",
+       &panfrost_kmod_ops,
+    },
++#endif
+    {
+       "panthor",
+       &panthor_kmod_ops,

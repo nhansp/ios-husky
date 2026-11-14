@@ -1,0 +1,144 @@
+# panvk: enumerate the MaliAccelerator service, enable v11 without the broken-driver gate
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index b519885..dfcbea9 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -156,6 +156,24 @@ panvk_physical_device_try_create(struct vk_instance *vk_instance,
+    return VK_SUCCESS;
+ }
+ 
++#ifdef HUSKY_DRM_SHIM
++/* There is no DRM node to enumerate: the one device is the MaliAccelerator IOKit service. */
++static VkResult
++panvk_enumerate_physical_devices(struct vk_instance *vk_instance)
++{
++   struct vk_physical_device *pdevice;
++   VkResult result = panvk_physical_device_try_create(vk_instance, NULL, &pdevice);
++
++   if (result == VK_ERROR_INCOMPATIBLE_DRIVER)
++      return VK_SUCCESS;
++   if (result != VK_SUCCESS)
++      return result;
++
++   list_addtail(&pdevice->link, &vk_instance->physical_devices.list);
++   return VK_SUCCESS;
++}
++#endif
++
+ static void
+ panvk_destroy_physical_device(struct vk_physical_device *device)
+ {
+@@ -257,6 +275,9 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+ 
+    instance->vk.physical_devices.try_create_for_drm =
+       panvk_physical_device_try_create;
++#ifdef HUSKY_DRM_SHIM
++   instance->vk.physical_devices.enumerate = panvk_enumerate_physical_devices;
++#endif
+    instance->vk.physical_devices.destroy = panvk_destroy_physical_device;
+ 
+    if (PANVK_DEBUG(STARTUP))
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index 5a0ae9d..493f081 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -40,6 +40,11 @@
+ 
+ #include "genxml/gen_macros.h"
+ 
++#ifdef HUSKY_DRM_SHIM
++int husky_drm_open(void);
++void husky_drm_close(int fd);
++#endif
++
+ #define PER_ARCH_FUNCS(_ver)                                                   \
+    void panvk_v##_ver##_get_physical_device_extensions(                        \
+       const struct panvk_physical_device *device,                              \
+@@ -76,8 +81,13 @@ static VkResult
+ create_kmod_dev(struct panvk_physical_device *device,
+                 const struct panvk_instance *instance, drmDevicePtr drm_device)
+ {
++#ifdef HUSKY_DRM_SHIM
++   const char *path = "MaliAccelerator";
++   int fd = husky_drm_open();
++#else
+    const char *path = drm_device->nodes[DRM_NODE_RENDER];
+    int fd = open(path, O_RDWR | O_CLOEXEC);
++#endif
+    if (fd < 0) {
+       return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                           "failed to open device '%s'", path);
+@@ -90,7 +100,11 @@ create_kmod_dev(struct panvk_physical_device *device,
+ 
+    device->kmod.dev = pan_kmod_dev_create(fd, flags, &instance->kmod.allocator);
+    if (!device->kmod.dev) {
++#ifdef HUSKY_DRM_SHIM
++      husky_drm_close(fd);
++#else
+       close(fd);
++#endif
+ 
+       if (errno != -ENOMEM)
+          return VK_ERROR_INCOMPATIBLE_DRIVER;
+@@ -105,6 +119,7 @@ create_kmod_dev(struct panvk_physical_device *device,
+    return VK_SUCCESS;
+ }
+ 
++#ifndef HUSKY_DRM_SHIM
+ static VkResult
+ get_drm_device_ids(struct panvk_physical_device *device,
+                    const struct panvk_instance *instance,
+@@ -130,6 +145,7 @@ get_drm_device_ids(struct panvk_physical_device *device,
+ 
+    return VK_SUCCESS;
+ }
++#endif
+ 
+ static void
+ init_shader_caches(struct panvk_physical_device *device,
+@@ -454,7 +470,9 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+    switch (arch) {
+    case 6:
+    case 7:
++#ifndef HUSKY_DRM_SHIM
+    case 11:
++#endif
+    case 14:
+       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
+          result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+@@ -466,6 +484,9 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+       break;
+ 
+    case 10:
++#ifdef HUSKY_DRM_SHIM
++   case 11:
++#endif
+    case 12:
+    case 13:
+       break;
+@@ -476,9 +497,11 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+       goto fail;
+    }
+ 
++#ifndef HUSKY_DRM_SHIM
+    result = get_drm_device_ids(device, instance, drm_device);
+    if (result != VK_SUCCESS)
+       goto fail;
++#endif
+ 
+    device->formats.all = pan_format_table(arch);
+    device->formats.blendable = pan_blendable_format_table(arch);
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index bc60ca1..6dcf02e 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -9,7 +9,9 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#ifndef __APPLE__
+ #include <sys/sysmacros.h>
++#endif
+ 
+ #include "git_sha1.h"
+ 

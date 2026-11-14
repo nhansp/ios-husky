@@ -1,0 +1,9 @@
+0001-util-os-mmap-os-munmap-through-the-husky-drm-shi.patch
+0002-panfrost-kmod-close-the-drm-fd-through-the-husky.patch
+0003-panvk-enumerate-the-maliaccelerator-service-enab.patch
+0004-meson-libdrm-the-husky-shim-for-panvk-on-darwin.patch
+0005-vulkan-runtime-drm-format-mod-in-vk-image-with-t.patch
+0006-panfrost-kmod-no-job-manager-backend-on-darwin.patch
+0007-panvk-do-not-advertise-fd-based-sharing-and-plac.patch
+0008-panvk-let-ld64-take-the-undefined-weak-entrypoin.patch
+0009-panfrost-kmod-imported-iosurface-bos-sized-by-th.patch

@@ -1,0 +1,38 @@
+; #version 450 / local_size_x = 64 / buffer Out { uint data[]; }; data[gid] = gid * 2 + 1;
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %arr ArrayStride 4
+               OpMemberDecorate %Out 0 Offset 0
+               OpDecorate %Out BufferBlock
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+     %v3uint = OpTypeVector %uint 3
+ %ptr_in_v3 = OpTypePointer Input %v3uint
+        %gid = OpVariable %ptr_in_v3 Input
+ %ptr_in_u = OpTypePointer Input %uint
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+        %arr = OpTypeRuntimeArray %uint
+        %Out = OpTypeStruct %arr
+ %ptr_un_Out = OpTypePointer Uniform %Out
+        %buf = OpVariable %ptr_un_Out Uniform
+        %int = OpTypeInt 32 1
+      %int_0 = OpConstant %int 0
+ %ptr_un_u = OpTypePointer Uniform %uint
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %gp = OpAccessChain %ptr_in_u %gid %uint_0
+          %i = OpLoad %uint %gp
+          %m = OpIMul %uint %i %uint_2
+          %v = OpIAdd %uint %m %uint_1
+         %pp = OpAccessChain %ptr_un_u %buf %int_0 %i
+               OpStore %pp %v
+               OpReturn
+               OpFunctionEnd

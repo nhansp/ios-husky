@@ -1,0 +1,23 @@
+# util: os_mmap/os_munmap through the husky drm shim
+diff --git a/src/util/os_mman.h b/src/util/os_mman.h
+index 1567ee7..4574333 100644
+--- a/src/util/os_mman.h
++++ b/src/util/os_mman.h
+@@ -51,7 +51,16 @@ extern "C" {
+ #endif
+ 
+ 
+-#if DETECT_OS_ANDROID && !defined(__LP64__)
++#ifdef HUSKY_DRM_SHIM
++/* BO mappings of the husky panthor transport are made by the kernel, not by mmap() on the DRM fd. */
++void *husky_drm_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset);
++int husky_drm_munmap(void *addr, size_t len);
++#  define os_mmap(addr, length, prot, flags, fd, offset) \
++             husky_drm_mmap(addr, length, prot, flags, fd, offset)
++#  define os_munmap(addr, length) \
++             husky_drm_munmap(addr, length)
++
++#elif DETECT_OS_ANDROID && !defined(__LP64__)
+ /* 32-bit needs mmap64 for 64-bit offsets */
+ #  define os_mmap(addr, length, prot, flags, fd, offset) \
+              mmap64(addr, length, prot, flags, fd, offset)

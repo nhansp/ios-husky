@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.husky.vk-smoke</string>
+	<key>Program</key>
+	<string>/usr/local/bin/vk_smoke</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>LaunchOnlyOnce</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>DYLD_LIBRARY_PATH</key>
+		<string>/usr/local/lib</string>
+	</dict>
+	<key>UserName</key>
+	<string>root</string>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>
