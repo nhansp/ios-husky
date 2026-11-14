@@ -17,6 +17,7 @@
 #define CS_STORE32(src, addr)   ((21ULL << 56) | ((uint64_t)(src) << 48) | ((uint64_t)(addr) << 40) | (1ULL << 16))
 
 static io_connect_t conn;
+static uint32_t sel_base;      /* 0 on HuskyPanthorUserClient, HUSKY_PNT_TUNNEL_BASE on IOGPUDeviceUserClient */
 static int failures;
 
 static int
@@ -25,7 +26,7 @@ pnt_ioctl(uint32_t req, void *arg, size_t size)
 	uint64_t in = req, err = 0;
 	uint32_t nout = 1;
 	size_t osize = size;
-	kern_return_t kr = IOConnectCallMethod(conn, HUSKY_PNT_SEL_IOCTL, &in, 1, arg, size, &err, &nout, arg, &osize);
+	kern_return_t kr = IOConnectCallMethod(conn, sel_base + HUSKY_PNT_SEL_IOCTL, &in, 1, arg, size, &err, &nout, arg, &osize);
 	if (kr != KERN_SUCCESS) {
 		printf("pvk_smoke: ioctl 0x%x: IOConnectCallMethod 0x%x\n", req, kr);
 		return EIO;
@@ -38,7 +39,7 @@ pnt_mmap(uint32_t handle)
 {
 	uint64_t in = handle, out[2] = { 0, 0 };
 	uint32_t nout = 2;
-	if (IOConnectCallScalarMethod(conn, HUSKY_PNT_SEL_MMAP, &in, 1, out, &nout) != KERN_SUCCESS) {
+	if (IOConnectCallScalarMethod(conn, sel_base + HUSKY_PNT_SEL_MMAP, &in, 1, out, &nout) != KERN_SUCCESS) {
 		return NULL;
 	}
 	return (void *)(uintptr_t)out[0];
@@ -165,8 +166,18 @@ main(void)
 		printf("pvk_smoke: FAIL no MaliAccelerator\n");
 		return 1;
 	}
+	/* the dedicated client answers a device query; the suite runs over the IOGPU tunnel, which panvk uses */
 	kern_return_t kr = IOServiceOpen(svc, mach_task_self(), HUSKY_PNT_CONNECT_TYPE, &conn);
 	CHECK(kr == KERN_SUCCESS, "IOServiceOpen type 0x%x (0x%x)", HUSKY_PNT_CONNECT_TYPE, kr);
+	if (kr == KERN_SUCCESS) {
+		struct drm_panthor_dev_query q0 = { .type = DRM_PANTHOR_DEV_QUERY_GPU_INFO };
+		int e0 = pnt_ioctl(DRM_IOCTL_PANTHOR_DEV_QUERY, &q0, sizeof(q0));
+		CHECK(e0 == 0 && q0.size != 0, "dedicated client: GPU_INFO size %u (%d)", q0.size, e0);
+		IOServiceClose(conn);
+	}
+	kr = IOServiceOpen(svc, mach_task_self(), 1, &conn);
+	sel_base = HUSKY_PNT_TUNNEL_BASE;
+	CHECK(kr == KERN_SUCCESS, "IOServiceOpen IOGPU device client (0x%x)", kr);
 	if (kr != KERN_SUCCESS) {
 		return 1;
 	}

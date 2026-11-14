@@ -124,5 +124,7 @@ struct drm_husky_bo_import_surface {
 #define HUSKY_PNT_SEL_IOCTL     0u
 #define HUSKY_PNT_SEL_MMAP      1u
 #define HUSKY_PNT_SEL_MUNMAP    2u
+/* The same three on the IOGPU device user client (connect type 1), whose class sandbox profiles admit. */
+#define HUSKY_PNT_TUNNEL_BASE   56u
 
 #endif /* HUSKY_PANTHOR_UAPI_H */

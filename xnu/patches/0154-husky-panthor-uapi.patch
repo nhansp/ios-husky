@@ -22,6 +22,53 @@ index 392c320..0df4e3b 100644
  	if (kind != IOGPU_UC_CONNECT_TYPE_DEVICE &&
  	    kind != IOGPU_UC_CONNECT_TYPE_MEMINFO) {
  		return kIOReturnUnsupported;
+diff --git a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+index 051e220..f7f073c 100644
+--- a/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
++++ b/iokit/Families/IOGPU/IOGPUDeviceUserClient.cpp
+@@ -25,6 +25,8 @@
+ #include <sys/systm.h>
+ #include <sys/proc.h>
+ #include <pexpert/pexpert.h>
++#include "husky_panthor_uapi.h"
++#include "husky_panthor.h"
+ 
+ OSDefineMetaClassAndStructors(IOGPUDeviceUserClient, IOUserClient);
+ 
+@@ -144,6 +146,8 @@ IOGPUDeviceUserClient::clientClose(void)
+ 	}
+ 	OSSafeReleaseNULL(fDevice); /* Release via refcounting [fixes REVIEW defect 5] */
+ 	OSSafeReleaseNULL(fStampMap);
++	husky_pnt_close(fPanthor);
++	fPanthor = NULL;
+ 	terminate();
+ 	return kIOGPUReturnSuccess;
+ }
+@@ -1023,6 +1027,10 @@ IOGPUDeviceUserClient::externalMethod(uint32_t selector,
+ 		return kIOGPUReturnNotAttached;
+ 	}
+ 
++	if (selector >= HUSKY_PNT_TUNNEL_BASE && selector <= HUSKY_PNT_TUNNEL_BASE + HUSKY_PNT_SEL_MUNMAP) {
++		return husky_pnt_external(&fPanthor, fTask, selector - HUSKY_PNT_TUNNEL_BASE, args);
++	}
++
+ 	/* Dispatch table A (56 entries) [spec 01 line 168] */
+ 	if (selector < IOGPU_UC_NUM_SELECTORS) {
+ 		dispatch = (IOExternalMethodDispatch *)&sMethods[selector];
+diff --git a/iokit/Families/IOGPU/IOGPUDeviceUserClient.h b/iokit/Families/IOGPU/IOGPUDeviceUserClient.h
+index 0fc3e61..edc9aff 100644
+--- a/iokit/Families/IOGPU/IOGPUDeviceUserClient.h
++++ b/iokit/Families/IOGPU/IOGPUDeviceUserClient.h
+@@ -35,6 +35,9 @@ class IOGPUDeviceUserClient : public IOUserClient {
+ 	IOMemoryMap   *fStampMap;
+ 	uint64_t       fStampUserBase;    /* Base user VA -> selector 2 stampBase */
+ 
++	/* panthor interface tunnelled as selectors 56-58 (husky_panthor.cpp): sandbox profiles admit this class */
++	struct husky_pnt_file *fPanthor;
++
+ 	/* 14 trap slots for getTargetAndTrapForIndex [spec 01 lines 249-271] */
+ 	IOExternalTrap fTraps[IOGPU_UC_NUM_TRAPS];
+ 
 diff --git a/iokit/Families/IOGPU/husky_mali_backend_bridge.c b/iokit/Families/IOGPU/husky_mali_backend_bridge.c
 index fbf117f..7bf8915 100644
 --- a/iokit/Families/IOGPU/husky_mali_backend_bridge.c
@@ -844,10 +891,10 @@ index 66f194d..4cea676 100644
  #endif
 diff --git a/iokit/Families/IOGPU/husky_panthor.cpp b/iokit/Families/IOGPU/husky_panthor.cpp
 new file mode 100644
-index 0000000..be4ef47
+index 0000000..553aa0c
 --- /dev/null
 +++ b/iokit/Families/IOGPU/husky_panthor.cpp
-@@ -0,0 +1,1979 @@
+@@ -0,0 +1,1989 @@
 +#if defined(ARM64_BOARD_CONFIG_HUSKY)
 +/*
 + * husky_panthor.cpp - the Linux panthor DRM driver's ioctl interface over an IOKit user client, so Mesa's
@@ -2770,12 +2817,15 @@ index 0000000..be4ef47
 +}
 +
 +IOReturn
-+HuskyPanthorUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a,
-+    IOExternalMethodDispatch *, OSObject *, void *)
++husky_pnt_external(husky_pnt_file **pf, task_t task, uint32_t selector, IOExternalMethodArguments *a)
 +{
-+	if (fFile == NULL || current_task() != fTask) {
++	if (current_task() != task) {
 +		return kIOReturnNotPermitted;
 +	}
++	if (*pf == NULL && (*pf = husky_pnt_open(task)) == NULL) {
++		return kIOReturnNoMemory;
++	}
++	husky_pnt_file *f = *pf;
 +	switch (selector) {
 +	case HUSKY_PNT_SEL_IOCTL: {
 +		uint64_t buf[16];
@@ -2785,7 +2835,7 @@ index 0000000..be4ef47
 +			return kIOReturnBadArgument;
 +		}
 +		memcpy(buf, a->structureInput, a->structureInputSize);
-+		const int err = husky_pnt_ioctl(fFile, (uint32_t)a->scalarInput[0], buf, a->structureInputSize);
++		const int err = husky_pnt_ioctl(f, (uint32_t)a->scalarInput[0], buf, a->structureInputSize);
 +		memcpy(a->structureOutput, buf, a->structureInputSize);
 +		a->scalarOutput[0] = (uint64_t)err;
 +		return kIOReturnSuccess;
@@ -2795,7 +2845,7 @@ index 0000000..be4ef47
 +			return kIOReturnBadArgument;
 +		}
 +		uint64_t addr = 0, size = 0;
-+		const int err = husky_pnt_mmap(fFile, (uint32_t)a->scalarInput[0], &addr, &size);
++		const int err = husky_pnt_mmap(f, (uint32_t)a->scalarInput[0], &addr, &size);
 +		a->scalarOutput[0] = addr;
 +		a->scalarOutput[1] = size;
 +		return err == 0 ? kIOReturnSuccess : kIOReturnNoMemory;
@@ -2804,10 +2854,17 @@ index 0000000..be4ef47
 +		if (a->scalarInputCount != 1) {
 +			return kIOReturnBadArgument;
 +		}
-+		return husky_pnt_munmap(fFile, a->scalarInput[0]) == 0 ? kIOReturnSuccess : kIOReturnBadArgument;
++		return husky_pnt_munmap(f, a->scalarInput[0]) == 0 ? kIOReturnSuccess : kIOReturnBadArgument;
 +	default:
 +		return kIOReturnUnsupported;
 +	}
++}
++
++IOReturn
++HuskyPanthorUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a,
++    IOExternalMethodDispatch *, OSObject *, void *)
++{
++	return fFile != NULL ? husky_pnt_external(&fFile, fTask, selector, a) : kIOReturnNotPermitted;
 +}
 +
 +IOReturn
@@ -2829,10 +2886,10 @@ index 0000000..be4ef47
 +#endif /* ARM64_BOARD_CONFIG_HUSKY */
 diff --git a/iokit/Families/IOGPU/husky_panthor.h b/iokit/Families/IOGPU/husky_panthor.h
 new file mode 100644
-index 0000000..46f6664
+index 0000000..4519093
 --- /dev/null
 +++ b/iokit/Families/IOGPU/husky_panthor.h
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,31 @@
 +/*
 + * husky_panthor.h - the panthor-interface user client (husky_panthor.cpp), connect type HUSKY_PNT_CONNECT_TYPE.
 + */
@@ -2848,6 +2905,12 @@ index 0000000..46f6664
 +int husky_pnt_ioctl(husky_pnt_file *f, uint32_t request, void *args, uint32_t len);
 +int husky_pnt_mmap(husky_pnt_file *f, uint32_t handle, uint64_t *addr, uint64_t *size);
 +int husky_pnt_munmap(husky_pnt_file *f, uint64_t addr);
++
++#ifdef __cplusplus
++struct IOExternalMethodArguments;
++/* Selector sel (HUSKY_PNT_SEL_*) for a client of task; *pf is opened on first use. */
++IOReturn husky_pnt_external(husky_pnt_file **pf, task_t task, uint32_t sel, IOExternalMethodArguments *a);
++#endif
 +
 +#ifdef __cplusplus
 +class IOService;
@@ -4195,10 +4258,10 @@ index 0000000..6f0b377
 +#endif /* _PANTHOR_DRM_H_ */
 diff --git a/iokit/Families/IOGPU/husky_panthor_uapi.h b/iokit/Families/IOGPU/husky_panthor_uapi.h
 new file mode 100644
-index 0000000..66766fa
+index 0000000..629a3e6
 --- /dev/null
 +++ b/iokit/Families/IOGPU/husky_panthor_uapi.h
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,130 @@
 +/*
 + * husky_panthor_uapi.h - what husky_panthor_drm.h (Linux include/uapi/drm/panthor_drm.h, MIT) needs from
 + * drm.h, plus the DRM core GEM and syncobj argument structs. DRM_IO* give the bare ioctl number: the kernel
@@ -4325,6 +4388,8 @@ index 0000000..66766fa
 +#define HUSKY_PNT_SEL_IOCTL     0u
 +#define HUSKY_PNT_SEL_MMAP      1u
 +#define HUSKY_PNT_SEL_MUNMAP    2u
++/* The same three on the IOGPU device user client (connect type 1), whose class sandbox profiles admit. */
++#define HUSKY_PNT_TUNNEL_BASE   56u
 +
 +#endif /* HUSKY_PANTHOR_UAPI_H */
 diff --git a/iokit/conf/files b/iokit/conf/files
