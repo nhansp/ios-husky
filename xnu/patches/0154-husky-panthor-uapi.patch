@@ -1,5 +1,5 @@
 diff --git a/iokit/Families/IOGPU/IOGPU.cpp b/iokit/Families/IOGPU/IOGPU.cpp
-index 392c320..0df4e3b 100644
+index 392c320..75011ca 100644
 --- a/iokit/Families/IOGPU/IOGPU.cpp
 +++ b/iokit/Families/IOGPU/IOGPU.cpp
 @@ -19,6 +19,8 @@
@@ -11,7 +11,21 @@ index 392c320..0df4e3b 100644
  
  /* boot-arg huskygpuclients=a,b: only these processes get a device (bring-up isolation). */
  static bool
-@@ -203,6 +205,10 @@ IOGPU::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+@@ -84,8 +86,11 @@ IOGPU::start(IOService *provider)
+ 	 *   - IOUserClientClass="IOGPUDeviceUserClient" [spec 01 line 127]
+ 	 *   - MaliDevProps CFData blob [spec 03 line 288; fixes REVIEWS.md:39, 103]
+ 	 */
+-	setProperty(IOGPU_PROP_PLUGIN_NAME, "MaliMetal");
+-	setProperty(IOGPU_PROP_PLUGIN_CLASS, "MaliMTLDevice");
++	/* huskymetal=vk: the metal2vulkan + panvk plug-in instead of MaliMetal */
++	char metal[8] = "";
++	const bool vk = PE_parse_boot_argn("huskymetal", metal, sizeof(metal)) && !strcmp(metal, "vk");
++	setProperty(IOGPU_PROP_PLUGIN_NAME, vk ? "HuskyVKMetal" : "MaliMetal");
++	setProperty(IOGPU_PROP_PLUGIN_CLASS, vk ? "HuskyVKMetalDevice" : "MaliMTLDevice");
+ 	setProperty("IOGPUName", fConfig.accelName);
+ 	setProperty("IOUserClientClass", "IOGPUDeviceUserClient");
+ 	publishDevProps();
+@@ -203,6 +208,10 @@ IOGPU::newUserClient(task_t owningTask, void *securityID, UInt32 type,
  	 * [spec 01 lines 82-86, 124-131; spec 02 lines 105-110; claim A3-uc-type].
  	 */
  	uint32_t kind = type & 0xffff;
