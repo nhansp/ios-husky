@@ -844,10 +844,10 @@ index 66f194d..4cea676 100644
  #endif
 diff --git a/iokit/Families/IOGPU/husky_panthor.cpp b/iokit/Families/IOGPU/husky_panthor.cpp
 new file mode 100644
-index 0000000..be53a3b
+index 0000000..be4ef47
 --- /dev/null
 +++ b/iokit/Families/IOGPU/husky_panthor.cpp
-@@ -0,0 +1,1912 @@
+@@ -0,0 +1,1979 @@
 +#if defined(ARM64_BOARD_CONFIG_HUSKY)
 +/*
 + * husky_panthor.cpp - the Linux panthor DRM driver's ioctl interface over an IOKit user client, so Mesa's
@@ -876,6 +876,7 @@ index 0000000..be53a3b
 +#include "husky_mali_backend_bridge.h"
 +#include "husky_panthor_drm.h"
 +#include "husky_panthor.h"
++#include "../../Kernel/arm/HuskySurface.h"
 +
 +extern "C" void husky_dcache_flush(vm_offset_t va, size_t len);
 +
@@ -1155,10 +1156,15 @@ index 0000000..be53a3b
 +	uint32_t                  refs;
 +	uint64_t                  size;
 +	uint32_t                  flags;          /* DRM_PANTHOR_BO_* */
-+	IOBufferMemoryDescriptor *md;
++	IOMemoryDescriptor       *md;
++	uint64_t                  md_off;         /* where the BO starts in md */
 +	uint64_t                 *phys;           /* one per 4 KiB GPU page */
 +	uint32_t                  npages;
-+	vm_offset_t               kva;
++	vm_offset_t               kva;            /* kernel view for BO_SYNC */
++	IOMemoryMap              *kmap;           /* imports: their kernel view */
++	IOOptionBits              cache;          /* user mapping cache mode */
++	OSObject                 *owner;          /* imports: the surface */
++	bool                      imported;
 +};
 +
 +struct pnt_mapping {
@@ -1194,6 +1200,7 @@ index 0000000..be53a3b
 +struct pnt_map_rec {
 +	IOMemoryMap *map;
 +	pnt_bo      *bo;
++	uint64_t     addr;
 +};
 +
 +enum { T_BO, T_VM, T_GROUP, T_HEAP, T_SYNC, T_MAP, T_COUNT };
@@ -1364,14 +1371,77 @@ index 0000000..be53a3b
 +		if (f->wedged) {
 +			PNT_LOG("HUSKY panthor: BO of 0x%llx bytes kept for a wedged VM\n", bo->size);
 +		} else {
++			OSSafeReleaseNULL(bo->kmap);
 +			bo->md->complete();
 +			bo->md->release();
++			OSSafeReleaseNULL(bo->owner);
 +		}
 +	}
 +	if (bo->phys != NULL) {
 +		kfree_data(bo->phys, bo->npages * sizeof(uint64_t));
 +	}
 +	kfree_data(bo, sizeof(*bo));
++}
++
++/* bo->md prepared, bo->md_off and bo->size set */
++static bool
++bo_gather_pages(pnt_bo *bo)
++{
++	bo->npages = (uint32_t)(bo->size / PNT_GPU_PAGE);
++	bo->phys = (uint64_t *)kalloc_data(bo->npages * sizeof(uint64_t), Z_WAITOK);
++	bool ok = bo->phys != NULL;
++	for (uint32_t i = 0; ok && i < bo->npages;) {
++		IOByteCount seg = 0;
++		addr64_t pa = bo->md->getPhysicalSegment(bo->md_off + (uint64_t)i * PNT_GPU_PAGE, &seg, kIOMemoryMapperNone);
++		ok = pa != 0 && !(pa & (PNT_GPU_PAGE - 1)) && seg >= PNT_GPU_PAGE;
++		for (; ok && seg >= PNT_GPU_PAGE && i < bo->npages; seg -= PNT_GPU_PAGE, pa += PNT_GPU_PAGE) {
++			bo->phys[i++] = pa;
++		}
++	}
++	return ok;
++}
++
++/*
++ * An IOSurface's pixels as a BO, from the surface's base (every plane: the caller adds the plane offset, returned
++ * in a->offset). Our replacement for panthor's dma-buf import.
++ */
++static int
++bo_import_surface(husky_pnt_file *f, struct drm_husky_bo_import_surface *a)
++{
++	HuskySurface *surf = husky_surface_copy(a->surface_id);
++	if (surf == NULL || surf->memory == NULL || a->plane >= (surf->planeCount ? surf->planeCount : 1) ||
++	    (surf->offset & (PNT_GPU_PAGE - 1))) {
++		OSSafeReleaseNULL(surf);
++		return EINVAL;
++	}
++	const uint64_t len = surf->memory->getLength() > surf->offset ? surf->memory->getLength() - surf->offset : 0;
++	pnt_bo *bo = (pnt_bo *)kalloc_data(sizeof(*bo), Z_WAITOK_ZERO);
++	if (len < PNT_GPU_PAGE || bo == NULL || surf->memory->prepare() != kIOReturnSuccess) {
++		if (bo != NULL) {
++			kfree_data(bo, sizeof(*bo));
++		}
++		surf->release();
++		return len < PNT_GPU_PAGE ? EINVAL : ENOMEM;
++	}
++	bo->refs = 1;
++	bo->md = surf->memory;
++	bo->md->retain();
++	bo->owner = surf;
++	bo->md_off = surf->offset;
++	bo->size = len & ~(PNT_GPU_PAGE - 1);
++	bo->imported = true;
++	bo->cache = surf->mapCache;
++	bo->kmap = bo->md->map();
++	bo->kva = bo->kmap != NULL ? (vm_offset_t)bo->kmap->getVirtualAddress() + (vm_offset_t)bo->md_off : 0;
++	uint32_t h = 0;
++	if (!bo_gather_pages(bo) || tbl_add(&f->t[T_BO], bo, &h) != 0) {
++		bo_put(f, bo);
++		return ENOMEM;
++	}
++	a->handle = h;
++	a->size = bo->size;
++	a->offset = a->plane < HUSKY_SURFACE_MAX_PLANES && surf->planeCount ? surf->planes[a->plane].offset : 0;
++	return 0;
 +}
 +
 +static int
@@ -1396,20 +1466,11 @@ index 0000000..be53a3b
 +		kfree_data(bo, sizeof(*bo));
 +		return ENOMEM;
 +	}
-+	bo->kva = (vm_offset_t)bo->md->getBytesNoCopy();
++	bo->kva = (vm_offset_t)((IOBufferMemoryDescriptor *)bo->md)->getBytesNoCopy();
++	bo->cache = wb ? kIOMapCopybackCache : kIOMapWriteCombineCache;
 +	bzero((void *)bo->kva, size);
 +	husky_dcache_flush(bo->kva, size);
-+	bo->npages = (uint32_t)(size / PNT_GPU_PAGE);
-+	bo->phys = (uint64_t *)kalloc_data(bo->npages * sizeof(uint64_t), Z_WAITOK);
-+	bool ok = bo->phys != NULL;
-+	for (uint32_t i = 0; ok && i < bo->npages;) {
-+		IOByteCount seg = 0;
-+		addr64_t pa = bo->md->getPhysicalSegment((uint64_t)i * PNT_GPU_PAGE, &seg, kIOMemoryMapperNone);
-+		ok = pa != 0 && !(pa & (PNT_GPU_PAGE - 1)) && seg >= PNT_GPU_PAGE;
-+		for (; ok && seg >= PNT_GPU_PAGE && i < bo->npages; seg -= PNT_GPU_PAGE, pa += PNT_GPU_PAGE) {
-+			bo->phys[i++] = pa;
-+		}
-+	}
++	bool ok = bo_gather_pages(bo);
 +	uint32_t h = 0;
 +	if (!ok || tbl_add(&f->t[T_BO], bo, &h) != 0) {
 +		bo_put(f, bo);
@@ -2154,7 +2215,9 @@ index 0000000..be53a3b
 +			return EINVAL;
 +		}
 +		/* DC CIVAC: clean and invalidate either way */
-+		husky_dcache_flush(bo->kva + (vm_offset_t)op.offset, (size_t)op.size);
++		if (bo->kva != 0) {
++			husky_dcache_flush(bo->kva + (vm_offset_t)op.offset, (size_t)op.size);
++		}
 +	}
 +	return 0;
 +}
@@ -2465,6 +2528,7 @@ index 0000000..be53a3b
 +	case DRM_IOCTL_SYNCOBJ_QUERY:
 +	case DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL:    need = sizeof(struct drm_syncobj_timeline_array); break;
 +	case DRM_IOCTL_SYNCOBJ_TRANSFER:           need = sizeof(struct drm_syncobj_transfer); break;
++	case DRM_IOCTL_HUSKY_BO_IMPORT_SURFACE:    need = sizeof(struct drm_husky_bo_import_surface); break;
 +	default:
 +		return ENOTTY;
 +	}
@@ -2554,7 +2618,7 @@ index 0000000..be53a3b
 +		struct drm_panthor_bo_query_info *a = (struct drm_panthor_bo_query_info *)args;
 +		pnt_bo *bo = (pnt_bo *)tbl_get(&f->t[T_BO], a->handle);
 +		st = bo != NULL ? 0 : ENOENT;
-+		a->extra_flags = 0;
++		a->extra_flags = bo != NULL && bo->imported ? DRM_PANTHOR_BO_IS_IMPORTED : 0;
 +		a->create_flags = bo != NULL ? bo->flags : 0;
 +		break;
 +	}
@@ -2606,6 +2670,9 @@ index 0000000..be53a3b
 +	case DRM_IOCTL_SYNCOBJ_TRANSFER:
 +		st = syncobj_transfer(f, (struct drm_syncobj_transfer *)args);
 +		break;
++	case DRM_IOCTL_HUSKY_BO_IMPORT_SURFACE:
++		st = bo_import_surface(f, (struct drm_husky_bo_import_surface *)args);
++		break;
 +	}
 +	IOLockUnlock(f->lock);
 +	return st;
@@ -2623,8 +2690,7 @@ index 0000000..be53a3b
 +		st = m != NULL ? 0 : ENOMEM;
 +	}
 +	if (st == 0) {
-+		const IOOptionBits cache = (bo->flags & DRM_PANTHOR_BO_WB_MMAP) ? kIOMapCopybackCache : kIOMapWriteCombineCache;
-+		m->map = bo->md->createMappingInTask(f->task, 0, kIOMapAnywhere | cache);
++		m->map = bo->md->createMappingInTask(f->task, 0, kIOMapAnywhere | bo->cache);
 +		uint32_t h = 0;
 +		if (m->map == NULL) {
 +			st = ENOMEM;
@@ -2636,7 +2702,8 @@ index 0000000..be53a3b
 +		} else {
 +			m->bo = bo;
 +			__atomic_add_fetch(&bo->refs, 1, __ATOMIC_ACQ_REL);
-+			*addr = m->map->getAddress();
++			m->addr = m->map->getAddress() + bo->md_off;
++			*addr = m->addr;
 +			*size = bo->size;
 +		}
 +	}
@@ -2652,7 +2719,7 @@ index 0000000..be53a3b
 +	pnt_table *t = &f->t[T_MAP];
 +	for (uint32_t i = 0; i < t->cap; i++) {
 +		pnt_map_rec *m = (pnt_map_rec *)t->slot[i];
-+		if (m != NULL && m->map->getAddress() == addr) {
++		if (m != NULL && m->addr == addr) {
 +			t->slot[i] = NULL;
 +			m->map->release();
 +			bo_put(f, m->bo);
@@ -4128,10 +4195,10 @@ index 0000000..6f0b377
 +#endif /* _PANTHOR_DRM_H_ */
 diff --git a/iokit/Families/IOGPU/husky_panthor_uapi.h b/iokit/Families/IOGPU/husky_panthor_uapi.h
 new file mode 100644
-index 0000000..776206f
+index 0000000..66766fa
 --- /dev/null
 +++ b/iokit/Families/IOGPU/husky_panthor_uapi.h
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,128 @@
 +/*
 + * husky_panthor_uapi.h - what husky_panthor_drm.h (Linux include/uapi/drm/panthor_drm.h, MIT) needs from
 + * drm.h, plus the DRM core GEM and syncobj argument structs. DRM_IO* give the bare ioctl number: the kernel
@@ -4231,6 +4298,20 @@ index 0000000..776206f
 +	__u64 points;
 +	__u32 count_handles;
 +	__u32 flags;
++};
++
++/*
++ * Husky's own ioctl: an IOSurface as a BO (in place of dma-buf import). The BO covers the surface's memory from its
++ * base; offset returns the plane's offset in it. Number 0x60: past the panthor range (0x40 + id).
++ */
++#define DRM_IOCTL_HUSKY_BO_IMPORT_SURFACE       0x60
++struct drm_husky_bo_import_surface {
++	__u32 surface_id;
++	__u32 plane;
++	__u32 handle;           /* out */
++	__u32 pad;
++	__u64 size;             /* out */
++	__u64 offset;           /* out */
 +};
 +
 +/*

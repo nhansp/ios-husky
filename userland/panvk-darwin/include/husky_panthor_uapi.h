@@ -100,6 +100,20 @@ struct drm_syncobj_timeline_array {
 };
 
 /*
+ * Husky's own ioctl: an IOSurface as a BO (in place of dma-buf import). The BO covers the surface's memory from its
+ * base; offset returns the plane's offset in it. Number 0x60: past the panthor range (0x40 + id).
+ */
+#define DRM_IOCTL_HUSKY_BO_IMPORT_SURFACE       0x60
+struct drm_husky_bo_import_surface {
+	__u32 surface_id;
+	__u32 plane;
+	__u32 handle;           /* out */
+	__u32 pad;
+	__u64 size;             /* out */
+	__u64 offset;           /* out */
+};
+
+/*
  * IOKit transport, connect type HUSKY_PNT_CONNECT_TYPE on the accelerator:
  *   selector 0 (ioctl):  scalar in {request}, struct in/out = the argument struct, scalar out {errno}.
  *                        The kernel dispatches on request & 0xff (the DRM ioctl number).
