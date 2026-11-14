@@ -4415,3 +4415,70 @@ index cb2f8b0..02ee182 100644
  iokit/Families/IOGPU/husky_mali_backend_bridge.c	optional iokitcpp
  iokit/Families/IOGPU/husky_iogpu_selftest.cpp		optional iokitcpp
 +iokit/Families/IOGPU/husky_panthor.cpp			optional iokitcpp
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 3130262..8f1d4a2 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -572,6 +572,9 @@ arm_init(
+ #endif
+ 
+ 	ml_parse_cpu_topology();
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: ml_parse_cpu_topology ok\n");
++#endif
+ 
+ 
+ 	boot_cpu_id = ml_get_boot_cpu_number();
+@@ -590,6 +593,9 @@ arm_init(
+ 	    - (uintptr_t)(args->virtBase)));
+ 
+ 	thread = thread_bootstrap();
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: thread_bootstrap ok\n");
++#endif
+ 	thread->machine.CpuDatap = &BootCpuData;
+ 	thread->machine.pcpu_data_base_and_cpu_number =
+ 	    ml_make_pcpu_base_and_cpu_number(0, BootCpuData.cpu_number);
+@@ -603,11 +609,20 @@ arm_init(
+ 	 */
+ 	thread->machine.preemption_count = 0;
+ 	cpu_bootstrap();
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: cpu_bootstrap ok\n");
++#endif
+ 
+ 	rtclock_early_init();
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: rtclock_early_init ok\n");
++#endif
+ 
+ 	kernel_debug_string_early("kernel_startup_bootstrap");
+ 	kernel_startup_bootstrap();
++#if defined(HUSKY)
++	husky_vp_bc("arm_init: kernel_startup_bootstrap ok\n");
++#endif
+ 
+ #if defined(HUSKY)
+ 	husky_vp_bc("arm_init: entry\n");
+diff --git a/osfmk/kern/static_if_common.c b/osfmk/kern/static_if_common.c
+index ba0ea33..f062827 100644
+--- a/osfmk/kern/static_if_common.c
++++ b/osfmk/kern/static_if_common.c
+@@ -273,7 +273,6 @@ static_if_init(const char *args)
+ #if defined(HUSKY)
+ 	/* bootK/L (DP11 bootloader): every boot stops between here and kern_feature_override_apply's first crumb */
+ 	extern void husky_vp_hex(const char *label, uint64_t v);
+-	extern void husky_kfo_direct(const char *args);
+ 	uint64_t ia_lo, ia_hi, sctlr, tcr, pfr1, t0;
+ 	__asm__ volatile ("mrs %0, S3_0_c2_c1_0\n\tmrs %1, S3_0_c2_c1_1\n\tmrs %2, sctlr_el1\n\t"
+ 	    "mrs %3, tcr_el1\n\tmrs %4, id_aa64pfr1_el1\n\tmrs %5, cntvct_el0"
+@@ -287,9 +286,6 @@ static_if_init(const char *args)
+ 	uint64_t t1;
+ 	__asm__ volatile ("isb\n\tmrs %0, cntvct_el0" : "=r" (t1));
+ 	husky_vp_hex("  sif ticks for 6 crumbs", t1 - t0);
+-	husky_vp_bc("  sif: direct kern_feature_override_apply\n");
+-	husky_kfo_direct(args);
+-	husky_vp_bc("  sif: direct returned\n");
+ #endif
+ 	for (static_if_initializer *f = __static_if_initializer_entries;
+ 	    f < __static_if_initializer_entries_end; f++) {

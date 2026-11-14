@@ -24,7 +24,7 @@ tail -3 $SP/deploy-$TAG.log | cut -c1-160
 grep -q "not cleanly unmounted\|Traceback\|refus" $SP/deploy-$TAG.log && echo "DEPLOY FAILED: booting what is already on the volume"
 CMDLINE="debug=0x10000c cpus=9 keepsyms=1 -v -enable_kprintf_spam startup_debug=1 -noprogress rd=ufsroot0 ufsrw=1 rootrw=1 launchd_unsecure_cache=1 huskygrowroot=1 huskysample=PosterBoard,CollectionsPoster,SpringBoard huskyiolog=backboardd,SpringBoard,PosterBoard,CollectionsPoster huskynull=backboardd,SpringBoard,PosterBoard,CollectionsPoster huskyfb_noconsole=1 huskytouch=1 huskytouchdelay=30 huskyreboot=180 huskyboost=1 huskygpu=7 huskygpuclients=${GPUCLIENTS:-metal_smoke,backboardd} huskygputrace=1 ufslogsecs=1 huskysurfcompressed=1 $*"
 CMDLINE="$CMDLINE" AVBTOOL=$SP/avb/avbtool.py AVBKEY=$SP/avb/key4096.pem AVB_ROLLBACK=${AVB_ROLLBACK:-1791158400} \
-	AVB_PROPS="com.android.build.boot.os_version:17 com.android.build.boot.security_patch:2026-10-05" bash tools/mkxnuboot.sh $K/kernel.development.husky out/boot/xnu-boot-$TAG.img --highmem >/dev/null 2>&1 || { echo "mkxnuboot failed"; exit 1; }
+	AVB_PROPS="com.android.build.boot.os_version:17 com.android.build.boot.security_patch:2026-10-05" NOSIGN=1 bash tools/mkxnuboot.sh $K/kernel.development.husky out/boot/xnu-boot-$TAG.img --highmem >/dev/null 2>&1 || { echo "mkxnuboot failed"; exit 1; }
 bash $T/wait-boot.sh out/boot/xnu-boot-$TAG.img 2>&1 | tail -1
 fastboot devices | grep -q $S && { echo "ABORT: still in fastboot"; exit 1; }
 sleep 185
