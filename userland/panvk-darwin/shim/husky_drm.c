@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/ioccom.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -39,7 +40,11 @@ struct drm_husky_import {
 #define USER_MMIO_OFFSET        (1ull << 56)
 #define memclear(s)             memset(&s, 0, sizeof(s))
 
+/* Symbols the Metal plug-in (userland/vkmetal) resolves in this library: husky_drm_surface_fd and husky_drm_default_fd. */
+#define HUSKY_EXPORT __attribute__((visibility("default")))
+
 static _Atomic io_connect_t conns[MAX_FDS];
+static _Atomic int default_fd = -1;
 static uint32_t sel_base[MAX_FDS];
 
 static io_connect_t
@@ -94,7 +99,16 @@ husky_drm_open(void)
 	}
 	sel_base[fd] = base;
 	atomic_store_explicit(&conns[fd], conn, memory_order_release);
+	atomic_store(&default_fd, fd);
 	return fd;
+}
+
+/* The descriptor of the transport the Vulkan device in this process opened (the most recent open one), or -1. */
+HUSKY_EXPORT int
+husky_drm_default_fd(void)
+{
+	int fd = atomic_load(&default_fd);
+	return husky_drm_is_fd(fd) ? fd : -1;
 }
 
 int
@@ -135,6 +149,8 @@ husky_drm_close(int fd)
 {
 	io_connect_t conn = conn_for_fd(fd);
 	if (conn != MACH_PORT_NULL) {
+		int expected = fd;
+		atomic_compare_exchange_strong(&default_fd, &expected, -1);
 		atomic_store_explicit(&conns[fd], MACH_PORT_NULL, memory_order_release);
 		drop_maps_for_conn(conn);
 		IOServiceClose(conn);
@@ -376,50 +392,86 @@ drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
 	return -1;
 }
 
-/* IOSurface "dma-buf" tokens: placeholder fds remembered with the surface they stand for. */
+/*
+ * IOSurface "dma-buf" tokens: a token is the read end of a fresh pipe, remembered with the surface it stands for under the pipe's identity
+ * (st_dev, st_ino: XNU gives each pipe its own). Keyed by identity, not by descriptor number, so that the dup(2) copies a Vulkan driver or
+ * a runtime makes of a descriptor (VkImportMemoryFdInfoKHR takes its own, a runtime keeps another) are still the same token. A table slot is
+ * reused when a new token has the identity of a freed pipe, and the oldest slot goes first when the table is full.
+ */
+#define MAX_TOKENS 1024
 static struct {
 	pthread_mutex_t lock;
-	uint32_t surface_id[MAX_FDS], plane[MAX_FDS];
-	uint64_t size[MAX_FDS];
-	uint8_t used[MAX_FDS];
+	uint64_t dev[MAX_TOKENS], ino[MAX_TOKENS];
+	uint32_t surface_id[MAX_TOKENS], plane[MAX_TOKENS];
+	uint64_t size[MAX_TOKENS];
+	uint8_t used[MAX_TOKENS];
+	uint32_t next;
 } tokens = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
-int
+/* The slot of a token descriptor with tokens.lock held, or -1. */
+static int
+token_slot(int fd, struct stat *st)
+{
+	if (fd < 0 || fstat(fd, st) != 0 || !S_ISFIFO(st->st_mode)) {
+		return -1;
+	}
+	for (int i = 0; i < MAX_TOKENS; i++) {
+		if (tokens.used[i] && tokens.ino[i] == (uint64_t)st->st_ino && tokens.dev[i] == (uint64_t)st->st_dev) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* A token for the surface: a descriptor panvk imports through VK_EXT_external_memory_dma_buf (drmPrimeFDToHandle below). */
+HUSKY_EXPORT int
 husky_drm_surface_fd(int drm_fd, uint32_t surface_id, uint32_t plane)
 {
 	if (!husky_drm_is_fd(drm_fd)) {
 		errno = EBADF;
 		return -1;
 	}
-	int fd = open("/dev/null", O_RDWR | O_CLOEXEC);
-	if (fd < 0 || fd >= MAX_FDS) {
-		if (fd >= 0) {
-			close(fd);
-			errno = EMFILE;
-		}
+	int ends[2];
+	if (pipe(ends) != 0) {
 		return -1;
 	}
+	close(ends[1]);
+	fcntl(ends[0], F_SETFD, FD_CLOEXEC);
+	struct stat st;
 	pthread_mutex_lock(&tokens.lock);
-	tokens.used[fd] = 1;
-	tokens.surface_id[fd] = surface_id;
-	tokens.plane[fd] = plane;
-	tokens.size[fd] = 0;
+	int slot = token_slot(ends[0], &st);
+	if (slot < 0 && fstat(ends[0], &st) == 0) {
+		slot = (int)(tokens.next++ % MAX_TOKENS);
+	}
+	if (slot < 0) {
+		pthread_mutex_unlock(&tokens.lock);
+		close(ends[0]);
+		errno = EIO;
+		return -1;
+	}
+	tokens.used[slot] = 1;
+	tokens.dev[slot] = (uint64_t)st.st_dev;
+	tokens.ino[slot] = (uint64_t)st.st_ino;
+	tokens.surface_id[slot] = surface_id;
+	tokens.plane[slot] = plane;
+	tokens.size[slot] = 0;
 	pthread_mutex_unlock(&tokens.lock);
-	return fd;
+	return ends[0];
 }
 
 int
 drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 {
-	if (prime_fd < 0 || prime_fd >= MAX_FDS) {
-		errno = EBADF;
-		return -1;
-	}
+	struct stat st;
 	pthread_mutex_lock(&tokens.lock);
-	int used = tokens.used[prime_fd];
-	struct drm_husky_import args = { .surface_id = tokens.surface_id[prime_fd], .plane = tokens.plane[prime_fd] };
+	int slot = token_slot(prime_fd, &st);
+	struct drm_husky_import args = { 0 };
+	if (slot >= 0) {
+		args.surface_id = tokens.surface_id[slot];
+		args.plane = tokens.plane[slot];
+	}
 	pthread_mutex_unlock(&tokens.lock);
-	if (!used) {
+	if (slot < 0) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -427,7 +479,10 @@ drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 		return -1;
 	}
 	pthread_mutex_lock(&tokens.lock);
-	tokens.size[prime_fd] = args.size;
+	/* The slot may have been reused while the ioctl ran: record the size only for the same identity. */
+	if (tokens.used[slot] && tokens.ino[slot] == (uint64_t)st.st_ino) {
+		tokens.size[slot] = args.size;
+	}
 	pthread_mutex_unlock(&tokens.lock);
 	*handle = args.handle;
 	return 0;
@@ -437,14 +492,14 @@ drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 off_t
 husky_drm_dmabuf_size(int prime_fd)
 {
+	struct stat st;
 	off_t size = -1;
-	if (prime_fd >= 0 && prime_fd < MAX_FDS) {
-		pthread_mutex_lock(&tokens.lock);
-		if (tokens.used[prime_fd]) {
-			size = (off_t)tokens.size[prime_fd];
-		}
-		pthread_mutex_unlock(&tokens.lock);
+	pthread_mutex_lock(&tokens.lock);
+	int slot = token_slot(prime_fd, &st);
+	if (slot >= 0) {
+		size = (off_t)tokens.size[slot];
 	}
+	pthread_mutex_unlock(&tokens.lock);
 	return size;
 }
 

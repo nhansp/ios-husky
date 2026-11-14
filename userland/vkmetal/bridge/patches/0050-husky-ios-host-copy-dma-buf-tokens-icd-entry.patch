@@ -1,0 +1,115 @@
+diff --git a/crates/metal2vulkan-runtime/src/copied.rs b/crates/metal2vulkan-runtime/src/copied.rs
+index b7ce2d8..2f20c1e 100644
+--- a/crates/metal2vulkan-runtime/src/copied.rs
++++ b/crates/metal2vulkan-runtime/src/copied.rs
+@@ -987,7 +987,7 @@ pub(crate) fn read_pages(pages: NonNull<u8>, into: &mut [u8]) -> bool {
+ }
+ 
+ /// [`read_pages`] on macOS.
+-#[cfg(target_os = "macos")]
++#[cfg(any(target_os = "macos", target_os = "ios"))]
+ pub(crate) fn read_pages(pages: NonNull<u8>, into: &mut [u8]) -> bool {
+     unsafe extern "C" {
+         /// `<mach/mach_init.h>`: the port of this process's task.
+@@ -1016,7 +1016,7 @@ pub(crate) fn read_pages(pages: NonNull<u8>, into: &mut [u8]) -> bool {
+ }
+ 
+ /// [`read_pages`] where the system is not asked: nothing is copied.
+-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
++#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+ pub(crate) fn read_pages(_pages: NonNull<u8>, _into: &mut [u8]) -> bool {
+     false
+ }
+diff --git a/crates/metal2vulkan-runtime/src/device/create.rs b/crates/metal2vulkan-runtime/src/device/create.rs
+index bb1f4bb..fedd42b 100644
+--- a/crates/metal2vulkan-runtime/src/device/create.rs
++++ b/crates/metal2vulkan-runtime/src/device/create.rs
+@@ -810,10 +810,43 @@ pub(crate) fn open_loader(loader: Option<&Path>) -> Result<ash::Entry, Error> {
+         if let Ok(entry) = unsafe { ash::Entry::load_from(path) } {
+             return Ok(entry);
+         }
++        // A Vulkan driver opened directly, with no Khronos loader between (iOS has none): its library exports the ICD entry point only.
++        #[cfg(target_vendor = "apple")]
++        // SAFETY: opening the driver runs its initialization, as opening a loader does.
++        if let Some(entry) = unsafe { icd_entry(path) } {
++            return Ok(entry);
++        }
+     }
+     Err(Error::LoaderNotFound(LoaderNotFound { tried }))
+ }
+ 
++/// The entry of a Vulkan driver library that exports `vk_icdGetInstanceProcAddr` (the ICD interface's `vkGetInstanceProcAddr`) and not
++/// `vkGetInstanceProcAddr`: its global commands (`vkCreateInstance`, the instance enumerations) come from that function with a null
++/// instance. The library stays open for the life of the process.
++///
++/// # Safety
++///
++/// Opening the library runs its initialization.
++#[cfg(target_vendor = "apple")]
++unsafe fn icd_entry(path: &Path) -> Option<ash::Entry> {
++    use std::os::unix::ffi::OsStrExt;
++    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
++    // SAFETY: a nul-terminated path.
++    let library = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
++    if library.is_null() {
++        return None;
++    }
++    // SAFETY: the library is open; a nul-terminated name.
++    let symbol = unsafe { libc::dlsym(library, c"vk_icdGetInstanceProcAddr".as_ptr()) };
++    if symbol.is_null() {
++        return None;
++    }
++    // SAFETY: the ICD interface's function has `vkGetInstanceProcAddr`'s signature.
++    let get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr = unsafe { std::mem::transmute(symbol) };
++    // SAFETY: the function is a driver's own, valid while the library stays open.
++    Some(unsafe { ash::Entry::from_static_fn(ash::StaticFn { get_instance_proc_addr }) })
++}
++
+ /// `vkCreateInstance` of `info` from `entry`: every instance the runtime creates, its devices' and
+ /// the drivers' keeper's (`keeper.rs`), is made here, and the exit guard's hook registers again
+ /// after it, whatever it answered ([`exit_guard::instance_made`]): a layer registers an exit
+diff --git a/crates/metal2vulkan-runtime/src/dma_buf.rs b/crates/metal2vulkan-runtime/src/dma_buf.rs
+index 4ec80cb..aee529b 100644
+--- a/crates/metal2vulkan-runtime/src/dma_buf.rs
++++ b/crates/metal2vulkan-runtime/src/dma_buf.rs
+@@ -440,8 +440,17 @@ fn dma_buf_length(fd: BorrowedFd<'_>) -> Option<u64> {
+     u64::try_from(end).ok()
+ }
+ 
++/// On Apple systems nothing identifies a dma-buf by its file: the source's contract (a token the
++/// driver's own import resolves, such as the husky IOSurface tokens) is trusted, the driver
++/// refusing a chunk it cannot import and the runtime then copying the pages as it does without
++/// a source.
++#[cfg(target_vendor = "apple")]
++fn dma_buf_length(_fd: BorrowedFd<'_>) -> Option<u64> {
++    Some(u64::MAX)
++}
++
+ /// No file is a dma-buf on this system.
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+ fn dma_buf_length(_fd: BorrowedFd<'_>) -> Option<u64> {
+     None
+ }
+diff --git a/crates/metal2vulkan-runtime/src/host_memory.rs b/crates/metal2vulkan-runtime/src/host_memory.rs
+index edfa522..f08a0c1 100644
+--- a/crates/metal2vulkan-runtime/src/host_memory.rs
++++ b/crates/metal2vulkan-runtime/src/host_memory.rs
+@@ -796,7 +796,7 @@ pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
+ /// [`mapped_writable`] on macOS: the regions of this task over `[start, end)`, without a gap,
+ /// each with write protection now (`mach_vm_region`, `VM_REGION_BASIC_INFO_64`); `false` where the
+ /// kernel answers no region.
+-#[cfg(target_os = "macos")]
++#[cfg(any(target_os = "macos", target_os = "ios"))]
+ pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
+     unsafe extern "C" {
+         /// `<mach/mach_init.h>`: the port of this process's task.
+@@ -848,7 +848,7 @@ pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
+ 
+ /// [`mapped_writable`] where the runtime does not ask the system for its mappings: `false` (and no
+ /// copy is made here: the runtime reads no caller's page, [`mapped_readable`]).
+-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
++#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+ pub(super) fn mapped_writable(_start: u64, _end: u64) -> bool {
+     false
+ }

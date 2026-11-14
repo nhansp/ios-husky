@@ -6,7 +6,7 @@ set -eu
 W=$HOME/husky/panvk
 SRC=$W/src/panvk-darwin
 REV=${MESA_REV:?}
-J=$(sysctl -n hw.ncpu)
+J=${PANVK_JOBS:-$(sysctl -n hw.ncpu)}
 export PATH=$W/cache/native/venv/bin:/usr/local/bin:$PATH
 export LDFLAGS=
 cd "$W"

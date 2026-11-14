@@ -1,0 +1,25 @@
+# Generated into the VM build directory by tools/dev/vm-vkmetal.sh with @M2V@ set to the patched metal2vulkan checkout.
+[package]
+name = "husky-vkmetal-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+path = "@BRIDGE@/NativeMetalBridge.rs"
+
+[dependencies]
+metal2vulkan = { path = "@M2V@/crates/metal2vulkan", features = ["ash"] }
+metal2vulkan-runtime = { path = "@M2V@/crates/metal2vulkan-runtime" }
+libc = "0.2"
+# The runtime hashes every shader-cache key and entry: ARMv8 SHA-256 instructions, not the portable rounds.
+sha2 = { version = "0.10", features = ["asm"] }
+
+[profile.release]
+panic = "unwind"
+debug = 1
+lto = "@LTO@"
+codegen-units = @CGU@
